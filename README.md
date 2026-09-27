@@ -11,7 +11,7 @@
 > - The binder now probes each artifact's actual tensor format (`Binder::peek`) and binds NVFP4 or FP8 per artifact, so **both layouts work with one binary**.
 > - Note: some community v3 artifacts declare a custom `metadata.name` (e.g. `swift-1.5-qwen3.8-27b-orcarouter`). The registry keys on `qwen3.8-27b`; if you hit `artifact identity ... has no registered target`, patch the JSON directory's `metadata.name` to `qwen3.8-27b` with length-preserving whitespace padding (no checksums inside the container).
 >
-> Hardware target: NVIDIA Tesla **V100 (sm_70)** only. Prebuilt base recipe and offline Docker build: `Dockerfile.v3.local`.
+> Hardware target: NVIDIA Tesla **V100 (sm_70)** only. For the verified V100 build recipe, runtime flags, and MTP benchmark data see [docs/V100-BUILD.md](docs/V100-BUILD.md).
 
 > **ninfer-v3-v100** — a maintained fork of [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100) (the Tesla V100 fork of [Neroued/ninfer](https://github.com/Neroued/ninfer)) that adds **direct support for upstream v3 `.ninfer` artifacts** — official downloads such as [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) run without conversion. For the verified V100 build recipe, runtime flags, and MTP benchmark data see [docs/V100-BUILD.md](docs/V100-BUILD.md). This fork is not affiliated with or endorsed by the upstream authors.
 

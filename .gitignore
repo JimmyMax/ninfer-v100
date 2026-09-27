@@ -66,3 +66,4 @@ profiles/
 # local build artifacts
 bin/
 third_party/cutlass/
+Dockerfile.v3.local
