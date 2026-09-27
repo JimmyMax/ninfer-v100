@@ -109,7 +109,6 @@ std::size_t baseline_workspace_bytes(std::int32_t tokens) {
 #ifdef NINFER_VOLTA_BUILD
 struct Nvfp4QpnSplitWorkspace {
     DeviceSpan gate;
-    DeviceSpan up;
     DeviceSpan activation;
 };
 
@@ -119,7 +118,6 @@ Nvfp4QpnSplitWorkspace allocate_qpn_split_workspace(Allocator& allocator, std::i
     const std::size_t bytes = static_cast<std::size_t>(kIntermediate) * tokens * sizeof(float);
     Nvfp4QpnSplitWorkspace out;
     out.gate = allocator.alloc_bytes(bytes, 256);
-    out.up   = allocator.alloc_bytes(bytes, 256);
     out.activation = allocator.alloc_bytes(
         static_cast<std::size_t>(Nvfp4MlpGateUpGeometry::kInputRows) * tokens * sizeof(std::uint16_t),
         256);
@@ -210,7 +208,6 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         Nvfp4QpnSplitWorkspace scratch = allocate_qpn_split_workspace(workspace, x.ne[1]);
         nvfp4_linear_swiglu_qpn_split_launch(x, weight, out,
                                              reinterpret_cast<float*>(scratch.gate.data),
-                                             reinterpret_cast<float*>(scratch.up.data),
                                              scratch.activation.data, stream);
         return;
     }
@@ -231,7 +228,6 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         Nvfp4QpnSplitWorkspace scratch    = allocate_qpn_split_workspace(workspace, x.ne[1]);
         nvfp4_linear_swiglu_qpn_split_launch(x, weight, out,
                                              reinterpret_cast<float*>(scratch.gate.data),
-                                             reinterpret_cast<float*>(scratch.up.data),
                                              scratch.activation.data, stream);
         return;
     }
