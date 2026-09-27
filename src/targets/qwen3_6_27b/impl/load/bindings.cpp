@@ -407,7 +407,15 @@ void bind_qwen38_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (layer < 56) {
+        // nvfp4full artifacts (e.g. kvnxiao swift-1.5) store MLP as NVFP4 in ALL
+        // layers; official nvfp4 artifacts keep layers >= 56 in FP8. Probe the
+        // descriptor and bind accordingly so both variants work.
+        const auto* gate_up_desc  = binder.peek(prefix + "mlp/gate_up");
+        const auto* gate_up_tensor =
+            gate_up_desc != nullptr ? std::get_if<artifact::TensorDescriptor>(gate_up_desc) : nullptr;
+        const bool mlp_is_nvfp4 =
+            gate_up_tensor != nullptr && gate_up_tensor->format == NumericFormat::NVFP4;
+        if (mlp_is_nvfp4) {
             target.mlp.gate_up =
                 bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
                                   prefix + "mlp/gate_up_projection/input_scale_divisor");

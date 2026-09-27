@@ -1,5 +1,18 @@
 **English** | [简体中文](README.zh-CN.md)
 
+> **JimmyMax/ninfer-v100** — fork of [liujun-7788/ninfer-v3-v100](https://github.com/liujun-7788/ninfer-v3-v100) (itself a fork of [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100), the Tesla V100 port of [Neroued/ninfer](https://github.com/Neroued/ninfer)).
+>
+> **Supported `.ninfer` artifact versions: v2 and v3.**
+> - **v2 artifacts** — the original container format (e.g. `orcarouter-Qwen3.8-27B-Uncensored-nvfp4-NInfer`), as supported by geoffwatts' fork.
+> - **v3 artifacts** — the upstream container format introduced at Neroued/ninfer `f76e19c0` (model/weight decoupling, 32-byte header with UUID), via liujun-7788's v3 reader.
+>
+> This fork additionally adds **nvfp4full support for Qwen3.8-27B v3 artifacts**:
+> - Official `qwen3.8-27b/nvfp4` artifacts keep the last 8 layers' MLP in FP8; nvfp4full community conversions (e.g. [kvnxiao/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-ninfer](https://huggingface.co/kvnxiao/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-ninfer)) store the MLP as NVFP4 in **all 64 layers**.
+> - The binder now probes each artifact's actual tensor format (`Binder::peek`) and binds NVFP4 or FP8 per artifact, so **both layouts work with one binary**.
+> - Note: some community v3 artifacts declare a custom `metadata.name` (e.g. `swift-1.5-qwen3.8-27b-orcarouter`). The registry keys on `qwen3.8-27b`; if you hit `artifact identity ... has no registered target`, patch the JSON directory's `metadata.name` to `qwen3.8-27b` with length-preserving whitespace padding (no checksums inside the container).
+>
+> Hardware target: NVIDIA Tesla **V100 (sm_70)** only. Prebuilt base recipe and offline Docker build: `Dockerfile.v3.local`.
+
 > **ninfer-v3-v100** — a maintained fork of [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100) (the Tesla V100 fork of [Neroued/ninfer](https://github.com/Neroued/ninfer)) that adds **direct support for upstream v3 `.ninfer` artifacts** — official downloads such as [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) run without conversion. For the verified V100 build recipe, runtime flags, and MTP benchmark data see [docs/V100-BUILD.md](docs/V100-BUILD.md). This fork is not affiliated with or endorsed by the upstream authors.
 
 # NInfer
