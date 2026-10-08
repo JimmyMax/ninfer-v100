@@ -795,7 +795,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
                    : std::nullopt),
       dflash_host(is_masked_draft_backend(plan.speculative_backend)
                       ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_6::DFlashDecodeIngress) +
-                                                             sizeof(qwen3_6::DFlashDecodeEgress))
+                                                             sizeof(qwen3_6::DFlashDecodeEgress) +
+                                                             sizeof(qwen3_6::DFlashPrefillIngress))
                       : std::nullopt),
       context_source_ready_(device_in), context_completion_(device_in),
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
@@ -1027,12 +1028,12 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         dflash_host_egress  = reinterpret_cast<qwen3_6::DFlashDecodeEgress*>(
             static_cast<unsigned char*>(dflash_host->data()) +
             sizeof(qwen3_6::DFlashDecodeIngress));
-        *dflash_host_ingress = {};
-        *dflash_host_egress  = {};
-    }
-    if (io.dflash_prefill) {
-        CUDA_CHECK(cudaMemsetAsync(io.dflash_prefill->produced_count.data, 0,
-                                   io.dflash_prefill->produced_count.bytes(), device.stream));
+        *dflash_host_ingress        = {};
+        *dflash_host_egress         = {};
+        dflash_prefill_host_ingress = reinterpret_cast<qwen3_6::DFlashPrefillIngress*>(
+            static_cast<unsigned char*>(dflash_host->data()) +
+            sizeof(qwen3_6::DFlashDecodeIngress) + sizeof(qwen3_6::DFlashDecodeEgress));
+        *dflash_prefill_host_ingress = {};
     }
     CUDA_CHECK(cudaMemsetAsync(io.rope_delta.data, 0, io.rope_delta.bytes(), device.stream));
     if (io.mtp) {
@@ -1160,6 +1161,7 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
                 nullptr,
                 state_slot,
                 state_slot,
+                0,
                 0,
                 nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);
@@ -7229,6 +7231,9 @@ StartResult ProgramImplCore::start_request(MaterializationTransaction& transacti
         return StartResult{.sequence = handle};
     } catch (...) {
         if (destination && *destination < max_concurrency) {
+            // Startup may have queued work before a later publication check failed.
+            // Complete it before returning its buffers, pages or execution row to the pools.
+            device.synchronize();
             const std::uint32_t lane = *destination;
             if (active_continuations[lane] < continuation_capacity) {
                 clear_lane_best_effort(active_sequence(lane), requests[lane]);
@@ -8977,21 +8982,10 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
             }
 
             if (is_masked_draft_backend(speculative_backend)) {
-                if (!dflash || !io.dflash_decode || !sequence.kv ||
+                if (!dflash || !io.dflash_prefill || !dflash_prefill_host_ingress || !sequence.kv ||
                     (backend_kv_cache() && !sequence.kv->backend)) {
                     throw std::logic_error("DFlash forced continuation state is incomplete");
                 }
-                *dflash_host_ingress                            = {};
-                dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(lane);
-                const StateImageSelectors selectors             = state_selectors(sequence);
-                dflash_host_ingress->state_source_slots[0]      = selectors.source;
-                dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-                dflash_host_ingress->dflash_kv_table_rows[0] =
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0;
-                CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                           sizeof(qwen3_6::DFlashDecodeIngress),
-                                           cudaMemcpyHostToDevice, device.stream));
             }
 
             std::uint32_t cursor = base;
@@ -9013,7 +9007,9 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                     selectors.source,
                     selectors.destination,
                     0,
-                    dflash_host_ingress};
+                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                         : 0,
+                    dflash_prefill_host_ingress};
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);
@@ -9327,6 +9323,9 @@ AbortResult ProgramImplCore::abort(SequenceHandle sequence) noexcept {
         return out;
     }
     SequenceState& state = active_sequence(lane);
+    // Cancellation can arrive after activation and before the first prefill unit has waited
+    // for its uploads and initialization. Settle that work before releasing reusable resources.
+    device.synchronize();
     if (!clear_lane_strict(state, request)) { return out; }
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);
@@ -10010,19 +10009,10 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
         if (is_masked_draft_backend(speculative_backend)) {
-            if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
+            if (!dflash || !io.dflash_prefill || !dflash_prefill_host_ingress ||
+                (backend_kv_cache() && !sequence.kv->backend)) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
-            *dflash_host_ingress                       = {};
-            dflash_host_ingress->active_lanes[0]       = static_cast<std::int32_t>(sequence.lane);
-            const StateImageSelectors selectors        = state_selectors(sequence);
-            dflash_host_ingress->state_source_slots[0] = selectors.source;
-            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-            dflash_host_ingress->dflash_kv_table_rows[0] =
-                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
         }
 
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
@@ -11060,7 +11050,7 @@ void ProgramImplCore::prepare_graphs() {
             controls.push_back(io.mtp->target_input_ids);
             controls.push_back(io.mtp->target_positions);
         }
-        if (io.dflash_prefill) { controls.push_back(io.dflash_prefill->produced_count); }
+        if (io.dflash_prefill) { controls.push_back(io.dflash_prefill->local_append_count); }
         for (const Tensor& tensor : controls) {
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
@@ -11580,7 +11570,8 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             selectors.source,
             selectors.destination,
             staged.initial_mtp_extent,
-            dflash_host_ingress};
+            0,
+            dflash_prefill_host_ingress};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -11626,6 +11617,9 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
                 schedule_state.state_destination_slot = selectors.destination;
+                schedule_state.dflash_kv_table_row =
+                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                         : 0;
                 if (staged.next_capture < staged.capture_groups.size()) {
                     rewrite_capture_hidden =
                         state_images->continuation_hidden_slot(selectors.destination);

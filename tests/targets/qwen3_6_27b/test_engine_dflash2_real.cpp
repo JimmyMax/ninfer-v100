@@ -116,6 +116,20 @@ int main(int argc, char** argv) {
         require(penalized.generated_token_ids == penalty_reference,
                 "DFlash2 committed token counts differ from ordinary decoding");
 
+        ninfer::PromptInput thinking_prompt;
+        thinking_prompt.options.enable_thinking = true;
+        thinking_prompt.messages.push_back({
+            .role  = ninfer::ChatRole::User,
+            .parts = {{.kind = ninfer::MessagePartKind::Text,
+                       .text = "Explain why there are infinitely many prime numbers."}},
+        });
+        auto thinking_request                      = request(64);
+        thinking_request.execution.thinking.budget = 1;
+        const auto forced = engine.generate(engine.prepare(thinking_prompt), thinking_request);
+        valid(forced, 64);
+        require(forced.thinking.applied && forced.thinking.injected_tokens != 0,
+                "DFlash2 did not commit the forced thinking-control suffix");
+
         // All rows share a known target prefix, while their budgets force P=0, partial and full W.
         std::vector<ninfer::GenerationHandle> handles;
         for (unsigned row = 0; row < batch; ++row) {

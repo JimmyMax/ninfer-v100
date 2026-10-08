@@ -202,9 +202,10 @@ broad additions without a concrete regression risk do not belong in the permanen
 ## DFlash2 Engine integration
 
 The real test uses one explicit companion artifact and compares a fixed greedy fixture and its
-penalty-count variant with ordinary decoding. It also checks compact batches with unequal output
-budgets, same-seed stochastic replay, retained/fresh prefix behavior, and absence of a full backend
-KV pool. A shared DFlash/DFlash2 fixture starts decode at token 63, verifies across the page
+penalty-count variant with ordinary decoding. It also checks forced thinking-control append
+(DFlash prefill must bind each chunk to its current state slot and KV row, not stale decode
+controls), compact batches with unequal output budgets, same-seed stochastic replay,
+retained/fresh prefix behavior, and absence of a full backend KV pool. A shared DFlash/DFlash2 fixture starts decode at token 63, verifies across the page
 boundary, stops after one target column at token 64, and checks the exact retained frontier and
 subsequent generation with and without reuse.
 The KV Store test checks exact mapping and reservation accounting for the same transition.

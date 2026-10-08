@@ -14,18 +14,26 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 namespace {
 
 DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
-    if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
+    if (!state.execution.io.dflash_prefill || state.dflash_prefill_host_ingress == nullptr) {
         throw std::logic_error("DFlash prefill controls are unavailable");
     }
     return dflash_feature_sink(
         state, [&state](const Tensor& features, const Tensor& positions, bool rewrite_checkpoint) {
-            auto& frame  = *state.execution.io.dflash_decode;
-            Tensor count = frame.append_counts.slice(0, 0, 1);
-            Tensor lane  = frame.state_destination_slots.slice(0, 0, 1);
-            Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
-            ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
+            auto& frame = *state.execution.io.dflash_prefill;
+            // Target execution and draft append use the same chunk bindings. Decode may have
+            // used another compact row, or a checkpoint may have forked the destination slot.
+            *state.dflash_prefill_host_ingress = {
+                .append_count           = features.ne[1],
+                .state_destination_slot = state.state_destination_slot,
+                .full_kv_table_row      = state.dflash_kv_table_row,
+            };
+            CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, state.dflash_prefill_host_ingress,
+                                       sizeof(qwen3_6::DFlashPrefillIngress),
+                                       cudaMemcpyHostToDevice, state.execution.device.stream));
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
-            dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
+            dflash_append_context(state, features, positions, frame.append_count,
+                                  frame.state_destination_slot, frame.full_kv_table_row,
+                                  {exact, exact});
             (void)rewrite_checkpoint;
         });
 }
