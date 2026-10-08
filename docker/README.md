@@ -13,6 +13,18 @@
   fits the default recipe (230k context); smaller cards must lower
   `MAX_CONTEXT`.
 
+## Prebuilt image (recommended)
+
+Every release publishes a ready-to-run image to GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/jimmymax/ninfer-v100:latest   # or a version tag, e.g. :v1.1.0
+docker tag ghcr.io/jimmymax/ninfer-v100:latest ninfer-v100:latest
+```
+
+With that tag in place you can skip to [Step 3](#step-3--run). Steps 1–2
+below are only needed if you want to build the image yourself.
+
 ## Step 1 — get the prebuilt binary
 
 Download `ninfer-serve-sm70.tar.gz` from the
@@ -123,6 +135,18 @@ with `docker logs -f ninfer-v100`.
 - 显卡：**仅支持 Tesla V100 (sm_70)**。二进制硬性要求计算能力 7.0，消费卡
   （RTX 4090 等）启动即被拒。32G 卡跑默认配方（230k 上下文）；更小的卡请调低
   `MAX_CONTEXT`。
+
+## 预构建镜像（推荐）
+
+每次发布都会推送可直接运行的镜像到 GitHub Container Registry：
+
+```bash
+docker pull ghcr.io/jimmymax/ninfer-v100:latest   # 或版本标签，如 :v1.1.0
+docker tag ghcr.io/jimmymax/ninfer-v100:latest ninfer-v100:latest
+```
+
+打上该标签后即可直接跳到[第 3 步](#第-3-步--运行)。下面的第 1–2 步仅在
+你想自己构建镜像时才需要。
 
 ## 第 1 步 — 获取预编译二进制
 

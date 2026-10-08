@@ -1,0 +1,246 @@
+# Release pipeline for the NInfer V100 (sm_70) fork.
+#
+# Triggers:
+#   - push a tag:        git tag v1.1.0 && git push origin v1.1.0
+#   - manual dispatch:   Actions → release → Run workflow → version v1.1.0
+#
+# Outputs:
+#   - GitHub Release with Linux tarballs (CLI + server + perplexity, sm_70)
+#   - Runtime Docker image pushed to ghcr.io/<owner>/ninfer-v100
+#
+# GitHub-hosted runners have no GPU; the build is compile-only. The smoke
+# step tolerates binaries that insist on a GPU even for --help.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag (e.g. v1.1.0)'
+        required: true
+        type: string
+
+env:
+  CUDA_APT_VERSION: '12-8'
+  CUDA_HOME: /usr/local/cuda-12.8
+  CUTLASS_VERSION: '4.4.2'
+
+jobs:
+  build:
+    name: Build Linux binaries (sm_70)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: meta
+        run: echo "version=${{ inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config ccache curl ca-certificates \
+            libcurl4-openssl-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+
+      - name: Install CUDA 12.8 toolkit (nvcc + dev libs, no driver)
+        run: |
+          curl -fLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-${{ env.CUDA_APT_VERSION }} \
+            cuda-cudart-dev-${{ env.CUDA_APT_VERSION }} \
+            cuda-nvtx-${{ env.CUDA_APT_VERSION }} \
+            cuda-driver-dev-${{ env.CUDA_APT_VERSION }}
+          echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
+          "$CUDA_HOME/bin/nvcc" --version
+
+      - name: Cache CUTLASS ${{ env.CUTLASS_VERSION }}
+        uses: actions/cache@v4
+        with:
+          path: cutlass-${{ env.CUTLASS_VERSION }}
+          key: cutlass-${{ env.CUTLASS_VERSION }}-v1
+
+      - name: Fetch CUTLASS ${{ env.CUTLASS_VERSION }}
+        run: |
+          if [ ! -f "cutlass-${{ env.CUTLASS_VERSION }}/CMakeLists.txt" ]; then
+            curl -fL "https://github.com/NVIDIA/cutlass/archive/refs/tags/v${{ env.CUTLASS_VERSION }}.tar.gz" | tar xz
+          fi
+          test -f "cutlass-${{ env.CUTLASS_VERSION }}/CMakeLists.txt"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-sm70-${{ github.sha }}
+          restore-keys: ccache-sm70-
+
+      # Recipe mirrors docs/V100-BUILD.md: sm_70 only, explicit CUDA 12.8 nvcc,
+      # local CUTLASS via FETCHCONTENT_SOURCE_DIR_CUTLASS.
+      - name: Configure (sm_70 only)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=70 \
+            -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+            -DNINFER_BUILD_APPS=ON \
+            -DBUILD_TESTING=OFF \
+            -DNINFER_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            -DFETCHCONTENT_SOURCE_DIR_CUTLASS="$PWD/cutlass-${{ env.CUTLASS_VERSION }}"
+
+      - name: Build
+        run: |
+          export CCACHE_DIR="$PWD/.ccache"
+          cmake --build build -j"$(nproc)"
+          ccache --show-stats || true
+
+      - name: Smoke check (no GPU on CI)
+        run: |
+          file build/apps/ninfer build/apps/ninfer-serve build/apps/ninfer-perplexity
+          if ldd build/apps/ninfer-serve | grep -q "not found"; then
+            ldd build/apps/ninfer-serve
+            echo "::error::unresolved shared libraries"
+            exit 1
+          fi
+          ./build/apps/ninfer --help >/dev/null 2>&1 \
+            && echo "ninfer --help OK" \
+            || echo "::warning::ninfer --help exits nonzero without a GPU (tolerated)"
+          ./build/apps/ninfer-serve --help >/dev/null 2>&1 \
+            && echo "ninfer-serve --help OK" \
+            || echo "::warning::ninfer-serve --help exits nonzero without a GPU (tolerated)"
+
+      - name: Package release tarballs
+        run: |
+          set -euo pipefail
+          V="${{ steps.meta.outputs.version }}"
+          cd build/apps
+          for b in ninfer ninfer-serve ninfer-perplexity; do strip "$b"; done
+          cd "$GITHUB_WORKSPACE"
+
+          # Full bundle: all three apps + docs.
+          PKG="ninfer-v100-${V}-linux-x86_64-sm70"
+          mkdir -p "dist/$PKG/bin"
+          cp build/apps/ninfer build/apps/ninfer-serve build/apps/ninfer-perplexity "dist/$PKG/bin/"
+          cp README.md README.zh-CN.md LICENSE docs/V100-BUILD.md "dist/$PKG/"
+          tar czf "dist/$PKG.tar.gz" -C dist "$PKG"
+          rm -rf "dist/$PKG"
+
+          # Thin bundle matching docker/README.md step 1 (bin/ninfer-serve).
+          mkdir -p dist/thin/bin
+          cp build/apps/ninfer-serve dist/thin/bin/
+          tar czf dist/ninfer-serve-sm70.tar.gz -C dist/thin bin
+          rm -rf dist/thin
+
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          ls -lh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tarballs
+          path: dist/
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-tarballs
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          name: NInfer V100 ${{ needs.build.outputs.version }}
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Prebuilt **Tesla V100 (sm_70)** binaries, compiled with CUDA 12.8 on
+            Ubuntu 24.04 (glibc 2.39). The runtime hard-requires compute
+            capability 7.0 — other GPUs are rejected at startup.
+
+            ## Assets
+
+            | File | Contents |
+            |---|---|
+            | `ninfer-v100-${{ needs.build.outputs.version }}-linux-x86_64-sm70.tar.gz` | `ninfer` CLI + `ninfer-serve` + `ninfer-perplexity`, docs, license |
+            | `ninfer-serve-sm70.tar.gz` | server binary only, ready for `docker/README.md` step 1 |
+
+            ## Docker
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository_owner }}/ninfer-v100:${{ needs.build.outputs.version }}
+            ```
+
+            See [docker/README.md](docker/README.md) for the one-click compose
+            recipe and [docs/V100-BUILD.md](docs/V100-BUILD.md) for the runtime
+            flags. Model `.ninfer` artifacts are downloaded separately from
+            Hugging Face / ModelScope — see the README model table.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Build & push runtime image (ghcr.io)
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-tarballs
+          path: dist
+
+      # docker/Dockerfile expects the prebuilt binary at docker/bin/ninfer-serve.
+      - name: Stage prebuilt binary
+        run: |
+          mkdir -p docker/bin
+          tar xzf dist/ninfer-serve-sm70.tar.gz -C docker/bin --strip-components=1
+          test -x docker/bin/ninfer-serve
+          ls -lh docker/bin/
+
+      - name: Resolve image name (lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: docker/
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.build.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
