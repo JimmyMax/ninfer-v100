@@ -112,8 +112,10 @@ jobs:
       - name: Smoke check (no GPU on CI)
         run: |
           file build/apps/ninfer build/apps/ninfer-serve build/apps/ninfer-perplexity
-          if ldd build/apps/ninfer-serve | grep -q "not found"; then
-            ldd build/apps/ninfer-serve
+          # libcuda.so.1 is the driver library injected at runtime on GPU hosts
+          # (and by nvidia-container-toolkit); it is always absent on CI.
+          if ldd build/apps/ninfer-serve | grep "not found" | grep -vq "libcuda.so.1"; then
+            ldd build/apps/ninfer-serve | grep "not found"
             echo "::error::unresolved shared libraries"
             exit 1
           fi
