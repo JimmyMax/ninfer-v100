@@ -1,0 +1,89 @@
+# Compile verification for the V100 (sm_70) fork on every push to master.
+#
+# GitHub-hosted runners have no GPU: this builds the product and the test
+# suite (compile-only). Runtime tests require a Tesla V100; see tests/README.md.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  CUDA_APT_VERSION: '12-8'
+  CUDA_HOME: /usr/local/cuda-12.8
+  CUTLASS_VERSION: '4.4.2'
+
+jobs:
+  build:
+    name: Build + tests compile (sm_70)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config ccache curl ca-certificates \
+            libcurl4-openssl-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+
+      - name: Install CUDA 12.8 toolkit (nvcc + dev libs, no driver)
+        run: |
+          curl -fLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-nvcc-${{ env.CUDA_APT_VERSION }} \
+            cuda-cudart-dev-${{ env.CUDA_APT_VERSION }} \
+            cuda-nvtx-${{ env.CUDA_APT_VERSION }} \
+            cuda-driver-dev-${{ env.CUDA_APT_VERSION }}
+          echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
+          "$CUDA_HOME/bin/nvcc" --version
+
+      - name: Cache CUTLASS ${{ env.CUTLASS_VERSION }}
+        uses: actions/cache@v4
+        with:
+          path: cutlass-${{ env.CUTLASS_VERSION }}
+          key: cutlass-${{ env.CUTLASS_VERSION }}-v1
+
+      - name: Fetch CUTLASS ${{ env.CUTLASS_VERSION }}
+        run: |
+          if [ ! -f "cutlass-${{ env.CUTLASS_VERSION }}/CMakeLists.txt" ]; then
+            curl -fL "https://github.com/NVIDIA/cutlass/archive/refs/tags/v${{ env.CUTLASS_VERSION }}.tar.gz" | tar xz
+          fi
+          test -f "cutlass-${{ env.CUTLASS_VERSION }}/CMakeLists.txt"
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-ci-sm70-${{ github.sha }}
+          restore-keys: ccache-ci-sm70-
+
+      - name: Configure (sm_70, apps + tests)
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=70 \
+            -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
+            -DNINFER_BUILD_APPS=ON \
+            -DBUILD_TESTING=ON \
+            -DNINFER_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            -DFETCHCONTENT_SOURCE_DIR_CUTLASS="$PWD/cutlass-${{ env.CUTLASS_VERSION }}"
+
+      - name: Build
+        run: |
+          export CCACHE_DIR="$PWD/.ccache"
+          cmake --build build -j"$(nproc)"
+          ccache --show-stats || true
