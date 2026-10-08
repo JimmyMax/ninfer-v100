@@ -230,6 +230,7 @@ public:
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);
         load              = std::move(constructed.load);
+        load.cuda_sync_mode = device.sync_mode();
         sampling_defaults = constructed.sampling_defaults;
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         core = std::visit(

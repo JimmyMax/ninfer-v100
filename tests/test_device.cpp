@@ -4,6 +4,8 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace {
@@ -48,7 +50,19 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--invalid-sync") {
+        try {
+            ninfer::DeviceContext ctx(0);
+        } catch (const std::invalid_argument& error) {
+            return std::string_view(error.what()).find("NINFER_CUDA_SYNC") != std::string_view::npos
+                       ? 0
+                       : fail("invalid sync setting has no configuration diagnostic");
+        }
+        return fail("invalid sync setting did not fail before CUDA initialization");
+    }
+    const unsigned int expected_flags =
+        argc == 2 ? static_cast<unsigned int>(std::stoul(argv[1])) : cudaDeviceScheduleSpin;
     int count                   = 0;
     const cudaError_t count_err = cudaGetDeviceCount(&count);
     if (cuda_unavailable(count_err)) {
@@ -67,6 +81,11 @@ int main() {
     int failures = 0;
 
     ninfer::DeviceContext ctx(0);
+    unsigned int actual_flags = 0;
+    CUDA_CHECK(cudaGetDeviceFlags(&actual_flags));
+    if ((actual_flags & cudaDeviceScheduleMask) != expected_flags) {
+        return fail("CUDA did not apply the requested synchronization schedule");
+    }
     if (ctx.device != 0) {
         ++failures;
         std::cerr << "ctx.device expected 0, got " << ctx.device << '\n';

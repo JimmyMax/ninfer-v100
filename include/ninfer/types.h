@@ -952,6 +952,7 @@ struct LoadSummary {
     std::string target;
     std::string model_id;
     std::string weights_id;
+    std::string cuda_sync_mode;
     double load_seconds                = 0.0;
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;
