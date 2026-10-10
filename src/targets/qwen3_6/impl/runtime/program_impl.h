@@ -11199,8 +11199,8 @@ void ProgramImplCore::prepare_graphs() {
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
-        const auto ordinary_profiles = ordinary_graph_profiles(capacity);
-        validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
+        const auto ordinary_profiles = ordinary_graph_profiles(graph_capacity());
+        validate_graph_profiles(ordinary_profiles, graph_capacity() - 1, "ordinary");
         const std::uint32_t ordinary_batch_limit = max_concurrency;
         schedule::OrdinaryBatchContext ordinary_state{
             execution_core(nullptr), decoder->text_kv,
@@ -11233,8 +11233,8 @@ void ProgramImplCore::prepare_graphs() {
     }
 
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        const auto planned_profiles = mtp_graph_profiles(capacity, draft_window);
-        validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
+        const auto planned_profiles = mtp_graph_profiles(graph_capacity(), draft_window);
+        validate_graph_profiles(planned_profiles, graph_capacity() - 1, "MTP");
         schedule::MtpBatchContext mtp_state{execution_core(&*replay_records),
                                             decoder->text_kv,
                                             *decoder->mtp_cache(),
@@ -11247,7 +11247,7 @@ void ProgramImplCore::prepare_graphs() {
         device.synchronize();
         schedule::mtp_decode_batch(
             mtp_state, 1, draft_window, draft_window,
-            mtp_causal_attention_envelopes(code_warm.max, draft_window, draft_window, capacity),
+            mtp_causal_attention_envelopes(code_warm.max, draft_window, draft_window, graph_capacity()),
             nullptr);
         device.synchronize();
 
@@ -11264,7 +11264,7 @@ void ProgramImplCore::prepare_graphs() {
                 schedule::capture_mtp_decode_batch(
                     mtp_state, static_cast<std::int32_t>(batch_size), draft_window, draft_window,
                     mtp_causal_attention_envelopes(planned.max, draft_window, draft_window,
-                                                   capacity),
+                                                   graph_capacity()),
                     profile.definition);
             }
         }
@@ -11274,8 +11274,8 @@ void ProgramImplCore::prepare_graphs() {
         // next-round agreement guard; regenerating the configured window here needlessly ran
         // the autoregressive MTP tail while a copied continuation remained valid.
         constexpr std::uint32_t lookup_proposal_k = 1;
-        const auto lookup_profiles       = mtp_graph_profiles(capacity, lookup_k);
-        validate_graph_profiles(lookup_profiles, capacity - 1, "MTP lookup");
+        const auto lookup_profiles       = mtp_graph_profiles(graph_capacity(), lookup_k);
+        validate_graph_profiles(lookup_profiles, graph_capacity() - 1, "MTP lookup");
         schedule::MtpBatchContext lookup_state{execution_core(&*mtp_lookup_replay_records),
                                                decoder->text_kv,
                                                *decoder->mtp_cache(),
@@ -11297,14 +11297,14 @@ void ProgramImplCore::prepare_graphs() {
                     lookup_state, static_cast<std::int32_t>(batch_size), lookup_k,
                     lookup_proposal_k,
                     mtp_causal_attention_envelopes(planned.max, lookup_k, lookup_proposal_k,
-                                                   capacity),
+                                                   graph_capacity()),
                     profile.definition);
             }
         }
     }
     if (is_masked_draft_backend(speculative_backend)) {
-        const auto batch_one_profiles = dflash_graph_profiles(capacity, draft_window, 1);
-        validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
+        const auto batch_one_profiles = dflash_graph_profiles(graph_capacity(), draft_window, 1);
+        validate_graph_profiles(batch_one_profiles, graph_capacity() - 1, "DFlash");
         schedule::DFlashBatchContext dflash_state{execution_core(&*replay_records),
                                                   decoder->text_kv,
                                                   *dflash,
@@ -11327,8 +11327,8 @@ void ProgramImplCore::prepare_graphs() {
         for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
             const auto planned_profiles =
                 batch_size == 1 ? batch_one_profiles
-                                : dflash_graph_profiles(capacity, draft_window, batch_size);
-            validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
+                                : dflash_graph_profiles(graph_capacity(), draft_window, batch_size);
+            validate_graph_profiles(planned_profiles, graph_capacity() - 1, "DFlash");
             for (const GraphExecutionProfile planned : planned_profiles) {
                 dflash_graphs.profiles.emplace_back();
                 DecodeGraphProfile& profile    = dflash_graphs.profiles.back();
@@ -12038,14 +12038,14 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         schedule::MtpCausalAttentionEnvelopes envelopes =
-            mtp_causal_attention_envelopes(maximum_frontier, verify_k, proposal_k, capacity);
+            mtp_causal_attention_envelopes(maximum_frontier, verify_k, proposal_k, graph_capacity());
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(graph_family, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "MTP batch");
             executable = &install_graph_profile(graph_family, profile, "MTP batch");
             envelopes = mtp_causal_attention_envelopes(
-                profile.max_execution_frontier, verify_k, proposal_k, capacity);
+                profile.max_execution_frontier, verify_k, proposal_k, graph_capacity());
         }
 
         *mtp_host_ingress = {};

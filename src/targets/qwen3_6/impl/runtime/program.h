@@ -1341,6 +1341,11 @@ private:
         return kvmem_window_tokens ? logical_tokens - sequence.window.removed_tokens
                                    : logical_tokens;
     }
+    // Graph profiles and decode envelopes cover one execution unit, which never exceeds the
+    // KVMem sparse window; the logical ceiling lives in capacity only.
+    [[nodiscard]] std::uint32_t graph_capacity() const noexcept {
+        return kvmem_window_tokens ? kvmem_window_tokens : capacity;
+    }
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

@@ -775,7 +775,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles =
-                mtp_graph_profiles(impl->capacity, qwen3_6::kMtpLookupMaximumDrafts);
+                mtp_graph_profiles(impl->kvmem_window_tokens ? impl->kvmem_window_tokens : impl->capacity, qwen3_6::kMtpLookupMaximumDrafts);
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
                 [&](GraphExecutionProfile profile) {
@@ -792,7 +792,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =
-                    dflash_graph_profiles(impl->capacity, impl->draft_window, batch_size);
+                    dflash_graph_profiles(impl->kvmem_window_tokens ? impl->kvmem_window_tokens : impl->capacity, impl->draft_window, batch_size);
                 return graph_topology_allowance(
                     profiles,
                     [&](GraphExecutionProfile profile) {
