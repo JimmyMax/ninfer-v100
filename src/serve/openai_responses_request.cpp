@@ -97,7 +97,8 @@ std::string item_id(const Json& item, const char* prefix) {
     return item.at("id").get<std::string>();
 }
 
-ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
+// `image` receives the part's detail.
+ninfer::product::media_acquire::Source parse_image_source(const Json& part, ContentPart& image) {
     if (part.contains("file_id") && !part.at("file_id").is_null()) {
         bad_request("input_image.file_id requires a Files API, which NInfer does not provide",
                     "input", "file_inputs_not_supported");
@@ -110,10 +111,10 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
         if (!part.at("detail").is_string()) {
             bad_request("input_image.detail must be a string", "input");
         }
-        if (part.at("detail").get<std::string>() != "auto") {
-            bad_request("only input_image detail 'auto' is supported", "input",
-                        "image_detail_not_supported");
-        }
+        const std::string detail = part.at("detail").get<std::string>();
+        const auto parsed        = parse_image_detail(detail);
+        image.image_detail       = parsed.value_or(ninfer::ImageDetail::Auto);
+        if (!parsed) { image.unknown_image_detail = detail; }
     }
 
     ninfer::product::media_acquire::Source source;
@@ -237,11 +238,12 @@ void parse_message_content_part(const Json& value, ChatRole role, ParsedMessage&
         ContentPart part;
         part.kind     = ContentKind::Image;
         part.type_raw = type;
-        part.source   = parse_image_source(value);
+        part.source   = parse_image_source(value, part);
         apply_shared_breakpoint(part, value, breakpoint_count);
+        Json canonical{{"type", "input_image"},
+                       {"image_url", value.at("image_url")},
+                       {"detail", image_detail_name(part.image_detail)}};
         parsed.turn.content.push_back(std::move(part));
-        Json canonical{
-            {"type", "input_image"}, {"image_url", value.at("image_url")}, {"detail", "auto"}};
         if (value.contains("prompt_cache_breakpoint")) {
             canonical["prompt_cache_breakpoint"] = value.at("prompt_cache_breakpoint");
         }
@@ -493,7 +495,7 @@ ChatTurn parse_function_call_output_item(
                 ContentPart part;
                 part.kind     = ContentKind::Image;
                 part.type_raw = type;
-                part.source   = parse_image_source(value);
+                part.source   = parse_image_source(value, part);
                 apply_shared_breakpoint(part, value, breakpoint_count);
                 turn.content.push_back(std::move(part));
             } else if (type == "input_file") {
@@ -1018,13 +1020,16 @@ void parse_truncation(const Json& body) {
 
 ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& limits) {
     ParsedPromptFields out;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get_ref<const std::string&>().empty()) {
-        bad_request("missing required field: model", "model");
+    if (body.contains("model") && !body.at("model").is_null() &&
+        !body.at("model").is_string()) {
+        bad_request("model must be a string", "model");
     }
-    out.prompt.model = body.at("model").get<std::string>();
+    if (body.contains("model") && body.at("model").is_string()) {
+        out.prompt.model = body.at("model").get<std::string>();
+    }
     if (body.contains("input") && !body.at("input").is_null()) {
         parse_input(body.at("input"), out.prompt, out.tool_identities);
+        settle_image_details(out.prompt.input_turns, limits, "input", "input_image.detail");
     }
     if (body.contains("instructions") && !body.at("instructions").is_null()) {
         if (!body.at("instructions").is_string()) {

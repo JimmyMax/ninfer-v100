@@ -140,8 +140,12 @@ int test_envelope_and_field_policy() {
                       "Anthropic temperature range was not enforced");
     body          = base_request();
     body["top_k"] = 21;
+    failures += check(parse(body).generation.sampling.top_k == kSamplerTopKCap,
+                      "a wider-than-Engine top_k is clamped to the candidate cap");
+    body          = base_request();
+    body["top_k"] = -1;
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
-                      "Engine top_k range was not enforced");
+                      "negative Anthropic top_k is rejected");
     body                  = base_request();
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_code([&] { (void)parse(body); }) == "output_config_format_not_supported",

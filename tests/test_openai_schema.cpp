@@ -40,7 +40,7 @@ bool throws_logic(Function&& function) {
     return false;
 }
 
-RequestLimits limits() { return RequestLimits{.default_max_tokens = 512}; }
+RequestLimits limits() { return RequestLimits{.default_max_tokens = 512, .max_context = 4096}; }
 
 Json base_request() {
     return Json{{"model", "qwen"},
@@ -119,6 +119,28 @@ int test_request_envelope_and_sampling() {
                   defaults.generation.max_tokens == limits().default_max_tokens,
               "protocol defaults remain outside GenerationRequest");
 
+    Json unbounded          = base_request();
+    unbounded["max_tokens"] = -1;
+    const OpenAIChatRequest unlimited = parse(unbounded);
+    failures += check(unlimited.output_tokens_explicit &&
+                          unlimited.generation.max_tokens == limits().max_context,
+                      "max_tokens -1 takes the context upper bound as the output budget");
+    failures += check(options(unlimited.generation).execution.requested_output_tokens ==
+                          static_cast<std::uint32_t>(limits().max_context),
+                      "the -1 budget reaches Engine request options");
+    unbounded["max_completion_tokens"] = -1;
+    unbounded.erase("max_tokens");
+    failures += check(parse(unbounded).generation.max_tokens == limits().max_context,
+                      "max_completion_tokens -1 has the same no-limit meaning");
+    unbounded.erase("max_completion_tokens");
+    unbounded["max_tokens"] = -2;
+    failures += check(api_error([&] { (void)parse(unbounded); }).param == "max_tokens",
+                      "a negative max_tokens other than -1 is rejected");
+    unbounded.erase("max_tokens");
+    unbounded["max_completion_tokens"] = -2;
+    failures += check(api_error([&] { (void)parse(unbounded); }).param == "max_completion_tokens",
+                      "a negative max_completion_tokens other than -1 is rejected");
+
     Json malformed              = base_request();
     malformed["stream_options"] = true;
     failures += check(api_error([&] { (void)parse(malformed); }).param == "stream_options",
@@ -156,6 +178,24 @@ int test_standard_field_policy() {
     rejected("store", true, "store_not_supported");
     rejected("functions", Json::array({Json{{"name", "legacy"}}}), "legacy_tools_not_supported");
 
+    // llama.cpp sampler and stopping controls the Engine does not implement. The released WebUI's
+    // Sampling panel offers all of them, so a non-neutral value must be rejected instead of being
+    // silently ignored.
+    rejected("repeat_penalty", 1.1, "repeat_penalty_not_supported");
+    rejected("typical_p", 0.9, "typical_p_not_supported");
+    rejected("typ_p", 0.9, "typ_p_not_supported");
+    rejected("tfs_z", 0.95, "tfs_z_not_supported");
+    rejected("dynatemp_range", 0.5, "dynatemp_range_not_supported");
+    rejected("mirostat", 2, "mirostat_not_supported");
+    rejected("xtc_probability", 0.5, "xtc_probability_not_supported");
+    rejected("dry_multiplier", 0.8, "dry_multiplier_not_supported");
+    rejected("top_n_sigma", 1.5, "top_n_sigma_not_supported");
+    rejected("n_probs", 1, "n_probs_not_supported");
+    rejected("n_indent", 2, "n_indent_not_supported");
+    rejected("t_max_predict_ms", 500, "t_max_predict_ms_not_supported");
+    rejected("t_max_prompt_ms", 500, "t_max_prompt_ms_not_supported");
+    rejected("samplers", "top_k;top_p", "samplers_not_supported");
+
     Json neutral                      = base_request();
     neutral["n"]                      = 1;
     neutral["logit_bias"]             = Json{{"12", 0}, {"13", 0.0}};
@@ -177,6 +217,20 @@ int test_standard_field_policy() {
     neutral["prompt_cache_retention"] = "24h";
     neutral["service_tier"]           = "priority";
     neutral["future_unknown_field"]   = Json{{"value", 1}};
+    neutral["repeat_penalty"]         = 1.0;
+    neutral["typical_p"]              = 1.0;
+    neutral["typ_p"]                  = 1.0;
+    neutral["tfs_z"]                  = 1.0;
+    neutral["dynatemp_range"]         = 0.0;
+    neutral["mirostat"]               = 0;
+    neutral["xtc_probability"]        = 0.0;
+    neutral["dry_multiplier"]         = 0.0;
+    neutral["top_n_sigma"]            = -1.0;
+    neutral["n_probs"]                = 0;
+    neutral["n_indent"]               = 0;
+    neutral["t_max_predict_ms"]       = 0;
+    neutral["t_max_prompt_ms"]        = 0;
+    neutral["samplers"]               = "";
     failures += check(parse(neutral).generation.messages.size() == 1,
                       "neutral controls and advisory hints are accepted");
 
@@ -377,8 +431,25 @@ int test_messages_and_media() {
                       "image and video compatibility inputs normalize to Engine media");
 
     body["messages"][0]["content"][0]["image_url"]["detail"] = "high";
+    failures += check(parse(body).generation.messages[0].content[0].image_detail ==
+                          ninfer::ImageDetail::High,
+                      "explicit image detail 'high' keeps the server's Vision preprocessing");
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "low";
+    failures += check(api_error([&] { (void)parse(body); }).code ==
+                          "image_detail_low_not_supported",
+                      "image detail 'low' names a preprocessing profile this build does not port");
+    body["messages"][0]["content"][0]["image_url"]["detail"] = "medium";
     failures += check(api_error([&] { (void)parse(body); }).code == "image_detail_not_supported",
-                      "explicit image preprocessing detail rejected");
+                      "unknown image detail value rejected");
+    {
+        RequestLimits lenient = limits();
+        lenient.lenient_image_detail = true;
+        const OpenAIChatRequest relaxed =
+            parse_chat_completion_request(body, lenient);
+        failures += check(relaxed.generation.messages[0].content[0].image_detail ==
+                              ninfer::ImageDetail::Auto,
+                          "--lenient-image-detail reads an unknown detail as auto");
+    }
 
     auto content_rejected = [&](const char* role, const char* type) {
         Json invalid                   = base_request();
@@ -581,10 +652,14 @@ int test_stops_and_ranges() {
         check(api_error([&] { (void)parse(body); }).param == "stop", "empty stop string rejected");
 
     body                                  = base_request();
-    body["top_k"]                         = 21;
-    const GenerationRequest invalid_top_k = parse(body).generation;
-    failures += check(api_error([&] { (void)options(invalid_top_k); }).param == "top_k",
-                      "Engine translator owns sampler value range");
+    body["top_k"]                         = 40;
+    const GenerationRequest wide_top_k    = parse(body).generation;
+    failures += check(options(wide_top_k).execution.sampling.top_k == kSamplerTopKCap,
+                      "a llama.cpp-width top_k is clamped to the Engine candidate cap");
+    body["top_k"]                         = -1;
+    const GenerationRequest negative_top_k = parse(body).generation;
+    failures += check(api_error([&] { (void)options(negative_top_k); }).param == "top_k",
+                      "negative top_k rejected by the common Engine translator");
     body["top_k"]                         = 5;
     body["min_p"]                         = 1.1;
     const GenerationRequest invalid_min_p = parse(body).generation;

@@ -69,9 +69,10 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     if (sampling.top_p && (*sampling.top_p < 0.0F || *sampling.top_p > 1.0F)) {
         invalid_sampling("top_p must be in [0,1]", "top_p");
     }
-    if (sampling.top_k && (*sampling.top_k < 0 || *sampling.top_k > 20)) {
-        invalid_sampling("top_k must be in [0,20]", "top_k");
+    if (sampling.top_k && *sampling.top_k < 0) {
+        invalid_sampling("top_k must not be negative", "top_k");
     }
+    if (sampling.top_k) { sampling.top_k = clamp_request_top_k(*sampling.top_k); }
     if (sampling.min_p && (*sampling.min_p < 0.0F || *sampling.min_p > 1.0F)) {
         invalid_sampling("min_p must be in [0,1]", "min_p");
     }

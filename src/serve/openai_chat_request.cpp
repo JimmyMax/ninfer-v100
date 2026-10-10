@@ -255,8 +255,59 @@ void validate_compatibility_hints(const Json& body) {
     }
 }
 
+// The released WebUI's Sampling panel offers llama.cpp's full sampler set, and a value the user
+// enters there arrives in this request body. NInfer's Engine implements only temperature, top_k,
+// top_p, min_p, the presence/frequency penalties and a seed, so any non-neutral value of a control
+// below would otherwise be accepted and silently ignored - the client would believe a setting is
+// active while the output stays unchanged. Rejecting it says so explicitly. Neutral values are
+// accepted because they are what an untouched client sends. Control table ported from the official
+// tree's native /completion validation.
+void validate_llama_sampling_controls(const Json& body) {
+    struct Control {
+        const char* key;
+        double neutral;
+        bool at_most; // neutral means "at most the neutral value" rather than equality
+    };
+    static constexpr Control controls[] = {
+        {"repeat_penalty", 1.0, false},  {"typical_p", 1.0, false},
+        {"typ_p", 1.0, false},           {"tfs_z", 1.0, false},
+        {"dynatemp_range", 0.0, false},  {"mirostat", 0.0, false},
+        {"xtc_probability", 0.0, false}, {"dry_multiplier", 0.0, false},
+        {"top_n_sigma", 0.0, true},      {"n_probs", 0.0, false},
+        {"n_indent", 0.0, false},        {"t_max_predict_ms", 0.0, true},
+        {"t_max_prompt_ms", 0.0, true},
+    };
+    for (const Control& control : controls) {
+        const std::optional<double> value = get_number(body, control.key);
+        if (!value) { continue; }
+        const bool neutral =
+            control.at_most ? *value <= control.neutral : *value == control.neutral;
+        if (!neutral) {
+            bad_request(std::string(control.key) +
+                            " other than its neutral value requires a llama.cpp sampling or "
+                            "stopping control that NInfer does not provide",
+                        control.key, std::string(control.key) + "_not_supported");
+        }
+    }
+    // The Engine applies a fixed sampler pipeline, so an explicit order cannot be honored either.
+    if (body.contains("samplers") && !body.at("samplers").is_null()) {
+        if (!body.at("samplers").is_string()) {
+            bad_request("samplers must be a string", "samplers");
+        }
+        const std::string order = body.at("samplers").get<std::string>();
+        if (!order.empty()) {
+            bad_request(
+                "samplers='" + order +
+                    "' requests a sampler order that NInfer's fixed sampler pipeline cannot honor; "
+                    "clear the field to use the Engine's pipeline",
+                "samplers", "samplers_not_supported");
+        }
+    }
+}
+
+// `image` receives an image's detail; a video has none.
 ninfer::product::media_acquire::Source parse_media_url(const Json& part, const char* field,
-                                                       bool image) {
+                                                       ContentPart* image) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
     }
@@ -270,18 +321,14 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
             bad_request(std::string(field) + " must contain a string url", "messages");
         }
         url = value.at("url").get<std::string>();
-        if (image && value.contains("detail") && !value.at("detail").is_null()) {
+        if (image != nullptr && value.contains("detail") && !value.at("detail").is_null()) {
             if (!value.at("detail").is_string()) {
                 bad_request("image_url.detail must be a string", "messages");
             }
             const std::string detail = value.at("detail").get<std::string>();
-            if (detail != "auto") {
-                bad_request(
-                    "image_url.detail='" + detail +
-                        "' requests an explicit preprocessing profile that NInfer's fixed Vision "
-                        "frontend cannot apply; use 'auto'",
-                    "messages", "image_detail_not_supported");
-            }
+            const auto parsed        = parse_image_detail(detail);
+            image->image_detail      = parsed.value_or(ninfer::ImageDetail::Auto);
+            if (!parsed) { image->unknown_image_detail = detail; }
         }
     } else {
         bad_request(std::string(field) + " must be a URL string or object", "messages");
@@ -339,7 +386,7 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
                             "modality_not_supported");
             }
             parsed.kind   = ContentKind::Image;
-            parsed.source = parse_media_url(part, "image_url", true);
+            parsed.source = parse_media_url(part, "image_url", &parsed);
         } else if (type == "video_url") {
             // Qwen, vLLM, and SGLang use video_url as a Chat Completions extension for
             // multimodal models. NInfer maps it to the Engine's native Video input.
@@ -348,7 +395,7 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
                             "modality_not_supported");
             }
             parsed.kind   = ContentKind::Video;
-            parsed.source = parse_media_url(part, "video_url", false);
+            parsed.source = parse_media_url(part, "video_url", nullptr);
         } else {
             bad_request("content type '" + type + "' is not supported", "messages",
                         "modality_not_supported");
@@ -873,8 +920,15 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
         limit = optional_int(body, "max_tokens");
         param = "max_tokens";
     }
-    if (limit) {
-        if (*limit < 0) { bad_request(std::string(param) + " must be nonnegative", param); }
+    if (limit && *limit == -1) {
+        // llama.cpp's "no limit", which its WebUI sends by default: the whole context is the
+        // budget. Engine still clamps it to the context remaining after the prepared prompt.
+        output.generation.max_tokens  = limits.max_context;
+        output.output_tokens_explicit = true;
+    } else if (limit) {
+        if (*limit < -1) {
+            bad_request(std::string(param) + " must be nonnegative, or -1 for no limit", param);
+        }
         output.generation.max_tokens  = *limit;
         output.output_tokens_explicit = true;
     } else {
@@ -889,13 +943,16 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     validate_standard_output_controls(body);
     validate_constrained_decoding_extensions(body);
     validate_compatibility_hints(body);
+    validate_llama_sampling_controls(body);
 
     OpenAIChatRequest output;
-    if (!body.contains("model") || !body.at("model").is_string() ||
-        body.at("model").get<std::string>().empty()) {
-        bad_request("missing required field: model", "model");
+    if (body.contains("model") && !body.at("model").is_null() &&
+        !body.at("model").is_string()) {
+        bad_request("model must be a string", "model");
     }
-    output.model = body.at("model").get<std::string>();
+    if (body.contains("model") && body.at("model").is_string()) {
+        output.model = body.at("model").get<std::string>();
+    }
 
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
@@ -903,6 +960,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_tool_choice(body, output.generation);
     parse_parallel_tool_calls(body, output.generation);
     parse_messages(body, output.generation);
+    settle_image_details(output.generation.messages, limits, "messages", "image_url.detail");
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
     parse_stream_options(body, output);

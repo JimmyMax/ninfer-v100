@@ -110,6 +110,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --lenient-image-detail reads an OpenAI image detail other than auto, low or high\n"
+           "       as auto instead of refusing the request\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -326,6 +328,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_cors = true;
         } else if (arg == "--no-webui") {
             options.enable_webui = false;
+        } else if (arg == "--lenient-image-detail") {
+            options.lenient_image_detail = true;
         } else if (arg == "--temperature") {
             options.sampling_overrides.temperature =
                 parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);

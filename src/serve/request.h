@@ -45,6 +45,10 @@ private:
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
     int default_max_tokens = 8192;
+    int max_context        = 8192; // --max-context, the upper bound of a "no limit" budget
+    // --lenient-image-detail: an image detail outside auto, low and high is read as auto instead
+    // of failing with image_detail_not_supported.
+    bool lenient_image_detail = false;
 };
 
 enum class ContentKind {
@@ -73,8 +77,32 @@ struct ContentPart {
     std::string type_raw; // original wire "type" string for diagnostics
     ninfer::product::media_acquire::Source source;
     ninfer::ImageResizePolicy image_resize_policy = ninfer::ImageResizePolicy::Downsize;
+    ninfer::ImageDetail image_detail              = ninfer::ImageDetail::Auto;
+    // A detail value outside auto, low and high, read as auto until settle_image_details accepts
+    // or refuses it.
+    std::string unknown_image_detail;
     std::optional<CacheBoundary> cache_boundary_after;
 };
+
+// OpenAI's image detail values; empty for any other (see settle_image_details).
+[[nodiscard]] inline std::optional<ninfer::ImageDetail> parse_image_detail(std::string_view value) {
+    if (value == "auto") { return ninfer::ImageDetail::Auto; }
+    if (value == "low") { return ninfer::ImageDetail::Low; }
+    if (value == "high") { return ninfer::ImageDetail::High; }
+    return std::nullopt;
+}
+
+[[nodiscard]] inline const char* image_detail_name(ninfer::ImageDetail detail) noexcept {
+    switch (detail) {
+    case ninfer::ImageDetail::Auto:
+        return "auto";
+    case ninfer::ImageDetail::Low:
+        return "low";
+    case ninfer::ImageDetail::High:
+        return "high";
+    }
+    return "auto";
+}
 
 struct ToolDefinition {
     std::string name;
@@ -124,6 +152,17 @@ struct SamplingParams {
     std::optional<double> frequency_penalty;
     std::optional<std::uint64_t> seed;
 };
+
+// The Engine's sampler resolves at most this many candidates. A larger request is clamped rather
+// than refused: llama.cpp and Ollama default to 40 (the released WebUI's Top K field accepts the
+// same range), and with top_p or min_p active over the full vocabulary the nucleus almost always
+// closes inside 20 candidates, so the wider value selects the same token nearly always. The
+// clamped value is what reaches the Engine and the request log. Negative values stay errors.
+inline constexpr int kSamplerTopKCap = 20;
+
+[[nodiscard]] constexpr int clamp_request_top_k(int top_k) noexcept {
+    return top_k > kSamplerTopKCap ? kSamplerTopKCap : top_k;
+}
 
 // Protocol-level effort vocabulary. Each wire adapter accepts the values from
 // its external contract; translation then resolves them against the capabilities

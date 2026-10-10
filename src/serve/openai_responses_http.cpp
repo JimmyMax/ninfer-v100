@@ -244,7 +244,10 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_context        = static_cast<int>(options_.max_context);
+        limits.lenient_image_detail = options_.lenient_image_detail;
         request = parse_openai_responses_create_request(parse_json_body(req), limits);
+        if (request.prompt.model.empty()) { request.prompt.model = public_model_id_; }
         validate_openai_model(request.prompt.model, public_model_id_);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
@@ -512,8 +515,11 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_context        = static_cast<int>(options_.max_context);
+        limits.lenient_image_detail = options_.lenient_image_detail;
         OpenAIResponsesPromptRequest request =
             parse_openai_responses_input_tokens_request(parse_json_body(req), limits);
+        if (request.model.empty()) { request.model = public_model_id_; }
         validate_openai_model(request.model, public_model_id_);
         OpenAIResponsesResolvedPrompt resolved =
             resolve_openai_responses_prompt(request, openai_responses_store_, std::nullopt, false);

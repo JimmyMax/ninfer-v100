@@ -18,6 +18,29 @@ namespace ninfer::serve {
     throw ApiException(std::move(error));
 }
 
+void settle_image_details(std::vector<ChatTurn>& turns, const RequestLimits& limits,
+                          const std::string& param, const std::string& field) {
+    for (ChatTurn& turn : turns) {
+        for (ContentPart& part : turn.content) {
+            if (!part.unknown_image_detail.empty()) {
+                if (!limits.lenient_image_detail) {
+                    bad_request(field + "='" + part.unknown_image_detail +
+                                    "' is not one of 'auto', 'low' or 'high'",
+                                param, "image_detail_not_supported");
+                }
+                part.unknown_image_detail.clear();
+            }
+            if (part.kind == ContentKind::Image && part.image_detail == ninfer::ImageDetail::Low) {
+                bad_request(
+                    field +
+                        "='low' selects a bounded Vision preprocessing profile that this build does "
+                        "not port yet; use 'auto' or 'high'",
+                    param, "image_detail_low_not_supported");
+            }
+        }
+    }
+}
+
 std::optional<int> optional_int(const RequestJson& object, const char* key) {
     if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
     const RequestJson& value = object.at(key);

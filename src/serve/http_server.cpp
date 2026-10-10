@@ -26,7 +26,7 @@ bool is_api_path(std::string_view path) {
            path == "/stats" || path == "/slots" || path == "/props" || path == "/models" ||
            path.starts_with("/models/") || path == "/completion" || path == "/completions" ||
            path == "/tokenize" || path == "/detokenize" || path == "/apply-template" ||
-           path == "/rerank" || path == "/reranking";
+           path == "/rerank" || path == "/reranking" || path == "/tools" || path == "/cors-proxy";
 }
 
 void write_exception(httplib::Response& res, const std::exception& ex) {
@@ -445,6 +445,16 @@ void HttpServer::register_routes() {
     server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
         handle_props(req, res);
     });
+    // llama.cpp features this server does not implement. The released WebUI probes both and reads
+    // this 403 as "feature disabled"; without the routes the SPA fallback answers them with HTML.
+    for (const char* path : {"/tools", "/cors-proxy"}) {
+        server_.Get(path, [this](const httplib::Request& req, httplib::Response& res) {
+            handle_disabled_feature(req, res);
+        });
+        server_.Post(path, [this](const httplib::Request& req, httplib::Response& res) {
+            handle_disabled_feature(req, res);
+        });
+    }
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -534,6 +544,23 @@ void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) c
         {"frequency_penalty", overrides.frequency_penalty.value_or(0.0F)},
     };
     params["seed"] = overrides.seed ? nlohmann::json(*overrides.seed) : nlohmann::json(-1);
+    // llama.cpp sampler and stopping controls the Engine does not implement, at their neutral
+    // values. The released WebUI fills the Sampling panel from the params this endpoint advertises,
+    // so these entries show the server's fixed behavior; a request that changes one is rejected
+    // with <key>_not_supported (see validate_llama_sampling_controls).
+    params["repeat_penalty"]  = 1.0F;
+    params["typical_p"]       = 1.0F;
+    params["typ_p"]           = 1.0F;
+    params["tfs_z"]           = 1.0F;
+    params["dynatemp_range"]  = 0.0F;
+    params["mirostat"]        = 0;
+    params["xtc_probability"] = 0.0F;
+    params["dry_multiplier"]  = 0.0F;
+    params["top_n_sigma"]     = -1.0F;
+    params["n_probs"]         = 0;
+    params["n_indent"]        = 0;
+    // The Engine applies its own sampler pipeline, so the advertised order is empty.
+    params["samplers"] = nlohmann::json::array();
     const nlohmann::json props = {
         {"default_generation_settings",
          {{"n_ctx", options_.max_context},
@@ -552,6 +579,17 @@ void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) c
         {"cors_proxy_enabled", false},
     };
     res.set_content(props.dump(), "application/json");
+}
+
+// llama.cpp's answer for a feature that is switched off. The released WebUI checks the status
+// code and reports "server tools are disabled" instead of a JSON parse failure.
+void HttpServer::handle_disabled_feature(const httplib::Request&, httplib::Response& res) const {
+    res.status = 403;
+    res.set_content(nlohmann::json{{"error",
+                                    {{"message", "this feature is disabled"},
+                                     {"type", "feature_disabled"}}}}
+                        .dump(),
+                    "application/json");
 }
 
 bool HttpServer::webui_enabled() const noexcept {
