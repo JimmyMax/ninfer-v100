@@ -7,6 +7,7 @@
 #include "ops/linear/fp8/fp8_config.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/fp8/fp8_cutlass_sm70.h"
+#include "ops/linear/fp8/fp8_launch.h"
 #endif
 
 #include <algorithm>
@@ -77,6 +78,16 @@ Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::i
 void launch_qpn_residual(const Tensor& x, const Weight& weight, Tensor& residual,
                          WorkspaceArena& workspace, cudaStream_t stream) {
     if (x.ne[1] <= 32) {
+        const std::size_t stage_bytes =
+            static_cast<std::size_t>(x.ne[0]) * static_cast<std::size_t>(x.ne[1]) * 2;
+        const std::size_t aligned_used = (workspace.used() + 255) / 256 * 256;
+        if (workspace.capacity() >= aligned_used && workspace.capacity() - aligned_used >= stage_bytes) {
+            auto scope             = workspace.scope();
+            const DeviceSpan stage = workspace.alloc_bytes(stage_bytes, 256);
+            fp8_stage_bf16_activation_sm70(x, stage.data, stream);
+            fp8_linear_add_qpn_fp16_launch(x, stage.data, weight, residual, stream);
+            return;
+        }
         fp8_linear_add_qpn_launch(x, weight, residual, stream);
         return;
     }
@@ -88,13 +99,19 @@ void launch_qpn_residual(const Tensor& x, const Weight& weight, Tensor& residual
 
 std::size_t qpn_residual_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                          std::int32_t tokens) {
+    // fp16 staging of the activation for the QPN route (T <= 32).
+    WorkspaceLayoutBuilder stage_layout;
+    (void)stage_layout.alloc_bytes(
+        static_cast<std::size_t>(input_rows) * static_cast<std::size_t>(std::min(tokens, 32)) * 2,
+        256);
+    const std::size_t stage_bytes = stage_layout.peak_bytes(1);
     WorkspaceLayoutBuilder layout;
-    if (tokens <= 32) { return 0; }
+    if (tokens <= 32) { return stage_bytes; }
     (void)allocate_projected(layout, output_rows, tokens);
     const std::size_t linear_bytes =
         fp8_cutlass_sm70_workspace_bytes(output_rows, input_rows, tokens);
     (void)layout.alloc_bytes(linear_bytes, 256);
-    return layout.peak_bytes(1);
+    return std::max(layout.peak_bytes(1), stage_bytes);
 }
 #endif
 

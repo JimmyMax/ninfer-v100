@@ -4,6 +4,9 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_launch.h" // fp8_stage_bf16_activation_sm70 (plain bf16 -> fp16)
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -82,6 +85,20 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
         Tensor output_chunk(output, DType::BF16, {weight.n, active});
 #ifdef NINFER_VOLTA_BUILD
         if (nvfp4_volta_qpn_supported(weight.n, weight.k, active)) {
+            // Staging the activation to fp16 takes the per-load bf16 conversions out of the
+            // kernel's inner loop: 5120x17408 T=4 102 us instead of 155 us.
+            const std::size_t stage_bytes =
+                static_cast<std::size_t>(weight.k) * static_cast<std::size_t>(active) * 2;
+            const std::size_t aligned_used =
+                workspace != nullptr ? (workspace->used() + 255) / 256 * 256 : 0;
+            if (workspace != nullptr && workspace->capacity() >= aligned_used &&
+                workspace->capacity() - aligned_used >= stage_bytes) {
+                auto scope             = workspace->scope();
+                const DeviceSpan stage = workspace->alloc_bytes(stage_bytes, 256);
+                fp8_stage_bf16_activation_sm70(input_chunk, stage.data, stream);
+                launch_nvfp4_volta_qpn_fp16(input_chunk, stage.data, weight, output_chunk, stream);
+                continue;
+            }
             launch_nvfp4_volta_qpn(input_chunk, weight, output_chunk, stream);
             continue;
         }
@@ -107,14 +124,23 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
         return nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows);
     }
 #ifdef NINFER_VOLTA_BUILD
+    // fp16 activation staging for the QPN chunks (<= kNvfp4VoltaQpnMaxTokens tokens each).
+    const std::size_t qpn_stage_bytes =
+        policy == LinearPolicy::A16Only
+            ? (static_cast<std::size_t>(input_rows) *
+                       static_cast<std::size_t>(std::min(max_tokens, kNvfp4VoltaQpnMaxTokens)) * 2 +
+                   255) / 256 * 256
+            : 0;
     // The wide-T MMA route in launch_a16 only needs workspace when split-K applies; report that
     // so a caller sizing for the widest T this interval reaches has it available. A caller that
     // doesn't (the zero-workspace linear() overload) still works -- launch_a16 falls back to the
     // chunked route rather than fault.
     if (policy == LinearPolicy::A16Only && max_tokens > kNvfp4VoltaQpnMaxTokens &&
         nvfp4_volta_mma_supported(output_rows, input_rows, max_tokens)) {
-        return nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens);
+        return std::max(nvfp4_volta_mma_workspace_bytes(output_rows, input_rows, max_tokens),
+                        qpn_stage_bytes);
     }
+    return qpn_stage_bytes;
 #endif
     return 0;
 }

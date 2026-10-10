@@ -30,6 +30,18 @@ struct Nvfp4ContiguousOutput {
     }
 };
 
+// residual += value with a single BF16 round (linear_add without a projected temporary).
+struct Nvfp4ResidualOutput {
+    __nv_bfloat16* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        const std::int64_t index = static_cast<std::int64_t>(token) * rows + parent_row;
+        data[index] = __float2bfloat16_rn(value + __bfloat162float(data[index]));
+    }
+};
+
 // Writes the mma accumulator straight through, no BF16 round. Split-projection SwiGLU uses this
 // for its gate pass; its up pass reads that fp32 plane from a fused output policy and performs the
 // activation before the only BF16 round. Splitting keeps each launch at QPN2's tuned

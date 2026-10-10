@@ -20,6 +20,14 @@
 #include <algorithm>
 #include <stdexcept>
 
+namespace ninfer::ops {
+namespace {
+thread_local std::int32_t t_small_t_key_window = 0;
+} // namespace
+void set_small_t_key_window(std::int32_t keys) noexcept { t_small_t_key_window = keys > 0 ? keys : 0; }
+std::int32_t small_t_key_window() noexcept { return t_small_t_key_window; }
+} // namespace ninfer::ops
+
 namespace ninfer::ops::detail {
 namespace {
 
@@ -217,7 +225,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 cache.block_tables.ne[0], invocation.width, invocation.full_width,
                 invocation.column_begin, logical_capacity, scale,
                 static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
-                static_cast<float*>(partial_l.data));
+                static_cast<float*>(partial_l.data), ::ninfer::ops::small_t_key_window());
             CUDA_CHECK(cudaGetLastError());
             return;
         }
@@ -439,8 +447,10 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
     const auto launch_reduce   = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, kDChunk),
                           invocation.width * invocation.batch_size);
-        causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                        Offset><<<grid, kReduceBlock, 0, stream>>>(
+        const auto reduce_kernel =
+            causal_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch,
+                                                          Masked, Offset>;
+        reduce_kernel<<<grid, kReduceBlock, 0, stream>>>(
             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
             static_cast<const float*>(partial_l.data), static_cast<const std::int32_t*>(pos.data),
             invocation.valid_columns

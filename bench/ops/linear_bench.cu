@@ -9,6 +9,10 @@
 //       --qtype q4 --n 4096 --k 5120 --t 8 --profile
 
 #include "ninfer/ops/linear.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/fp8/fp8_prepack_sm70.h"
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#endif
 
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
@@ -650,6 +654,14 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
         checked_mul(static_cast<std::uint64_t>(group.n), max_t, "output allocation");
 
     LinearBenchWeight weight = make_weight(group.qtype, group.n, group.k);
+#ifdef NINFER_VOLTA_BUILD
+    // NINFER_BENCH_PREPACK=1 mirrors the model loader: FP8/NVFP4 weights are QPN-prepacked.
+    if (const char* pp = std::getenv("NINFER_BENCH_PREPACK"); pp != nullptr && pp[0] == '1') {
+        if (group.qtype == QType::FP8_E4M3FN_ROW_BF16S) { ops::detail::fp8_prepack_qpn_sm70(weight.weight); }
+        if (group.qtype == QType::NVFP4) { ops::detail::nvfp4_prepack_qpn_sm70(weight.weight); }
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+#endif
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
     const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(

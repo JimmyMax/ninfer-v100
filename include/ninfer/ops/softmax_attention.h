@@ -199,4 +199,11 @@ void context_softmax_attention(const Tensor& q, const Tensor& query_k, const Ten
     AttentionHeadGeometry geometry, ContextAttentionExecutionEnvelope envelope,
     std::int32_t min_tokens, std::int32_t max_tokens, std::int32_t batch_size);
 
+// Draft-side key window for the small-T int8 attention (MTP layer): while a window W > 0 is set on
+// the calling thread, kernels launched by causal_softmax_attention only attend to the last W keys
+// (rounded down to a 64-key tile). The target model's own attention never sets it, so outputs
+// stay exact; only draft acceptance can change. Captured into CUDA graphs at launch.
+void set_small_t_key_window(std::int32_t keys) noexcept;
+[[nodiscard]] std::int32_t small_t_key_window() noexcept;
+
 } // namespace ninfer::ops

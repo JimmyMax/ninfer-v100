@@ -36,6 +36,26 @@ void launch_nvfp4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaS
         inverse_weight_divisor, stream);
 }
 
+void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const void* x_fp16, const Weight& w, Tensor& out,
+                                 cudaStream_t stream) {
+    const std::int32_t n                   = out.ne[0];
+    const float inverse_weight_divisor = 1.0F / w.weight_scale_divisor;
+    launch_nvfp4_volta_qpn_with_fp16_activation(
+        x, w, static_cast<const half*>(x_fp16),
+        Nvfp4ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), n}, n,
+        inverse_weight_divisor, stream);
+}
+
+void launch_nvfp4_volta_qpn_fp16_residual(const Tensor& x, const void* x_fp16, const Weight& w,
+                                          Tensor& residual, cudaStream_t stream) {
+    const std::int32_t n                   = residual.ne[0];
+    const float inverse_weight_divisor = 1.0F / w.weight_scale_divisor;
+    launch_nvfp4_volta_qpn_with_fp16_activation(
+        x, w, static_cast<const half*>(x_fp16),
+        Nvfp4ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), n}, n,
+        inverse_weight_divisor, stream);
+}
+
 #endif // NINFER_VOLTA_BUILD
 
 } // namespace ninfer::ops::detail

@@ -1,4 +1,6 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
+#include "ops/linear/fp8/fp8_launch.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 
 #include "core/layout.h"
 #include "ninfer/ops/linear.h"
@@ -77,6 +79,20 @@ Tensor allocate_projected(Allocator& allocator, std::int32_t output_rows, std::i
 
 void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& residual,
                             WorkspaceArena& workspace, cudaStream_t stream) {
+    // Decode widths: fp16-staged activation and the residual add fused into the QPN epilogue
+    // (no projected temporary, no separate residual_add launch, one BF16 round).
+    if (x.ne[1] <= kNvfp4VoltaQpnMaxTokens && nvfp4_volta_qpn_supported(weight.n, weight.k, x.ne[1])) {
+        const std::size_t stage_bytes =
+            static_cast<std::size_t>(x.ne[0]) * static_cast<std::size_t>(x.ne[1]) * 2;
+        const std::size_t aligned_used = (workspace.used() + 255) / 256 * 256;
+        if (workspace.capacity() >= aligned_used && workspace.capacity() - aligned_used >= stage_bytes) {
+            auto stage_scope       = workspace.scope();
+            const DeviceSpan stage = workspace.alloc_bytes(stage_bytes, 256);
+            fp8_stage_bf16_activation_sm70(x, stage.data, stream);
+            launch_nvfp4_volta_qpn_fp16_residual(x, stage.data, weight, residual, stream);
+            return;
+        }
+    }
     auto scope         = workspace.scope();
     Tensor projected    = allocate_projected(workspace, weight.n, x.ne[1]);
     if (x.ne[1] >= 33) {
@@ -94,6 +110,12 @@ void launch_linear_then_add(const Tensor& x, const Weight& weight, Tensor& resid
 
 std::size_t linear_then_add_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
                                             std::int32_t tokens) {
+    if (tokens <= kNvfp4VoltaQpnMaxTokens &&
+        nvfp4_volta_qpn_supported(output_rows, input_rows, tokens)) {
+        WorkspaceLayoutBuilder stage;  // fused QPN residual route: only the fp16 activation
+        (void)stage.alloc_bytes(static_cast<std::size_t>(input_rows) * static_cast<std::size_t>(tokens) * 2, 256);
+        return stage.peak_bytes(1);
+    }
     WorkspaceLayoutBuilder layout;
     (void)allocate_projected(layout, output_rows, tokens);
     const std::size_t linear_bytes = tokens >= 33

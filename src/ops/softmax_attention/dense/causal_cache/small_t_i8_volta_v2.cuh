@@ -42,7 +42,7 @@ __launch_bounds__(kCausalSmallTI8VoltaV2Warps * 32, 1) __global__
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    float* partial_acc, float* partial_m, float* partial_l) {
+    float* partial_acc, float* partial_m, float* partial_l, std::int32_t key_window = 0) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
     constexpr int Warps         = kCausalSmallTI8VoltaV2Warps;
     constexpr int Threads       = Warps * 32;
@@ -148,11 +148,15 @@ __launch_bounds__(kCausalSmallTI8VoltaV2Warps * 32, 1) __global__
         causal_small_t_active_splits<Geometry, true>(window, split_count, tokens);
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
+    // Optional draft-side key window: splits cover [key_begin, window) instead of [0, window).
+    const int key_begin =
+        (key_window > 0 && window > key_window) ? ((window - key_window) / Bc) * Bc : 0;
+    const int span          = window - key_begin;
+    const int logical_tiles = div_up(span, Bc);
     const bool tile_split   = logical_tiles >= active_split_count;
     const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
+        tile_split ? div_up(logical_tiles, active_split_count) : div_up(span, active_split_count);
+    const int split_start = key_begin + split * units_per_split * (tile_split ? Bc : 1);
     const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
     const int split_end   = (split_limit < window) ? split_limit : window;
     if (split_start >= split_end) {

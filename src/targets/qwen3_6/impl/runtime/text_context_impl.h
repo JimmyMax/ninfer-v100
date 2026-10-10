@@ -358,6 +358,23 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     ops::rmsnorm(x, *mtp_.input_norm, kCfg.rms_eps, true, ah, s);
 }
 
+namespace {
+// NINFER_MTP_ATTN_WINDOW=W: the MTP (draft) layer attends only to the last W keys. Target-model
+// attention is untouched, so outputs are unchanged; only draft acceptance can move.
+struct MtpKeyWindowScope {
+    MtpKeyWindowScope() noexcept {
+        static const std::int32_t window = [] {
+            const char* v = std::getenv("NINFER_MTP_ATTN_WINDOW");
+            return v != nullptr ? static_cast<std::int32_t>(std::atoi(v)) : 0;
+        }();
+        ops::set_small_t_key_window(window);
+    }
+    ~MtpKeyWindowScope() { ops::set_small_t_key_window(0); }
+    MtpKeyWindowScope(const MtpKeyWindowScope&)            = delete;
+    MtpKeyWindowScope& operator=(const MtpKeyWindowScope&) = delete;
+};
+} // namespace
+
 void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
                                    const Tensor& rope_positions,
                                    ops::CausalAttentionExecutionEnvelope envelope,
@@ -386,6 +403,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, s);
 
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
+    const MtpKeyWindowScope mtp_key_window;
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T ||

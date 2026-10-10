@@ -267,15 +267,45 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     const float head_l =
         causal_merge_split_statistics<Geometry>(partial_m, partial_l, q_head, token, tokens,
                                                 active_split_count, weights, warp_sums, scalars);
-    const int d = d_start + tid;
-    if (tid >= DChunk || d >= kCausalHeadDim) return;
+    // When DChunk < blockDim (the 12/2 TP2 shard uses DChunk 64 with 256 threads), the otherwise
+    // idle threads split the split-loop: group g sums splits g, g+Groups, ... and the groups are
+    // combined through shared memory. 4x the loads in flight per output element.
+    constexpr int Groups = (256 / DChunk) > 0 ? (256 / DChunk) : 1;
+    const int group = tid / DChunk;
+    const int dl    = tid - group * DChunk;
+    const int d     = d_start + dl;
     float numerator = 0.0f;
-    for (int split = 0; split < active_split_count; ++split) {
-        if (weights[split] != 0.0f)
+    if (group < Groups && d < kCausalHeadDim) {
+        // No per-split branch: a zero weight belongs to a neutral split whose partial is 0, and the
+        // branch-free, unrolled form keeps several independent loads in flight per thread (the
+        // guarded loop issued them one at a time and was latency-bound at ~30 us per call).
+        int split = group;
+        for (; split + 7 * Groups < active_split_count; split += 8 * Groups) {
+            float v[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                v[u] = partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token,
+                                                                      split + u * Groups, tokens)];
+            }
+#pragma unroll
+            for (int u = 0; u < 8; ++u) { numerator += v[u] * weights[split + u * Groups]; }
+        }
+        for (; split < active_split_count; split += Groups) {
             numerator +=
                 partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] *
                 weights[split];
+        }
     }
+    if constexpr (Groups > 1) {
+        __shared__ float group_sums[Groups][DChunk];
+        if (group < Groups) { group_sums[group][dl] = numerator; }
+        __syncthreads();
+        if (group != 0) { return; }
+        numerator = 0.0f;
+#pragma unroll
+        for (int g = 0; g < Groups; ++g) { numerator += group_sums[g][dl]; }
+    }
+    if (group != 0 || d >= kCausalHeadDim) return;
 
     const float value = (head_l > 0.0f) ? numerator / head_l : 0.0f;
     out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);

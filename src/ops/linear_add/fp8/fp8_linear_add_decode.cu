@@ -58,6 +58,13 @@ void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& re
         x, weight,
         Fp8ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n, stream);
 }
+
+void fp8_linear_add_qpn_fp16_launch(const Tensor& x, const void* x_fp16, const Weight& weight,
+                                    Tensor& residual, cudaStream_t stream) {
+    launch_fp8_volta_qpn_with_fp16_activation(
+        x, weight, static_cast<const half*>(x_fp16),
+        Fp8ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n, stream);
+}
 #endif
 
 } // namespace ninfer::ops::detail
