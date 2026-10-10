@@ -174,6 +174,16 @@ public:
         object.role          = StateImageRole::ActiveMutable;
     }
 
+    // Marks the active mutable slot as overwritten in place by an out-of-transaction restore
+    // (a KVMem Host checkpoint restore). Advances the content epoch so stale readers fail.
+    void begin_active_overwrite(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (object.role != StateImageRole::ActiveMutable || !object.device_slot) {
+            throw std::logic_error("StateImage active overwrite requires the active mutable slot");
+        }
+        object.content_epoch = next_epoch();
+    }
+
     [[nodiscard]] bool valid(StateImageHandle handle) const noexcept {
         return handle.owner_ == this && handle.index_ < objects_.size() &&
                objects_[handle.index_].role != StateImageRole::Free &&

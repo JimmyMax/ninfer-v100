@@ -10865,9 +10865,12 @@ void ProgramImplCore::ensure_sequence_kv_mapped(SequenceState& sequence, std::ui
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
-    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
+    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text,
+                                               compact_position(sequence, main_tokens),
+                                               device.stream);
     if (backend_tokens != 0) {
-        backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
+        backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend,
+                                                      compact_position(sequence, backend_tokens),
                                                       device.stream);
     }
 }
@@ -10878,9 +10881,10 @@ void ProgramImplCore::commit_sequence_kv(SequenceState& sequence, std::uint32_t 
         (backend_tokens != 0 && !sequence.kv->backend)) {
         throw std::logic_error("KV commit request is outside the sequence bundle");
     }
-    text_kv_addresses->commit_frontier(sequence.kv->text, main_tokens);
+    text_kv_addresses->commit_frontier(sequence.kv->text, compact_position(sequence, main_tokens));
     if (sequence.kv->backend) {
-        backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_tokens);
+        backend_kv_addresses->commit_frontier(*sequence.kv->backend,
+                                              compact_position(sequence, backend_tokens));
     }
 }
 
@@ -10892,9 +10896,11 @@ void ProgramImplCore::trim_sequence_kv(SequenceState& sequence, std::uint32_t ma
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV trim requested without an allocation");
     }
-    text_kv_addresses->destructive_truncate(sequence.kv->text, main_tokens);
+    text_kv_addresses->destructive_truncate(sequence.kv->text,
+                                            compact_position(sequence, main_tokens));
     if (sequence.kv->backend) {
-        backend_kv_addresses->destructive_truncate(*sequence.kv->backend, backend_tokens);
+        backend_kv_addresses->destructive_truncate(*sequence.kv->backend,
+                                                   compact_position(sequence, backend_tokens));
     }
 }
 

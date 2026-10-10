@@ -139,6 +139,9 @@ struct PrepareStats {
 
 struct PreparedPromptData {
     std::vector<TokenId> token_ids;
+    // Exact token span of the final user query, for the KVMem retrieval probe. Absent when
+    // the frontend cannot license a canonical boundary.
+    std::optional<TokenSpan> memory_query;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
     std::int32_t rope_delta = 0;

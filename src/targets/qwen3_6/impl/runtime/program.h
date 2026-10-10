@@ -537,6 +537,8 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    // KVMem: false forbids consuming or publishing retained Host histories for this request.
+    bool allow_memory_reuse = true;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -553,6 +555,9 @@ struct RequestControl {
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
+        // KVMem: frontier/generation licensed by the planner for a Host-history restore.
+        std::uint32_t memory_restore_frontier   = 0;
+        std::uint64_t memory_restore_generation = 0;
     };
 
     std::optional<Prefill> prefill;
@@ -1326,6 +1331,13 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+    // KVMem compact device view: cache positions are logical positions minus the
+    // removed-token count. Identity whenever the integration is disabled.
+    [[nodiscard]] std::uint32_t compact_position(const SequenceState& sequence,
+                                                 std::uint32_t logical_tokens) const noexcept {
+        return kvmem_window_tokens ? logical_tokens - sequence.window.removed_tokens
+                                   : logical_tokens;
+    }
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
@@ -1341,6 +1353,42 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+
+    // KVMem sparse working set (definitions in kvmem_window_impl.h). All frontiers here are
+    // LOGICAL token positions; compact_position() maps them onto the device address space.
+    void prepare_window(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
+                        bool force_selection = false);
+    void archive_memory_window(SequenceState& sequence);
+    [[nodiscard]] bool memory_query_probe(const SequenceState& sequence,
+                                          std::uint32_t prompt_tokens) const;
+    [[nodiscard]] std::uint32_t memory_checkpoint_frontier(const SequenceState& sequence,
+                                                           std::uint32_t prompt_tokens,
+                                                           bool allow_reuse) const;
+    void capture_memory_prefix(SequenceState& sequence, std::uint32_t chunk_tokens);
+    [[nodiscard]] std::unique_ptr<KvmemPrefixCheckpoint>
+    capture_memory_checkpoint(SequenceState& sequence);
+    [[nodiscard]] std::unique_ptr<KvmemPrefixCheckpoint>&
+    memory_checkpoint_slot(KvmemWindowState& window, KvmemCheckpointKind kind);
+    [[nodiscard]] const KvmemPrefixCheckpoint*
+    memory_checkpoint(const KvmemWindowState& window, KvmemCheckpointKind kind) const;
+    void capture_memory_endpoint(SequenceState& sequence, const RequestControl& request) noexcept;
+    [[nodiscard]] bool memory_same_query(const KvmemWindowState& window,
+                                         const PreparedPromptData& prompt,
+                                         std::uint32_t frontier) const;
+    void capture_memory_rewrite(SequenceState& sequence, KvmemCheckpointKind kind) noexcept;
+    void capture_memory_reconstruction_if_ready(SequenceState& sequence);
+    void rewind_memory_query(SequenceState& sequence);
+    void restore_memory_prefix(SequenceState& sequence, const KvmemPrefixCheckpoint& checkpoint,
+                               bool preserve_view = false);
+    void bind_memory_snapshot(SequenceState& sequence);
+    void prepare_memory_statistics(SequenceState& sequence, std::uint32_t query_begin,
+                                   std::uint32_t query_end);
+    void commit_memory_statistics(SequenceState& sequence, std::uint32_t begin,
+                                  std::uint32_t end);
+    void read_memory_candidates();
+    void commit_memory_candidates(SequenceState& sequence, std::uint32_t begin,
+                                  std::uint32_t end, std::uint32_t first_column,
+                                  std::uint32_t row_width);
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
