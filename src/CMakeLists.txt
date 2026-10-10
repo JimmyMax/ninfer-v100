@@ -560,4 +560,27 @@ if(NINFER_BUILD_SERVE)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
     PRIVATE ninfer_media_acquire ninfer_product_logging CUDA::cudart)
+
+  # A WebUI is compiled in only from a local directory, never downloaded at configure time, so
+  # offline and hermetic builds are unaffected. scripts/fetch-webui.sh unpacks llama.cpp's released
+  # WebUI into such a directory.
+  set(NINFER_WEBUI_DIR "" CACHE PATH
+      "Directory of built WebUI files (with index.html) to serve from ninfer-serve; empty embeds none")
+  if(NINFER_WEBUI_DIR)
+    if(NOT EXISTS "${NINFER_WEBUI_DIR}/index.html" AND NOT EXISTS "${NINFER_WEBUI_DIR}/index.html.gz")
+      message(FATAL_ERROR "NINFER_WEBUI_DIR has no index.html: ${NINFER_WEBUI_DIR}")
+    endif()
+    add_executable(ninfer_webui_embed serve/webui/embed.cpp)
+    file(GLOB_RECURSE NINFER_WEBUI_FILES CONFIGURE_DEPENDS "${NINFER_WEBUI_DIR}/*")
+    set(NINFER_WEBUI_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/webui_assets.cpp")
+    add_custom_command(
+      OUTPUT "${NINFER_WEBUI_SOURCE}"
+      COMMAND ninfer_webui_embed "${NINFER_WEBUI_SOURCE}" "${NINFER_WEBUI_DIR}"
+      DEPENDS ninfer_webui_embed ${NINFER_WEBUI_FILES}
+      COMMENT "Embedding the WebUI from ${NINFER_WEBUI_DIR}"
+      VERBATIM)
+    target_sources(ninfer_serve PRIVATE "${NINFER_WEBUI_SOURCE}")
+  else()
+    target_sources(ninfer_serve PRIVATE serve/webui_none.cpp)
+  endif()
 endif()

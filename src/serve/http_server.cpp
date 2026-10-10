@@ -4,6 +4,7 @@
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
+#include "serve/webui.h"
 
 #include <nlohmann/json.hpp>
 
@@ -17,6 +18,16 @@
 
 namespace ninfer::serve {
 namespace {
+
+// Paths the JSON API owns. The WebUI catch-all must never answer one of these, so a client that
+// mistypes an API route gets the API's own 404 instead of the SPA entry page.
+bool is_api_path(std::string_view path) {
+    return path == "/v1" || path.starts_with("/v1/") || path == "/health" || path == "/metrics" ||
+           path == "/stats" || path == "/slots" || path == "/props" || path == "/models" ||
+           path.starts_with("/models/") || path == "/completion" || path == "/completions" ||
+           path == "/tokenize" || path == "/detokenize" || path == "/apply-template" ||
+           path == "/rerank" || path == "/reranking";
+}
 
 void write_exception(httplib::Response& res, const std::exception& ex) {
     ApiError error;
@@ -475,6 +486,13 @@ void HttpServer::register_routes() {
     server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
         handle_messages(req, res);
     });
+
+    // Registered last: httplib tries routes in order, so every API route above wins its path.
+    if (webui_enabled()) {
+        server_.Get(R"(/.*)", [this](const httplib::Request& req, httplib::Response& res) {
+            handle_webui(req, res);
+        });
+    }
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
@@ -495,6 +513,38 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
                     "application/json");
+}
+
+bool HttpServer::webui_enabled() const noexcept {
+    return options_.enable_webui && !webui_assets().empty();
+}
+
+void HttpServer::handle_webui(const httplib::Request& req, httplib::Response& res) const {
+    if (is_api_path(req.path)) {
+        res.status = 404;
+        return;
+    }
+    const bool gzip = req.get_header_value("Accept-Encoding").find("gzip") != std::string::npos;
+    const WebUiAsset* asset = req.path.size() > 1
+                                  ? find_webui_asset(std::string_view(req.path).substr(1), gzip)
+                                  : nullptr;
+    if (asset == nullptr) { asset = find_webui_asset("index.html", gzip); }
+    if (asset == nullptr) {
+        res.status = 404;
+        return;
+    }
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("ETag", std::string(asset->etag));
+    res.set_header("Vary", "Accept-Encoding");
+    if (!asset->encoding.empty()) {
+        res.set_header("Content-Encoding", std::string(asset->encoding));
+    }
+    if (req.get_header_value("If-None-Match") == asset->etag) {
+        res.status = 304;
+        return;
+    }
+    res.set_content(reinterpret_cast<const char*>(asset->bytes.data()), asset->bytes.size(),
+                    std::string(asset->content_type));
 }
 
 bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }

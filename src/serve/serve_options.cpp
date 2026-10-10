@@ -324,6 +324,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.preserve_thinking = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
+        } else if (arg == "--no-webui") {
+            options.enable_webui = false;
         } else if (arg == "--temperature") {
             options.sampling_overrides.temperature =
                 parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
