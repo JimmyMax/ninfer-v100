@@ -269,6 +269,9 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> : ResourceCandidateState {
     // KVMem: retained-history participation and the Host payload bytes reserved while active.
     bool allow_memory_reuse               = false;
     std::uint64_t memory_host_reservation = 0;
+    // KVMem: exact retained-history checkpoint licensed for this request, if any.
+    std::uint32_t memory_restore_frontier   = 0;
+    std::uint64_t memory_restore_generation = 0;
     bool backend_retained_tail_release    = false;
 };
 
@@ -772,6 +775,8 @@ public:
     // retaining a checkpoint, preventing an older concurrent result publishing.
     std::array<MemoryPublication, 32> memory_publications;
     std::uint64_t memory_history_hits = 0, memory_history_misses = 0, memory_history_evictions = 0;
+    // Monotonic ordering for retained Host histories.
+    std::uint64_t next_memory_publication_order = 1;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;

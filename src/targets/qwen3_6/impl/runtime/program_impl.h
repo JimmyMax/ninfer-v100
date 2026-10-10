@@ -9285,6 +9285,11 @@ FinishResult ProgramImplCore::finish(SequenceHandle sequence) noexcept {
     const std::uint32_t continuation_index = active_continuations[lane];
     if (request.lifecycle != Lifecycle::Finishable) { return out; }
     if (!request.publish_continuation) {
+        if (kvmem_window_tokens) {
+            // The native continuation is not catalogued, but the bounded Host history is.
+            capture_memory_endpoint(state, request);
+            retain_memory_history(state, request);
+        }
         if (!clear_lane_strict(state, request)) { return out; }
         out.disposition = runtime::FinishDisposition::Released;
         out.timings     = request.timings;
@@ -10049,6 +10054,22 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         request.allow_memory_reuse   = request_plan.allow_memory_reuse;
         request.memory_host_reservation = request_plan.memory_host_reservation;
         request.memory_session_key   = staged.prompt.context_cache.session_key;
+        if (kvmem_window_tokens) {
+            // Retained Host history: exact checkpoint identity decides whether any bytes are
+            // reused; a miss recomputes the quoted prefix under the reserved budget.
+            staged.memory_restore_frontier   = request_plan.memory_restore_frontier;
+            staged.memory_restore_generation = request_plan.memory_restore_generation;
+            sequence.window.session_key          = staged.prompt.context_cache.session_key;
+            sequence.window.publication_order    = next_memory_publication_order++;
+            sequence.window.update_session_index =
+                staged.prompt.context_cache.update_session_index;
+            if (staged.memory_restore_frontier != 0) {
+                if (!restore_memory_history(sequence, staged)) {
+                    staged.hidden_replay_tokens = staged.memory_restore_frontier;
+                }
+            }
+            reserve_memory_history(sequence, request, staged.prompt);
+        }
         sequence.mtp_draft_count     = 0;
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.swap(materialization_ledger_);

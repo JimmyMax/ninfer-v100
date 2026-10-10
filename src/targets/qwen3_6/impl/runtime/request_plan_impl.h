@@ -492,6 +492,14 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     plan->root_rebuild_tail_begin     = base.root_rebuild_tail_begin;
     plan->allow_memory_reuse          = base.allow_memory_reuse;
     plan->memory_host_reservation     = base.memory_host_reservation;
+    if (kvmem_window_tokens && base.allow_memory_reuse) {
+        // Root requests may consume an exact retained Host history instead of recomputing it.
+        if (const auto match = memory_restorable_history(prompt)) {
+            const auto& history = *memory_histories[match->history];
+            plan->memory_restore_frontier   = match->frontier;
+            plan->memory_restore_generation = history.stamp.session.id;
+        }
+    }
 
     if ((source != nullptr && shared_source != nullptr) ||
         ((source == nullptr && shared_source == nullptr) != !checkpoint.has_value())) {
