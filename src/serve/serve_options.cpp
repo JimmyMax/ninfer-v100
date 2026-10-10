@@ -261,6 +261,30 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--kvmem-selected") {
+            options.kvmem.selected_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kvmem-selected"), "kvmem-selected"));
+        } else if (arg == "--kvmem-reserve") {
+            options.kvmem.reserve_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kvmem-reserve"), "kvmem-reserve"));
+        } else if (arg == "--kvmem-sink") {
+            options.kvmem.sink_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kvmem-sink"), "kvmem-sink"));
+        } else if (arg == "--kvmem-recent") {
+            options.kvmem.recent_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kvmem-recent"), "kvmem-recent"));
+        } else if (arg == "--kvmem-host-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--kvmem-host-mib"), "kvmem-host-mib");
+            if (mib == 0 || mib > std::numeric_limits<std::uint64_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--kvmem-host-mib is out of range");
+            }
+            options.kvmem.host_bytes = mib << 20;
+        } else if (arg == "--kvmem-retained") {
+            options.kvmem.retained_sessions = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kvmem-retained"), "kvmem-retained"));
+        } else if (arg == "--kvmem-verify") {
+            options.kvmem.verify_transfers = true;
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));

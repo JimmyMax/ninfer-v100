@@ -118,7 +118,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         builder, qwen3_6::DecoderStateSpec{
                      .full_attention_layers     = TextConfig::full_attention_layers(),
                      .mtp_layers                = TextConfig::mtp_layers,
-                     .capacity                  = plan.capacity,
+                     // KVMem sizes the paged cache, block tables and views for the sparse
+                     // window; the logical ceiling lives in plan.capacity only.
+                     .capacity                  = plan.kvmem_window_tokens ? plan.kvmem_window_tokens
+                                                                          : plan.capacity,
                      .kv_heads                  = TextConfig::kv_heads,
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_storage                = plan.kv_storage,
@@ -256,7 +259,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     return out;
 }
 
-WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
+WorkspacePlan build_workspace_plan(SequencePlanImpl plan) {
+    // KVMem: no single execution unit covers more than the sparse window, so the workspace is
+    // sized for it while the plan's logical ceiling stays max_context.
+    if (plan.kvmem_window_tokens) { plan.capacity = plan.kvmem_window_tokens; }
     const std::uint32_t chunk_u32 = std::min(plan.prefill_chunk, plan.capacity);
     if (chunk_u32 == 0 ||
         chunk_u32 > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
@@ -866,7 +872,11 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .kvmem_window_tokens = kvmem_window_tokens,
         .kvmem               = options.kvmem,
     };
-    const std::uint32_t logical_pages = page_count(inputs.capacity);
+    // KVMem plans the device KV pool for the sparse window (B+R), not the logical ceiling;
+    // plan.capacity itself stays the logical max_context.
+    const std::uint32_t layout_tokens =
+        inputs.kvmem_window_tokens ? inputs.kvmem_window_tokens : inputs.capacity;
+    const std::uint32_t logical_pages = page_count(layout_tokens);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
