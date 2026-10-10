@@ -201,6 +201,8 @@ public:
             const auto bytes_state = p.state_images->host_layout().image_bytes;
             before = std::make_unique<PinnedHostBuffer>(bytes_state);
             after = std::make_unique<PinnedHostBuffer>(bytes_state);
+            std::memset(before->data(), 0, bytes_state);
+            std::memset(after->data(), 0, bytes_state);
             checked = std::make_unique<PinnedHostBuffer>(selected.size() * backend.page_bytes);
             std::memset(before->data(), 0, bytes_state);
             std::memset(after->data(), 0, bytes_state);
@@ -211,6 +213,7 @@ public:
     void start_spill() override {
         auto& p = backend.program;
         auto& seq = backend.sequence;
+        p.device.synchronize();
         if (before) {
             p.state_images->copy_to_host(p.state_store->physical_slot(seq.state.write),
                 qwen3_6::HostStateImageView{static_cast<std::byte*>(before->data()),
@@ -226,7 +229,7 @@ public:
             p.backend_kv_pages->physical_pool().copy_to_host_records(mtp_sources, mtp_records,
                 spill_ids, *backend.mtp_layout, p.device.transfer_stream);
         }
-        p.device.synchronize();
+        CUDA_CHECK(cudaStreamSynchronize(p.device.transfer_stream));
         for (std::size_t i = 0; i < spill_ids.size(); ++i) {
             if (source_epochs[i] !=
                 p.text_kv_addresses->content_epoch(seq.kv->text, spill_slots[i])) {
@@ -287,7 +290,7 @@ public:
             p.backend_kv_pages->physical_pool().copy_from_host_records(mtp_records, selected,
                 mtp_destinations, *backend.mtp_layout, p.device.transfer_stream);
         }
-        p.device.synchronize();
+        CUDA_CHECK(cudaStreamSynchronize(p.device.transfer_stream));
         if (checked) {
             std::vector<std::byte*> rows;
             for (std::size_t i = 0; i < selected.size(); ++i) {
@@ -305,7 +308,7 @@ public:
                 qwen3_6::HostStateImageView{static_cast<std::byte*>(after->data()),
                                             &p.state_images->host_layout()},
                 p.device.transfer_stream);
-            p.device.synchronize();
+            CUDA_CHECK(cudaStreamSynchronize(p.device.transfer_stream));
             for (std::size_t i = 0; i < rows.size(); ++i) {
                 if (std::memcmp(rows[i], restore_records[i], backend.page_bytes)) {
                     throw std::logic_error("KVMem native payload changed during restore");
@@ -347,7 +350,10 @@ public:
     }
 
     kvmem::AbortResult abort() noexcept override {
-        try { backend.program.device.synchronize(); }
+        try {
+            backend.program.device.synchronize();
+            CUDA_CHECK(cudaStreamSynchronize(backend.program.device.transfer_stream));
+        }
         catch (...) { backend.invalidate(); return kvmem::AbortResult::SessionInvalidated; }
         if (destructive && !published) {
             backend.invalidate();
@@ -551,7 +557,7 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImplCore::capture_memory_checkpoin
         qwen3_6::HostStateImageView{static_cast<std::byte*>(checkpoint->state->data()),
                                     &state_images->host_layout()},
         device.transfer_stream);
-    device.synchronize();
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     if (kvmem_options.verify_transfers) {
         std::fprintf(stderr, "KVMEM_PREFIX_CHECKPOINT frontier=%u state_bytes=%zu\n", frontier,
                      bytes);
@@ -743,11 +749,14 @@ void ProgramImplCore::restore_memory_prefix(SequenceState& sequence,
     }
     ++window.stamp.execution_history;
     state_store->begin_active_overwrite(sequence.state.write);
+    // The new Root StateImage can still have reset work on the execution
+    // stream. Complete it before restoring bytes on the transfer stream.
+    device.synchronize();
     state_images->copy_from_host(
         qwen3_6::HostStateImageConstView{static_cast<const std::byte*>(checkpoint.state->data()),
                                          &state_images->host_layout()},
         state_store->physical_slot(sequence.state.write), device.transfer_stream);
-    device.synchronize();
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     if (kvmem_options.verify_transfers) {
         PinnedHostBuffer verify(bytes);
         std::memset(verify.data(), 0, bytes);
@@ -755,7 +764,7 @@ void ProgramImplCore::restore_memory_prefix(SequenceState& sequence,
             qwen3_6::HostStateImageView{static_cast<std::byte*>(verify.data()),
                                         &state_images->host_layout()},
             device.transfer_stream);
-        device.synchronize();
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
         if (std::memcmp(verify.data(), checkpoint.state->data(), bytes)) {
             throw std::logic_error("KVMem query StateImage restore changed native bytes");
         }

@@ -10046,7 +10046,11 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         }
 
         sequence.endpoint_valid = false;
-        if (!preserving_source) { trim_sequence_kv(sequence, base, backend_kv_valid(sequence)); }
+        // A Root plan can quote a retained Host prefix before its native KV has
+        // been restored. Only trim coverage already committed in this sequence.
+        if (!preserving_source) {
+            trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+        }
         bind_sequence_kv(sequence);
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
@@ -10352,6 +10356,9 @@ runtime::ExecutionTiming ProgramImplCore::resolve_pending_raw(
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
+            commit_memory_candidates(sequence, pending.base_E, pending.base_E + committed,
+                                     static_cast<std::uint32_t>(row) * pending.row_stride,
+                                     pending.row_stride);
             settle_state_fork(sequence);
             const TokenId* token_base =
                 speculative_backend == SpeculativeBackend::Mtp
@@ -10965,6 +10972,18 @@ void ProgramImplCore::commit_sequence_kv(SequenceState& sequence, std::uint32_t 
         throw std::logic_error("KV commit request is outside the sequence bundle");
     }
     text_kv_addresses->commit_frontier(sequence.kv->text, compact_position(sequence, main_tokens));
+    if (kvmem_window_tokens) {
+        // Decode appends can cross page boundaries without a prefill window
+        // preparation. Include committed append pages in durable checkpoints;
+        // speculative mappings beyond this frontier are not resident history.
+        const auto committed_pages = kv_pages_for_tokens(compact_position(sequence, main_tokens));
+        sequence.window.pages.resize(std::min(sequence.window.pages.size(),
+                                               static_cast<std::size_t>(committed_pages)));
+        while (sequence.window.pages.size() < committed_pages) {
+            const auto slot = static_cast<std::uint32_t>(sequence.window.pages.size());
+            sequence.window.pages.push_back(slot + sequence.window.removed_tokens / kPagedKVPageSize);
+        }
+    }
     if (sequence.kv->backend) {
         backend_kv_addresses->commit_frontier(*sequence.kv->backend,
                                               compact_position(sequence, backend_tokens));
@@ -12017,6 +12036,16 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         std::optional<nvtx::ScopedRange> submit_range;
         submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
                              static_cast<std::uint64_t>(lanes.size()));
+        if (kvmem_window_tokens) {
+            maximum_frontier = 0;
+            for (const auto lane : lanes) {
+                auto& sequence = active_sequence(lane);
+                prepare_window(sequence, sequence.execution_frontier,
+                               sequence.execution_frontier + 1U);
+                maximum_frontier = std::max(maximum_frontier,
+                    compact_position(sequence, sequence.execution_frontier));
+            }
+        }
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
@@ -12067,6 +12096,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         }
         timing.end_wait();
 
+        read_memory_candidates();
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence    = active_sequence(lanes[row]);
@@ -12172,16 +12202,30 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
     }
 
-    const std::uint32_t verify_k =
-        use_lookup ? qwen3_6::kMtpLookupMaximumDrafts : draft_window;
-    const std::uint32_t proposal_k = use_lookup ? 1U : draft_window;
-    const std::uint32_t width = verify_k + 1;
-    qwen3_6::MtpDecodeState& frame =
-        use_lookup ? *io.mtp_lookup_decode : *io.mtp_decode;
-    DecodeGraphFamily& graph_family = use_lookup ? mtp_lookup_graphs : mtp_graphs;
-
     const auto started = Clock::now();
     try {
+        if (kvmem_window_tokens) {
+            maximum_frontier = 0;
+            for (const auto lane : lanes) {
+                auto& sequence = active_sequence(lane);
+                const auto frontier = sequence.execution_frontier;
+                const auto extent = use_lookup ? qwen3_6::kMtpLookupMaximumDrafts : draft_window;
+                prepare_window(sequence, frontier,
+                    std::min(capacity, frontier + extent + draft_window + 1U));
+                // A changed attention view invalidates the learned proposals
+                // and therefore any lookup continuation qualified against them.
+                if (sequence.mtp_draft_count == 0) { use_lookup = false; }
+                maximum_frontier = std::max(maximum_frontier,
+                    compact_position(sequence, frontier));
+            }
+        }
+        const std::uint32_t verify_k =
+            use_lookup ? qwen3_6::kMtpLookupMaximumDrafts : draft_window;
+        const std::uint32_t proposal_k = use_lookup ? 1U : draft_window;
+        const std::uint32_t width = verify_k + 1;
+        qwen3_6::MtpDecodeState& frame =
+            use_lookup ? *io.mtp_lookup_decode : *io.mtp_decode;
+        DecodeGraphFamily& graph_family = use_lookup ? mtp_lookup_graphs : mtp_graphs;
         std::optional<nvtx::ScopedRange> submit_range;
         submit_range.emplace(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                              static_cast<std::uint64_t>(lanes.size()));
@@ -12270,6 +12314,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         }
         timing.end_wait();
 
+        read_memory_candidates();
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = active_sequence(lanes[row]);
@@ -12466,6 +12511,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         }
         timing.end_wait();
 
+        read_memory_candidates();
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence       = active_sequence(lanes[row]);
@@ -12572,6 +12618,8 @@ runtime::ExecutionTiming ProgramImplCore::resolve_non_speculative_pending(
         sequence.ledger_frontier    = request.pending.prompt_tokens + 1;
         break;
     case PendingKind::Ordinary:
+        commit_memory_candidates(sequence, request.pending.base_E,
+                                 request.pending.base_E + 1, 0, 1);
         advance_rebuild_work(sequence, request.pending.base_E + request.pending.produced,
                              prefill_chunk);
         sequence.execution_frontier = request.pending.base_E + request.pending.produced;
