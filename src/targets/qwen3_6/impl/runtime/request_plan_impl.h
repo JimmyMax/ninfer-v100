@@ -275,6 +275,33 @@ RequestBasePlan ProgramImplCore::plan_request(const PreparedPromptData& prompt,
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
+    if (kvmem_window_tokens) {
+        // KVMem: the device entitlement is the sparse window; the bounded Host archive must
+        // be able to reserve the request's entire legal execution before it turns Active.
+        const bool retain_history = options.allow_prefix_reuse && prompt.identity.reusable;
+        if (reserved_context_tokens > kvmem_window_tokens || retain_history) {
+            const auto host_layout =
+                plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry());
+            const auto pages = pages_for_tokens(reserved_context_tokens);
+            const auto page_bytes = host_layout.page_stride +
+                (backend_kv_pages
+                     ? plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry())
+                           .page_stride
+                     : 0);
+            if (pages > kvmem_options.host_bytes / page_bytes) {
+                throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                    "KVMem host payload budget cannot reserve the requested token history");
+            }
+            base->memory_host_reservation = pages * page_bytes;
+        }
+        base->text_kv_page_entitlement = pages_for_tokens(kvmem_window_tokens);
+        if (backend_kv_pages) {
+            base->backend_kv_page_entitlement = pages_for_tokens(kvmem_window_tokens);
+        }
+        base->allow_memory_reuse           = options.allow_prefix_reuse && prompt.identity.reusable;
+        base->allow_prefix_reuse           = false;
+        base->summary.publish_continuation = false;
+    }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
         .state_slots      = 1U,
@@ -463,6 +490,8 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;
     plan->root_rebuild_tail_begin     = base.root_rebuild_tail_begin;
+    plan->allow_memory_reuse          = base.allow_memory_reuse;
+    plan->memory_host_reservation     = base.memory_host_reservation;
 
     if ((source != nullptr && shared_source != nullptr) ||
         ((source == nullptr && shared_source == nullptr) != !checkpoint.has_value())) {

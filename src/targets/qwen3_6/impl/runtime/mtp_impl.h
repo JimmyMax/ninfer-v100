@@ -30,7 +30,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                         state.state_destination_slot, state.mtp_proposal_extent);
 
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
-    ops::set_i32_scalar(position_view, position, state.execution.device.stream);
+    ops::set_i32_scalar(position_view, position - static_cast<int>(state.execution.cache_position_shift), state.execution.device.stream);
     Tensor mtp_hidden         = state.execution.io.mtp->ar_hidden;
     Tensor logits             = state.execution.io.logits.slice(1, 0, 1);
     Tensor draft0             = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
@@ -38,7 +38,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     CUDA_CHECK(cudaMemcpyAsync(rope_position_view.data, rope_position.data(),
                                rope_position.size_bytes(), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
-    const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
+    const auto bridge_visible = static_cast<std::uint32_t>(position + 1) - state.execution.cache_position_shift;
     const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
     card.mtp_forward_batch(next_token, previous_hidden, position_view, bridge_envelope, mtp_hidden,
                            build_proposal ? 0 : -1, build_proposal ? &logits : nullptr,
@@ -52,12 +52,12 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     }
 
     Tensor ar_position = state.execution.io.mtp->position.slice(0, 0, 1);
-    ops::set_i32_scalar(ar_position, position + 1, state.execution.device.stream);
+    ops::set_i32_scalar(ar_position, position + 1 - static_cast<int>(state.execution.cache_position_shift), state.execution.device.stream);
     for (int i = 1; i < static_cast<int>(state.mtp_proposal_extent); ++i) {
         Tensor previous_token = state.execution.io.mtp->draft_tokens.slice(0, i - 1, 1);
         Tensor next_draft     = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
         Tensor next_hidden    = state.execution.prefill_hidden.slice(1, i, 1);
-        const auto visible    = static_cast<std::uint32_t>(position + i + 1);
+        const auto visible    = static_cast<std::uint32_t>(position + i + 1) - state.execution.cache_position_shift;
         const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
         card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
                                  envelope, next_hidden, logits, next_draft);

@@ -182,6 +182,10 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // KVMem compact view: cache slots and attention visibility are logical positions minus
+    // this shift; RoPE positions stay logical.
+    void set_cache_position_shift(std::uint32_t shift) noexcept { cache_position_shift_ = shift; }
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
@@ -318,6 +322,7 @@ private:
     std::int32_t active_sequence_batch_                                            = 0;
     std::int32_t active_sequence_width_                                            = 0;
     std::int32_t rope_delta_                                                       = 0;
+    std::uint32_t cache_position_shift_                                            = 0;
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;

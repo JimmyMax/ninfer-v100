@@ -4943,12 +4943,17 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
     }
 
     if (source_state != nullptr || shared_state != nullptr) {
-        transaction.text_activation_frontier = details.reuse_base;
+        // KVMem: only the sparse window is ever materialized on the device; the retained Host
+        // archive covers the rest of a reused prefix.
+        const auto activation_frontier = [&](std::uint32_t frontier) {
+            return kvmem_window_tokens ? std::min(frontier, kvmem_window_tokens) : frontier;
+        };
+        transaction.text_activation_frontier = activation_frontier(details.reuse_base);
         if (backend_address) {
-            transaction.backend_activation_frontier =
+            transaction.backend_activation_frontier = activation_frontier(
                 speculative_backend == SpeculativeBackend::Mtp && details.reuse_base != 0
                     ? details.reuse_base - 1U
-                    : details.reuse_base;
+                    : details.reuse_base);
         }
     }
 
@@ -8970,7 +8975,9 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 timing.resume_submit();
             }
 
-            ensure_sequence_kv_mapped(sequence, end, backend_kv_cache() ? end : 0U);
+            if (!kvmem_window_tokens) {
+                ensure_sequence_kv_mapped(sequence, end, backend_kv_cache() ? end : 0U);
+            }
 
             sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
             if (sequence.ledger.size() != static_cast<std::size_t>(end) + 1U) {
@@ -9994,7 +10001,11 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
-        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        // KVMem materializes the sparse window incrementally through prepare_window; the whole
+        // logical prompt never lands on the device address space at once.
+        if (!kvmem_window_tokens) {
+            ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        }
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -10002,6 +10013,9 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         request.timings              = {};
         request.pending              = {};
         request.publish_continuation = request_plan.summary.publish_continuation;
+        request.allow_memory_reuse   = request_plan.allow_memory_reuse;
+        request.memory_host_reservation = request_plan.memory_host_reservation;
+        request.memory_session_key   = staged.prompt.context_cache.session_key;
         sequence.mtp_draft_count     = 0;
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
         sequence.ledger.swap(materialization_ledger_);
@@ -11629,6 +11643,20 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             std::uint32_t final_chunk_tokens = 0;
             bool finalized                   = false;
             while (remaining != 0) {
+                if (kvmem_window_tokens) {
+                    // The sparse device window is prepared for this chunk; the compact view,
+                    // selection and spill are published before the attention reads the cache.
+                    const auto lead = staged.prepare_mtp && staged.initial_mtp_extent
+                        ? staged.initial_mtp_extent - 1U : 0U;
+                    if (staged.prompt_tokens - staged.cursor <= remaining) {
+                        remaining = std::min(remaining, kvmem_options.reserve_tokens - lead);
+                    }
+                    const auto chunk_end = std::min(staged.prompt_tokens, staged.cursor + remaining);
+                    const auto mapped_end = std::min(capacity, chunk_end +
+                        (chunk_end == staged.prompt_tokens ? lead : 0U));
+                    prepare_window(sequence, staged.cursor, mapped_end);
+                    schedule_state.execution.cache_position_shift = sequence.window.removed_tokens;
+                }
                 schedule_state.text_kv_base           = staged.cursor;
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
@@ -11860,7 +11888,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             sequence.prefix_digests.size() != sequence.ledger_frontier) {
             throw std::logic_error("ordinary batch row is not decode-ready");
         }
-        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+        maximum_frontier = std::max(maximum_frontier, compact_position(sequence, sequence.execution_frontier));
     }
 
     const auto start = Clock::now();
@@ -12002,7 +12030,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             sequence.mtp_draft_count > draft_window) {
             throw std::logic_error("MTP batch row is not decode-ready");
         }
-        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+        maximum_frontier = std::max(maximum_frontier, compact_position(sequence, sequence.execution_frontier));
         const std::uint32_t max_lookup_extent =
             std::min({qwen3_6::kMtpLookupMaximumDrafts,
                       budgets[row].generated_tokens_remaining > 1
@@ -12231,7 +12259,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                 : 0U;
         const std::uint32_t extent =
             std::min({draft_window, max_by_budget, capacity - sequence.execution_frontier - 1U});
-        maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
+        maximum_frontier = std::max(maximum_frontier, compact_position(sequence, sequence.execution_frontier));
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
     }

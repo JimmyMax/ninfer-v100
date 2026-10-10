@@ -41,6 +41,9 @@ struct ExecutionCore {
     ProposalHead proposal_head;
     // KVMem mean-K statistics target (post-RMSNorm/pre-RoPE block sums); null disables.
     const qwen3_6::detail::MemoryStatistics* memory_statistics = nullptr;
+    // KVMem compact-view shift: cache positions are logical positions minus this value;
+    // RoPE positions stay logical (rope_delta absorbs the shift).
+    std::uint32_t cache_position_shift = 0;
 };
 
 struct PrefillContext {

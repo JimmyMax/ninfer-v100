@@ -197,6 +197,10 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     qwen3_6::detail::PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // KVMem: whether retained Host histories may be consumed/published, and the Host payload
+    // bytes this request reserves for its entire legal execution while active.
+    bool allow_memory_reuse                = false;
+    std::uint64_t memory_host_reservation  = 0;
 };
 
 // Program-owned physical planning state shared by request materialization and active capture.
@@ -262,6 +266,9 @@ struct AdmissionCandidateImpl<NINFER_QWEN36_VARIANT> : ResourceCandidateState {
     runtime::PrefillWork root_rebuild_work;
     std::uint32_t root_rebuild_tail_begin = 0;
     bool text_retained_tail_release       = false;
+    // KVMem: retained-history participation and the Host payload bytes reserved while active.
+    bool allow_memory_reuse               = false;
+    std::uint64_t memory_host_reservation = 0;
     bool backend_retained_tail_release    = false;
 };
 
