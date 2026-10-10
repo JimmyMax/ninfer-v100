@@ -195,6 +195,39 @@ void test_common_validation() {
     }
 }
 
+// A community v3 conversion declares its publisher's own name and identifies its architecture
+// through the converter recipe; the reader must report both.
+void test_v3_community_identity() {
+    Json directory = {
+        {"metadata", {{"name", "swift-1.5-qwen3.8-27b-gsq-rco-iq3s"}}},
+        {"provenance", {{"converter", "ninfer-v3"}, {"recipe", "qwen3_8_27b_gguf"}}},
+        {"objects", Json::array({
+                        {{"id", "resource"},
+                         {"kind", "resource"},
+                         {"encoding", "raw-bytes-v1"},
+                         {"offset", 0},
+                         {"bytes", 3}},
+                    })},
+    };
+    auto fixture     = write_fixture(directory, "v3_community_identity", ninfer::test::artifact_fixture::kMagicV3);
+    Reader reader(fixture.path);
+    if (reader.identity().model_id != "swift-1.5-qwen3.8-27b-gsq-rco-iq3s") {
+        throw std::runtime_error("declared model_id was not reported: " +
+                                 reader.identity().model_id);
+    }
+    if (reader.identity().weights_id != "gguf") {
+        throw std::runtime_error("recipe did not recover the weights id: " +
+                                 reader.identity().weights_id);
+    }
+    if (reader.provenance_recipe() != "qwen3_8_27b_gguf") {
+        throw std::runtime_error("provenance recipe was not reported: " +
+                                 std::string(reader.provenance_recipe()));
+    }
+    if (reader.objects().size() != 1) {
+        throw std::runtime_error("v3 fixture object list was not parsed");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -202,6 +235,7 @@ int main() {
         test_registered_sizes();
         test_normative_fixture();
         test_common_validation();
+        test_v3_community_identity();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

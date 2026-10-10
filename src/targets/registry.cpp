@@ -87,9 +87,9 @@ std::size_t current_free_device_bytes() {
 template <class Target, class Loaded, class Instance>
 ConstructedTarget construct_registered(const EngineOptions& options, DeviceContext& device,
                                        artifact::Reader& reader, Clock::time_point load_start,
-                                       std::string_view target_key) {
+                                       std::string_view target_key,
+                                       const artifact::ArtifactIdentity& identity) {
     StartupPhaseScope target_plan_phase(options.startup_observer, StartupPhase::TargetPlan);
-    const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
     const runtime::ContextCostIdentity context_cost_identity{
@@ -139,9 +139,11 @@ ConstructedTarget construct_registered(const EngineOptions& options, DeviceConte
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
 
     LoadSummary summary;
-    summary.target               = std::string(target_key);
-    summary.model_id             = identity.model_id;
-    summary.weights_id           = identity.weights_id;
+    summary.target = std::string(target_key);
+    // The identity the artifact declares, so a community conversion stays visible in the load
+    // report even when the recipe resolved it to a registered architecture for execution.
+    summary.model_id             = reader.identity().model_id;
+    summary.weights_id           = reader.identity().weights_id;
     summary.load_seconds         = std::chrono::duration<double>(Clock::now() - load_start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.file_bytes;
@@ -194,6 +196,27 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
+// The registered model id a v3 converter recipe names, e.g. "qwen3_8_27b_gguf" -> "qwen3.8-27b".
+// Community NInfer conversions reuse the registered recipes (`qwen3_8_27b_gguf`, `qwen3_8_27b_nvfp4`,
+// ...) because the recipe describes the architecture and weights profile the container holds, while
+// their `metadata.name` is the publisher's own. A recipe that pairs an architecture with weights the
+// target cannot serve still fails in Target::resolve_weights, so a prefix match is enough here.
+std::string_view registered_model_id_for_recipe(std::string_view recipe) {
+    struct RecipePrefix {
+        std::string_view prefix;
+        std::string_view model_id;
+    };
+    static constexpr RecipePrefix prefixes[] = {
+        {"qwen3_8_27b", Qwen3_6_27B::qwen3_8_model_id},
+        {"qwen3_6_27b", Qwen3_6_27B::model_id},
+        {"qwen3_6_35b_a3b", Qwen3_6_35BA3B::model_id},
+    };
+    for (const RecipePrefix& entry : prefixes) {
+        if (recipe.starts_with(entry.prefix)) { return entry.model_id; }
+    }
+    return {};
+}
+
 ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& device) {
     validate_options(options);
     const auto load_start = Clock::now();
@@ -201,21 +224,35 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
     StartupPhaseScope inspect_phase(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect_phase.complete();
-    const auto& identity = reader.identity();
-    if (identity.model_id == Qwen3_6_27B::model_id) {
-        return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::target_key);
+    // The identity the artifact is served as. A community NInfer conversion of a registered
+    // architecture declares its own `metadata.name` (e.g. "swift-1.5-qwen3.8-27b-gsq-rco-iq3s"),
+    // which is not registered; its converter recipe names the architecture and weights profile the
+    // container actually holds, so resolve through the recipe instead of refusing the artifact. The
+    // artifact itself stays byte-unchanged and its declared name stays in the load report.
+    artifact::ArtifactIdentity served = reader.identity();
+    if (served.model_id != Qwen3_6_27B::model_id && served.model_id != Qwen3_6_27B::qwen3_8_model_id &&
+        served.model_id != Qwen3_6_35BA3B::model_id) {
+        const std::string_view resolved = registered_model_id_for_recipe(reader.provenance_recipe());
+        if (!resolved.empty()) { served.model_id = std::string(resolved); }
     }
-    if (identity.model_id == Qwen3_6_27B::qwen3_8_model_id) {
+    if (served.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
-            options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key);
+            options, device, reader, load_start, Qwen3_6_27B::target_key, served);
     }
-    if (identity.model_id == Qwen3_6_35BA3B::model_id) {
+    if (served.model_id == Qwen3_6_27B::qwen3_8_model_id) {
+        return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
+            options, device, reader, load_start, Qwen3_6_27B::qwen3_8_target_key, served);
+    }
+    if (served.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
-            options, device, reader, load_start, Qwen3_6_35BA3B::target_key);
+            options, device, reader, load_start, Qwen3_6_35BA3B::target_key, served);
     }
-    throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
-                             "' has no registered target for this device");
+    std::string message = "artifact identity '" + reader.identity().model_id + "/" +
+                          reader.identity().weights_id + "' has no registered target for this device";
+    if (!reader.provenance_recipe().empty()) {
+        message += " (converter recipe '" + std::string(reader.provenance_recipe()) + "')";
+    }
+    throw std::runtime_error(std::move(message));
 }
 
 } // namespace ninfer::targets

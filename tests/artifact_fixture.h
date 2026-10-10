@@ -23,6 +23,10 @@ inline constexpr std::array<std::uint8_t, 8> kMagic = {
     'N', 'I', 'N', 'F', 'E', 'R', 0, 2,
 };
 
+inline constexpr std::array<std::uint8_t, 8> kMagicV3 = {
+    'N', 'I', 'N', 'F', 'E', 'R', 0, 3,
+};
+
 inline std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
 }
@@ -42,8 +46,11 @@ struct TemporaryArtifact {
 
 inline TemporaryArtifact write_fixture(const Json& directory, std::string_view suffix,
                                        const std::array<std::uint8_t, 8>& magic = kMagic) {
-    const std::string json         = directory.dump();
-    const auto payload_offset      = align_up(16 + json.size(), 4096);
+    const std::string json = directory.dump();
+    // v3 headers are 32 bytes (magic + json length + a container UUID); v2 headers are 16.
+    const bool is_v3              = magic == kMagicV3;
+    const std::uint64_t header    = is_v3 ? 32 : 16;
+    const auto payload_offset     = align_up(header + json.size(), 4096);
     const auto nonnegative_integer = [](const Json& value) {
         return value.is_number_unsigned() ||
                (value.is_number_integer() && value.get<std::int64_t>() >= 0);
@@ -60,7 +67,7 @@ inline TemporaryArtifact write_fixture(const Json& directory, std::string_view s
     std::vector<std::byte> file(payload_offset + payload_bytes, std::byte{0});
     for (std::size_t i = 0; i < magic.size(); ++i) { file[i] = std::byte{magic[i]}; }
     write_u64_le(file.data() + 8, json.size());
-    std::memcpy(file.data() + 16, json.data(), json.size());
+    std::memcpy(file.data() + header, json.data(), json.size());
 
     std::uint8_t marker = 1;
     for (const auto& object : directory.at("objects")) {

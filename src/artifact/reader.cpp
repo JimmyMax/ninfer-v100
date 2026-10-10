@@ -420,6 +420,12 @@ struct Reader::Impl {
                     identity.model_id = require_string(meta.at("name"), "metadata.name");
                 }
             }
+            if (directory.contains("provenance") && directory.at("provenance").is_object() &&
+                directory.at("provenance").contains("recipe") &&
+                directory.at("provenance").at("recipe").is_string()) {
+                provenance_recipe =
+                    directory.at("provenance").at("recipe").get_ref<const std::string&>();
+            }
             if (directory.contains("provenance") && directory.at("provenance").is_object()
                 && directory.at("provenance").contains("upgraded_from")
                 && directory.at("provenance").at("upgraded_from").is_object()) {
@@ -835,6 +841,7 @@ struct Reader::Impl {
 
     MappedFile file;
     ArtifactIdentity identity;
+    std::string provenance_recipe;
     std::vector<ObjectDescriptor> entries;
     std::unordered_map<std::string, std::size_t, TransparentStringHash, std::equal_to<>> index;
     // v3 logical namespace: fork-side object name -> entries index.  Built from
@@ -852,6 +859,8 @@ Reader::Reader(Reader&&) noexcept            = default;
 Reader& Reader::operator=(Reader&&) noexcept = default;
 
 const ArtifactIdentity& Reader::identity() const noexcept { return impl_->identity; }
+
+std::string_view Reader::provenance_recipe() const noexcept { return impl_->provenance_recipe; }
 
 const std::vector<ObjectDescriptor>& Reader::objects() const noexcept { return impl_->entries; }
 

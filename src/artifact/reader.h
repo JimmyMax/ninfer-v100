@@ -157,6 +157,10 @@ public:
     Reader& operator=(const Reader&) = delete;
 
     const ArtifactIdentity& identity() const noexcept;
+    // The v3 converter recipe (`provenance.recipe`, e.g. "qwen3_8_27b_gguf"). Empty for v2
+    // containers and for v3 containers that carry no recipe. Community conversions declare their
+    // own `metadata.name`, so the recipe is what identifies the architecture they hold.
+    [[nodiscard]] std::string_view provenance_recipe() const noexcept;
     const std::vector<ObjectDescriptor>& objects() const noexcept;
     const ObjectDescriptor* find(std::string_view name) const noexcept;
 
