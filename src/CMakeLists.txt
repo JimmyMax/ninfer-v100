@@ -472,19 +472,22 @@ else()
   ninfer_internal_includes(ninfer_media_decode)
 endif()
 
-if(NINFER_BUILD_MEDIA_ACQUIRE)
+if(NINFER_BUILD_MEDIA_ACQUIRE AND NINFER_ENABLE_VISION)
   # Product-only path/data/HTTP acquisition. No target package links this library.
-  if(NINFER_ENABLE_VISION)
-    add_library(ninfer_media_acquire STATIC
-      product/media_acquire/acquire.cpp)
-  else()
-    add_library(ninfer_media_acquire STATIC
-      ${PROJECT_SOURCE_DIR}/portcompat/media_acquire_stub.cpp)
-  endif()
+  add_library(ninfer_media_acquire STATIC
+    product/media_acquire/acquire.cpp)
   ninfer_internal_includes(ninfer_media_acquire)
-  if(NINFER_ENABLE_VISION)
-    target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  if(WIN32)
+    # The POSIX inet/getaddrinfo surface maps to Winsock 2 on Windows.
+    target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
   endif()
+else()
+  # Downstream links are unconditional, so the target always exists; without acquisition it is
+  # the local-input-only stub.
+  add_library(ninfer_media_acquire STATIC
+    ${PROJECT_SOURCE_DIR}/portcompat/media_acquire_stub.cpp)
+  ninfer_internal_includes(ninfer_media_acquire)
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)

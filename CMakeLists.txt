@@ -100,9 +100,11 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70" AND
     "${CMAKE_CUDA_COMPILER_VERSION})")
 endif()
 
-set(NINFER_BUILD_MEDIA_ACQUIRE OFF)
-if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  set(NINFER_BUILD_MEDIA_ACQUIRE ON)
+if(NOT DEFINED NINFER_BUILD_MEDIA_ACQUIRE)
+  set(NINFER_BUILD_MEDIA_ACQUIRE OFF)
+  if(NINFER_BUILD_APPS OR BUILD_TESTING)
+    set(NINFER_BUILD_MEDIA_ACQUIRE ON)
+  endif()
 endif()
 
 set(NINFER_BUILD_PROMPT_INPUT OFF)
@@ -117,11 +119,34 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 if(NINFER_ENABLE_VISION)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+  if(MSVC AND NINFER_FFMPEG_ROOT)
+    # Windows: an explicit FFmpeg shared-dev layout (include/ plus MSVC import libraries in
+    # lib/). No pkg-config is needed; the imported target keeps the same name the rest of the
+    # build already links against.
+    add_library(ninfer_ffmpeg_imported INTERFACE)
+    target_include_directories(ninfer_ffmpeg_imported INTERFACE "${NINFER_FFMPEG_ROOT}/include")
+    target_link_libraries(ninfer_ffmpeg_imported INTERFACE
+      "${NINFER_FFMPEG_ROOT}/lib/avformat.lib"
+      "${NINFER_FFMPEG_ROOT}/lib/avcodec.lib"
+      "${NINFER_FFMPEG_ROOT}/lib/avutil.lib"
+      "${NINFER_FFMPEG_ROOT}/lib/swscale.lib")
+    add_library(PkgConfig::FFMPEG ALIAS ninfer_ffmpeg_imported)
+  else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+      libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+  endif()
   if(NINFER_BUILD_MEDIA_ACQUIRE)
-    pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+    if(MSVC AND NINFER_CURL_ROOT)
+      # Windows: an import library generated from the shipped libcurl DLL plus its headers.
+      add_library(ninfer_curl_imported INTERFACE)
+      target_include_directories(ninfer_curl_imported INTERFACE "${NINFER_CURL_ROOT}/include")
+      target_link_libraries(ninfer_curl_imported INTERFACE "${NINFER_CURL_ROOT}/libcurl.lib")
+      add_library(PkgConfig::LIBCURL ALIAS ninfer_curl_imported)
+    else()
+      find_package(PkgConfig REQUIRED)
+      pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+    endif()
   endif()
 endif()
 find_package(Threads REQUIRED)
