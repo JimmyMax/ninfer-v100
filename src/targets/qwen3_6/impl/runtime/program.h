@@ -539,6 +539,9 @@ struct RequestControl {
     bool publish_continuation = true;
     // KVMem: false forbids consuming or publishing retained Host histories for this request.
     bool allow_memory_reuse = true;
+    // KVMem session binding and its reserved Host payload bytes while active.
+    std::optional<PreparedSessionKey> memory_session_key;
+    std::uint64_t memory_host_reservation = 0;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -1389,6 +1392,15 @@ private:
     void commit_memory_candidates(SequenceState& sequence, std::uint32_t begin,
                                   std::uint32_t end, std::uint32_t first_column,
                                   std::uint32_t row_width);
+    [[nodiscard]] std::optional<KvmemHistoryMatch>
+    memory_restorable_history(const PreparedPromptData& prompt) const;
+    bool restore_memory_history(SequenceState& sequence, RequestControl::Prefill& staged);
+    void reserve_memory_history(SequenceState& sequence, RequestControl& request,
+                                const PreparedPromptData& prompt);
+    void retain_memory_history(SequenceState& sequence, const RequestControl& request) noexcept;
+    void save_memory_snapshot(KvmemWindowState& window) noexcept;
+    void load_memory_snapshot(const PreparedPromptData& prompt) noexcept;
+    void erase_memory_snapshot(const PreparedSessionKey& key) noexcept;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

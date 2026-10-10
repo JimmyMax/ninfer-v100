@@ -776,6 +776,306 @@ void ProgramImplCore::bind_memory_snapshot(SequenceState& sequence) {
     }
 }
 
+// ---- Retained Host histories --------------------------------------------------------------
+
+std::optional<KvmemHistoryMatch> ProgramImplCore::memory_restorable_history(
+    const PreparedPromptData& prompt) const {
+    if (!kvmem_window_tokens || !prompt.identity.reusable ||
+        (prompt.context_cache.session_key && !prompt.context_cache.update_session_index)) {
+        return std::nullopt;
+    }
+    std::optional<KvmemHistoryMatch> best;
+    std::size_t best_frontier = 0;
+    unsigned prefix_rejected = 0, identity_rejected = 0, query_rejected = 0, incomplete = 0;
+    for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+        const auto& history = memory_histories[index];
+        if (!history || !history->stamp.valid ||
+            history->session_key != prompt.context_cache.session_key) {
+            continue;
+        }
+        for (const auto kind : kKvmemCheckpointKinds) {
+            const auto* candidate = memory_checkpoint(*history, kind);
+            if (!candidate) continue;
+            const auto& checkpoint = *candidate;
+            const auto frontier = static_cast<std::uint32_t>(checkpoint.prefix.size());
+            const auto pages = kv_pages_for_tokens(frontier);
+            bool complete = frontier && checkpoint.state &&
+                checkpoint.state->size() == state_images->host_layout().image_bytes &&
+                frontier == checkpoint.identity.stamp.frontier && history->statistics &&
+                history->selector && history->statistics_frontier >= frontier &&
+                history->archive.size() >= pages && history->host_versions.size() >= pages;
+            for (std::uint32_t page = 0; complete && page < pages; ++page) {
+                complete = history->archive[page] &&
+                           history->host_versions[page] >= kvmem_valid_columns(page, frontier);
+            }
+            if (!complete) { ++incomplete; continue; }
+            if (frontier >= prompt.token_ids.size() ||
+                !std::equal(checkpoint.prefix.begin(), checkpoint.prefix.end(),
+                            prompt.token_ids.begin())) {
+                ++prefix_rejected;
+                continue;
+            }
+            if (!checkpoint.prefix_identity.matches(prompt, frontier)) {
+                ++identity_rejected;
+                continue;
+            }
+            if (prompt.token_ids.size() > kvmem_window_tokens && prompt.memory_query &&
+                frontier > prompt.memory_query->begin &&
+                !memory_same_query(*history, prompt, frontier)) {
+                ++query_rejected;
+                continue;
+            }
+            if (frontier > best_frontier ||
+                (frontier == best_frontier && best &&
+                 history->publication_order >
+                     memory_histories[best->history]->publication_order)) {
+                best = KvmemHistoryMatch{index, kind, frontier};
+                best_frontier = frontier;
+            }
+        }
+    }
+    if (kvmem_options.verify_transfers) {
+        std::fprintf(stderr,
+            "KVMEM_HISTORY_LOOKUP frontier=%zu prefix_rejected=%u identity_rejected=%u "
+            "query_rejected=%u incomplete=%u\n",
+            best_frontier, prefix_rejected, identity_rejected, query_rejected, incomplete);
+    }
+    return best;
+}
+
+bool ProgramImplCore::restore_memory_history(SequenceState& sequence,
+                                             RequestControl::Prefill& staged) {
+    const auto match = memory_restorable_history(staged.prompt);
+    if (!match) return false;
+    auto& history = memory_histories[match->history];
+    const auto frontier = std::optional<std::uint32_t>(match->frontier);
+    if (*frontier != staged.memory_restore_frontier ||
+        staged.memory_restore_generation != history->stamp.session.id) {
+        return false;
+    }
+    sequence.window = std::move(*history);
+    history.reset();
+    auto& window = sequence.window;
+    const bool same_query = memory_same_query(window, staged.prompt, *frontier);
+    auto checkpoint = std::move(memory_checkpoint_slot(window, match->kind));
+    // The previous Program address-space lease has been released. These IDs
+    // must never be treated as resident in the new native address space.
+    window.pages.clear();
+    window.removed_tokens = 0;
+    window.reconstruction_frontier = 0;
+    window.query_replayed = same_query;
+    const auto query = staged.prompt.memory_query.value_or(TokenSpan{});
+    window.query_begin = static_cast<std::uint32_t>(query.begin);
+    window.query_end = static_cast<std::uint32_t>(query.begin + query.count);
+    if (!same_query) {
+        window.query_tokens = 0;
+        std::fill(window.query_sum.begin(), window.query_sum.end(), 0.0F);
+    }
+    // The durable archive already covers the quoted prefix. This is not a
+    // native allocation frontier; force-selection creates only B resident rows.
+    sequence.text_kv_valid = *frontier;
+    if (backend_kv_pages) sequence.mtp_kv_valid = *frontier;
+    restore_memory_prefix(sequence, *checkpoint, true);
+    if (backend_kv_pages) {
+        // An MTP row combines target hidden at i with the embedding of token i+1.
+        // Prefix identity proves only [0,frontier), so its last MTP row must be
+        // rebuilt using this request's first suffix token before it is trusted.
+        const auto last = *frontier - 1U;
+        sequence.mtp_kv_valid = last;
+        trim_sequence_kv(sequence, *frontier, last);
+        ensure_sequence_kv_mapped(sequence, *frontier, *frontier);
+        const auto selectors = state_selectors(sequence);
+        schedule::PrefillContext bridge{
+            {device, model, work, state_images->linear(),
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             proposal_head},
+            text_kv_view(sequence),
+            mtp_kv_view(sequence),
+            decoder->text_kv,
+            decoder->mtp_cache(),
+            nullptr,
+            *frontier,
+            nullptr,
+            nullptr,
+            selectors.source,
+            selectors.destination,
+            0,
+            nullptr};
+        bridge.cache_position_shift = window.removed_tokens;
+        set_device_i32(io.rope_delta,
+                       sequence.rope_delta + checked_i32(window.removed_tokens,
+                                                         "restored MTP cache shift"));
+        auto token = io.mtp->target_input_ids.slice(0, 0, 1);
+        set_device_i32(token, staged.prompt.token_ids[*frontier]);
+        const auto rope = prompt_rope_position(staged.prompt, last);
+        mark_workspace_usage(workspace_plan.mtp_prefill);
+        if (staged.vision) {
+            schedule::mtp_bridge_multimodal(bridge, staged.prompt, *staged.vision,
+                {.previous_hidden = &sequence.tail_hidden,
+                 .position = checked_i32(last, "restored MTP tail"),
+                 .rope_position = rope});
+        } else {
+            schedule::mtp_bridge_and_propose(bridge, token, sequence.tail_hidden,
+                                             checked_i32(last, "restored MTP tail"), rope, false);
+        }
+        device.synchronize();
+        work.reset();
+        sequence.mtp_kv_valid = *frontier;
+        commit_sequence_kv(sequence, *frontier, *frontier);
+        window.host_versions.at(last / kvmem_page_tokens) = 0;
+        // Same-boundary query replay can restore before another view switch.
+        archive_memory_window(sequence);
+    }
+    if (*frontier == memory_checkpoint_frontier(sequence, staged.prompt_tokens, true)) {
+        window.prefix_checkpoint = std::move(checkpoint);
+    } else {
+        // An exact replay can start at the input capture boundary, so prefill
+        // will not cross it again. Keep the restored complete state for repeats
+        // and cancellation recovery; restoring does not consume its payload.
+        memory_checkpoint_slot(window, match->kind) = std::move(checkpoint);
+    }
+    staged.base = *frontier;
+    staged.cursor = *frontier;
+    ++memory_history_hits;
+    if (kvmem_options.verify_transfers) {
+        std::fprintf(stderr,
+            "KVMEM_HISTORY_RESTORE frontier=%u kind=%u same_query=%u prefix_match=1 "
+            "state_exact=1\n",
+            *frontier, static_cast<unsigned>(match->kind), same_query ? 1U : 0U);
+    }
+    return true;
+}
+
+void ProgramImplCore::reserve_memory_history(SequenceState& sequence, RequestControl& request,
+                                             const PreparedPromptData& prompt) {
+    const auto& key = prompt.context_cache.session_key;
+    if (key && prompt.context_cache.update_session_index) {
+        MemoryPublication* target = nullptr;
+        for (auto& publication : memory_publications) {
+            if (publication.key == key) { target = &publication; break; }
+            if (!publication.key) { target = &publication; }
+        }
+        if (!target) {
+            for (auto& publication : memory_publications) {
+                const bool active = std::any_of(requests.begin(), requests.end(),
+                    [&](const auto& value) { return value.memory_session_key == publication.key; });
+                const bool retained = std::any_of(memory_histories.begin(), memory_histories.end(),
+                    [&](const auto& value) {
+                        return value && value->session_key == publication.key;
+                    });
+                if (!active && !retained && (!target || publication.order < target->order)) {
+                    target = &publication;
+                }
+            }
+        }
+        if (!target) throw std::logic_error("KVMem publication table has no reclaimable entry");
+        if (target->key != key) { target->key = key; target->order = 0; }
+        target->order = std::max(target->order, sequence.window.publication_order);
+    }
+    if (!sequence.window.statistics) ++memory_history_misses;
+    // An explicit fresh request invalidates only its own lineage. A caller that
+    // forbids index updates cannot consume or erase the named cached history.
+    if (!request.allow_memory_reuse && prompt.context_cache.update_session_index) {
+        if (prompt.context_cache.session_key) erase_memory_snapshot(*prompt.context_cache.session_key);
+        for (auto& history : memory_histories) {
+            if (history && history->session_key == prompt.context_cache.session_key &&
+                history->publication_order <= sequence.window.publication_order) {
+                history.reset();
+            }
+        }
+    }
+    std::uint64_t reserved = 0;
+    for (const auto& active : requests) reserved += active.memory_host_reservation;
+    if (reserved > kvmem_options.host_bytes) {
+        throw std::logic_error("KVMem active Host reservations exceed admission capacity");
+    }
+    auto available = kvmem_options.host_bytes - reserved;
+    for (;;) {
+        std::uint64_t cached_bytes = 0;
+        std::optional<std::size_t> victim;
+        for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+            const auto& history = memory_histories[index];
+            if (!history) continue;
+            cached_bytes += history->host_bytes;
+            if (!victim ||
+                history->publication_order < memory_histories[*victim]->publication_order) {
+                victim = index;
+            }
+        }
+        if (cached_bytes <= available) break;
+        if (!victim) throw std::logic_error("KVMem retained Host accounting has no victim");
+        memory_histories[*victim].reset();
+        ++memory_history_evictions;
+    }
+}
+
+void ProgramImplCore::retain_memory_history(SequenceState& sequence,
+                                            const RequestControl& request) noexcept {
+    if (!kvmem_window_tokens || !request.allow_memory_reuse || !sequence.window.stamp.valid ||
+        (!sequence.window.prefix_checkpoint && !sequence.window.endpoint_checkpoint &&
+         !sequence.window.input_checkpoint && !sequence.window.reconstruction_checkpoint)) {
+        return;
+    }
+    auto& window = sequence.window;
+    if (window.session_key && !window.update_session_index) return;
+    if (window.session_key) {
+        for (const auto& publication : memory_publications) {
+            if (publication.key == window.session_key &&
+                publication.order > window.publication_order) {
+                return;
+            }
+        }
+    }
+    std::uint32_t frontier = 0;
+    for (const auto kind : kKvmemCheckpointKinds)
+        if (const auto* checkpoint = memory_checkpoint(window, kind))
+            frontier = std::max(frontier, static_cast<std::uint32_t>(checkpoint->prefix.size()));
+    const auto pages = kv_pages_for_tokens(frontier);
+    if (!pages || pages > window.archive.size() || pages > window.host_versions.size() ||
+        !window.archive.front()) {
+        return;
+    }
+    const auto page_bytes = window.archive.front()->size();
+    // All slots share one archive through the latest complete checkpoint.
+    // Uncommitted/cancelled rows past that frontier are never retained.
+    window.archive.resize(pages);
+    window.host_versions.resize(pages);
+    window.host_bytes = pages * page_bytes;
+    std::optional<std::size_t> destination;
+    std::optional<std::size_t> oldest;
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+        auto& history = memory_histories[index];
+        if (!history) { if (!destination) destination = index; continue; }
+        ++count;
+        if (window.session_key && history->session_key == window.session_key) {
+            if (history->publication_order > window.publication_order) return;
+            destination = index;
+            break;
+        }
+        if (!oldest ||
+            history->publication_order < memory_histories[*oldest]->publication_order) {
+            oldest = index;
+        }
+    }
+    if (count >= kvmem_options.retained_sessions &&
+        (!destination || !memory_histories[*destination])) {
+        destination = oldest;
+        ++memory_history_evictions;
+    }
+    if (!destination) return;
+    // Capture already completed every Host copy. The active state's later
+    // writes and unpublished output never become this checkpoint's contents.
+    save_memory_snapshot(window);
+    memory_histories[*destination].emplace(std::move(window));
+}
+
+// Cold disk snapshots are not enabled in this build (kvmem.disk_path/disk_bytes are rejected at
+// startup); the in-process retained histories above are the whole persistence surface.
+void ProgramImplCore::save_memory_snapshot(KvmemWindowState&) noexcept {}
+void ProgramImplCore::load_memory_snapshot(const PreparedPromptData&) noexcept {}
+void ProgramImplCore::erase_memory_snapshot(const PreparedSessionKey&) noexcept {}
+
 // ---- Mean-K statistics (port of program/storage/memory_statistics.cpp) -------------------
 
 namespace {
