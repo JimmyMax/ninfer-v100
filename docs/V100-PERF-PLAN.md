@@ -6,8 +6,8 @@ or are rejected; it is the entry point for "what next" alongside
 
 ## Current state
 
-Released locally as **v1.3.0** (commit `9e2a9bff`, image `ninfer:v1.3.0`), running in the local
-deployment. It contains:
+Released as **v1.3.0** (commit `b0ad4799`, image `ninfer:v1.3.0`, published on origin with a GitHub
+release), running in the local deployment. It contains:
 
 | Change | Effect |
 |---|---|
@@ -48,40 +48,71 @@ docker run --rm --gpus '"device=1"' -v /tmp/tests/tests:/tests ninfer:<tag> /tes
 docker run --rm --gpus '"device=1"' -v /tmp/tests/tests:/tests ninfer:<tag> /tests/ninfer_qwen3_6_runtime_mechanisms_test
 ```
 
+## Where the round time goes (v1.3.0)
+
+Decode throughput is `(1 + 3 × accept) / round`. Round time depends only on context length, not on
+the content, while `accept` ranges from 0.45 (Chinese documents) to 0.80 (code) **at the same round
+time**: at 7.4K, `ms/round` is 39.5 for both kinds, and tok/s is 85 for code against 60 for Chinese.
+Acceptance and round time are therefore two independent levers, and `ms/round` — not tok/s — is the
+invariant to compare across runs, images, or machines.
+
+| | 7.4K | 31.5K | 186K |
+|---|---:|---:|---:|
+| round (ms), v1.3.0 kernel | 39.5 | 43.0 | 63.0 |
+| round (ms), previous kernel (`NINFER_SM70_ATTN_V2=0`) | 41.0 | 49.3 | 89.9 |
+| accept, code / Chinese | 0.79 / 0.51 | 0.77 / 0.49 | 0.68–0.80 / 0.45–0.50 |
+
+Context-proportional cost is `(63.0 − 39.5) / 179K = 0.131 µs/token`, down from 0.267 before the v1.3.0 kernel. Two pools are unexplained by that measurement:
+
+1. **~15 ms/round is context-independent** (38% of the 7.4K round, 24% of the 186K round). Weight
+   streaming accounts for ~24 ms of the 39.5 ms round (19.1 GiB at ~850 GB/s), KV for ~0.2 ms at
+   7.4K; the rest is launch, host, and fixed draft work.
+2. **The context-proportional cost is 3.9x the KV bandwidth floor.** This is a hybrid model: only the
+   full-attention blocks keep a KV cache, and the pool fits inside the logged 10.9 GiB runtime,
+   which bounds those blocks at ≤14 (4 kv heads × 256 head dim × K,V × 1 byte int8 = ≤28 KB per
+   token). At ~850 GB/s that floor is **0.034 µs/token**, a quarter of the measured 0.131. So the
+   growth is not KV bandwidth, and it is either a latency/page-overhead-bound decode attention
+   kernel (up to ~18 ms/round recoverable at 186K, +29%) or every MTP draft step streaming the
+   context KV again (3 drafts ≈ 3x the traffic), which would put the same cost in the draft path.
+
+Two cheap measurements separate those cases and should run before any kernel work:
+
+- `--draft-tokens 1` vs `3` vs `5` at 186K in one image: the round-time slope per extra draft token
+  is the draft path's context cost. A slope near 0.034 µs/token puts the cost in attention.
+- `bench/ops/causal_softmax_attention_bench` (needs `-DNINFER_BUILD_BENCHMARKS=ON`) at 8K/32K/186K:
+  the kernel's own time against the same floor, with no draft path in the way.
+
 ## Next items
 
-### 1. Close the rest of the gap to the tpx port (est. +9% to +13% at long context)
+### 1. Attribute the two pools above (up to +29% at 186K, up to +38% at 8K)
 
-We measure 51.3 / 38.1 decode tok/s at 186K/193K; the source port reports 56 / 43 with its full set
-of commits. Remaining candidates, in the order they should be attempted:
+Run the two measurements, then decide. An nsys trace of one 8K decode round attributes the ~15 ms
+fixed pool directly (8K needs no long prefill, so the loop is fast). Likely suspects: per-round
+host/launch work, CUDA-graph coverage of the draft steps, sampling and logits handoff, KV append.
+This is where the remaining tpx commits (`53f65504` fp16 staging, `2c9e20c9` fused residual epilogue)
+would act, so measure first and then pick from them.
 
-- `53f65504` — stage QPN residual/down-projection activations as fp16 instead of bf16.
-- `2c9e20c9` — fused NVFP4 residual epilogue, faster split reduce, MTP key-window knob.
-- Linear dispatch retunes for nvfp4/fp8/w8/q4 configs. Pure tuning; A/B each one.
+### 2. Acceptance is half of tok/s (config-only first)
 
-Caveat: the two `nvfp4_*` files involved have diverged from that baseline (our swiglu epilogue
-fusion), so these are manual ports, not clean applications.
+Chinese documents accept at ~0.47 against code's ~0.75, which is a 40% tok/s difference at identical
+round time. Sweep `--draft-tokens` (2–6) and the MTP key-window knob from `2c9e20c9`; treat `accept`
+and `ms/round` as separate reported quantities in every benchmark.
 
-### 2. Profile what is left at 186K (no estimate yet)
+### 3. KV dtype: real bytes, wrong kernels today
 
-Decode is now ~63 ms/round at 186K. Attention is no longer the dominant cost; find the next one
-with kernel/nsys profiling before writing code. Candidate suspects: NVFP4 weight streaming, MTP
-draft rounds, LM head, per-round host work.
-
-### 3. Short-context path
-
-8K only improved 3.7% (code) and 7.2% (Chinese), well below the long-context gains. Something
-other than attention dominates there — likely fixed per-round overhead, sampling, or scheduling.
-Profile before changing code.
+`--kv-dtype k8v4` (−25% KV bytes) and `nvfp4` (−50%) are supported, but the Volta small-T v2 kernel
+only handles INT8 group-64; the other dtypes fall back to the older paths (~+27 ms/round at 186K),
+so they lose more than they save today. Extending the v2 kernel to k8v4 keeps the fast path and
+removes a quarter of the KV traffic — worth it at long context, but it is kernel work, not a flag.
 
 ### 4. Concurrency
 
-Every number above is single-request. The deployment runs `--max-concurrency 2`; nothing is known
-about how attention, scheduling, or the context cache behave with two active requests.
+Every number here is single-request, while the deployment runs `--max-concurrency 2`. The
+bandwidth-bound part will not double, but the ~15 ms fixed pool may overlap. Nothing is known yet.
 
-### 5. Product-side backlog (independent of performance)
+### 5. Product-side backlog
 
-Prometheus metrics, constrained decoding, custom Jinja template support. All exist upstream and
+Prometheus metrics, constrained decoding, custom Jinja template support — all exist upstream and
 have not been ported.
 
 ### 6. Deferred
@@ -91,7 +122,6 @@ second V100 in the same host; out of scope until then.
 
 ## Publishing
 
-Local commits and tags are intentionally unpushed: `v1.2.0` (correctness fixes, CI, materialization
-planner) and `v1.3.0` (attention). Push once the deployment has run for a while without issues.
-`wip-a8e212ac` and the `ninfer:v1.3.0b` image are local-only reference material and must not be
-pushed.
+`v1.3.0` is published: master, the tag, a GitHub release with the long-context numbers, and the
+ghcr.io image. `v1.2.0` stays a local tag because its content is included in v1.3.0; `wip-a8e212ac`
+and the `ninfer:v1.3.0b` image are local-only reference material and must not be pushed.
