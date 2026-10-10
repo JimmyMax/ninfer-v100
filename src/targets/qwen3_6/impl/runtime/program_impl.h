@@ -11912,7 +11912,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             ordinary_host_ingress->cache_positions[row] =
-                checked_i32(frontier, "ordinary batch position");
+                checked_i32(compact_position(sequence, frontier), "ordinary batch position");
             ordinary_host_ingress->rope_positions[row] =
                 checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] =
@@ -12092,7 +12092,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                     : std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
                                 capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
-            mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
+            mtp_host_ingress->base_frontiers[row] =
+                checked_i32(compact_position(sequence, frontier), "MTP batch cache frontier");
             mtp_host_ingress->remaining_budgets[row] =
                 checked_i32(budgets[row].generated_tokens_remaining, "MTP batch remaining budget");
             mtp_host_ingress->current_extents[row]      = static_cast<std::int32_t>(extent);
@@ -12117,7 +12118,8 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const StateImageSelectors selectors            = state_selectors(sequence);
             mtp_host_ingress->state_source_slots[row]      = selectors.source;
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
-            mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
+            mtp_host_ingress->rope_deltas[row] = sequence.rope_delta +
+                checked_i32(sequence.window.removed_tokens, "MTP cache shift");
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
