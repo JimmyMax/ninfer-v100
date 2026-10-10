@@ -31,8 +31,8 @@ sudo apt-get install -y build-essential cmake pkg-config \
 #    https://developer.nvidia.com/cuda-downloads
 
 # 3. sources
-git clone https://github.com/liujun-7788/ninfer-v3-v100.git
-cd ninfer-v3-v100
+git clone https://github.com/JimmyMax/ninfer-v100.git
+cd ninfer-v100
 
 # 4. CUTLASS 4.4.2 as a local directory (see pitfall 2)
 wget https://github.com/NVIDIA/cutlass/archive/refs/tags/v4.4.2.tar.gz \
@@ -55,7 +55,7 @@ cmake --build build-v100 -j$(nproc)
 
 1. **`CMAKE_CUDA_ARCHITECTURES=70`.** A default configure builds for a long
    list of architectures (70 through 121a). Pass `70` explicitly — the V100
-   fork's kernels hard-check compute capability 7.0 anyway (an RTX 4090,
+   kernels hard-check compute capability 7.0 anyway (an RTX 4090,
    sm_89, cannot run this build and is rejected at startup; do not try to
    substitute other cards), and the build gets dramatically faster.
 
