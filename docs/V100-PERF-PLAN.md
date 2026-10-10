@@ -22,26 +22,17 @@ Kept as the local tag `wip-a8e212ac` for reference.
 
 ## Measurement harness
 
-Everything needed to reproduce or extend the numbers:
-
 | Piece | Location |
 |---|---|
+| Protocol, measurement rules, example commands | `bench/v100/README.md` |
 | Prompt generator (code / Chinese documents, exact token counts) | `bench/v100/ctx_prompt.py` |
 | Decode / first-token client (reads server `timings`) | `bench/v100/decode_bench.py` |
-| Multi-context matrix runner (image × 8K/32K/186K/193K) | `bench/run_ctx_matrix.sh` |
-| Long-context runner | `bench/run_longctx.sh` |
-| Local bench compose (image override, GPU 1) | `bench/docker-compose.bench.yml` |
+| Orchestration that swaps images and starts the server | deployment directory: `bench/run_ctx_matrix.sh`, `bench/run_longctx.sh`, `bench/docker-compose.bench.yml` |
 
-Rules that made results trustworthy, and that any new perf item must follow:
-
-1. **Prefer an in-image switch for A/B.** The attention kernel has `NINFER_SM70_ATTN_V2=0`; use it
-   rather than two images so both variants see the same session state.
-2. **Always include a drift control.** Re-run the baseline image after the candidate, or interleave.
-   Long-context decode drifts by ~1%, first token by ~5%, and short-request latency by far more.
-3. **Never benchmark while something else uses the host.** A concurrent `nvcc` build inflated
-   tokenize measurements by 2×; a background image export did the same.
-4. Long-context numbers need the GPU to itself: stop the deployment container first
-   (`docker compose -f docker-compose.yml stop llama-cpp-text`).
+Read `bench/v100/README.md` before running anything: it records the in-image A/B switch, the
+drift-control rule, and the one-tenant-per-host rule. A concurrent build inflated host-side
+preparation measurements by 2x in one session, and an uncontrolled comparison once produced a
+spurious 36% "win" that a controlled rerun reduced to nothing.
 
 Build and verify recipe:
 
