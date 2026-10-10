@@ -62,6 +62,18 @@ if(MSVC)
   # flag reaches cl as a compiler option instead of being parsed as an input file.
   add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  # Ported from the official consolidated tree: /Zc:__cplusplus makes MSVC report the standard it
+  # is actually compiling. Without it the macro stays at 199711L even under /std:c++20, and CUDA's
+  # <vector_types.h> then hides the constexpr dim3 constructors behind its own
+  # __cplusplus >= 201103L test, which fails to compile every translation unit that builds a dim3
+  # in a constant expression.
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:__cplusplus>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:__cplusplus>)
+  # CUDA's static runtime requests LIBCMT even when the application and its dependencies use the
+  # project-wide /MD runtime. Keep one CRT in the final process; $<HOST_LINK:...> keeps this off
+  # the CUDA relocatable device-link step, which forwards it to cl.exe without /link and would only
+  # produce a noisy D9002.
+  add_link_options($<HOST_LINK:/NODEFAULTLIB:LIBCMT>)
   add_compile_definitions(_CRT_NONSTDC_NO_WARNINGS _CRT_SECURE_NO_WARNINGS
     NOMINMAX WIN32_LEAN_AND_MEAN UTF8PROC_STATIC)
 endif()
