@@ -1,4 +1,4 @@
-# Release pipeline for the NInfer V100 (sm_70) fork.
+# Release pipeline for the NInfer V100 (sm_70) build.
 #
 # Triggers:
 #   - push a tag:        git tag v1.1.0 && git push origin v1.1.0

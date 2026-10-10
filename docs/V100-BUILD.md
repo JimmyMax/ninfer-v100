@@ -160,7 +160,7 @@ repeats), prefill / decode tok/s by context:
 
 ## Models
 
-Official upstream v3 artifacts load directly with this fork, e.g.
+Official upstream v3 artifacts load directly with this build, e.g.
 [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer).
 v2 artifacts (magic `NInfer\0\2`) keep working unchanged.
 
