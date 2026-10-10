@@ -1,0 +1,50 @@
+# 从当前工作树直接产出运行时镜像（避免导出 20.9GB 验证镜像）。
+# 编译阶段的指令与 Dockerfile.verify.local 逐字一致，以命中已有构建缓存。
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY}
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        cmake \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libcurl4-openssl-dev \
+        libswscale-dev \
+        ninja-build \
+        pkg-config \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=70 \
+        -DNINFER_BUILD_APPS=ON \
+        -DBUILD_TESTING=ON \
+        -DNINFER_BUILD_BENCHMARKS=OFF \
+        -DFETCHCONTENT_SOURCE_DIR_CUTLASS=/src/third_party/cutlass \
+    && cmake --build /build --parallel
+
+# 运行阶段：只拷贝二进制，导出体积约 7.8GB。
+FROM ninfer:v1.2.0 AS runtime
+COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
+COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+
+# 测试运行镜像（可选）：--target testrun -t ninfer:v1.3.0b-tests
+FROM ninfer:v1.2.0 AS testrun
+COPY --from=build /build/tests/ /tests/
+
+# 测试导出阶段：--target testexport --output type=local,dest=<dir>
+FROM scratch AS testexport
+COPY --from=build /build/tests/ninfer_softmax_attention_test /tests/
+COPY --from=build /build/tests/ninfer_qwen3_6_27b_dflash2_real_test /tests/
+COPY --from=build /build/tests/ninfer_qwen3_6_runtime_mechanisms_test /tests/
