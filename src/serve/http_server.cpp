@@ -442,6 +442,9 @@ void HttpServer::register_routes() {
         res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                         "application/json");
     });
+    server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_props(req, res);
+    });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -513,6 +516,42 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
     }
     res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context),
                     "application/json");
+}
+
+// llama.cpp-shaped server properties. The released WebUI treats a failing /props as "server
+// unreachable", so this endpoint is what makes the built-in page usable at all.
+void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
+    const SamplingOverrides& overrides = options_.sampling_overrides;
+    // -1 means "no fixed value": an unset override leaves the request/engine default in charge.
+    nlohmann::json params = {
+        {"n_predict", options_.default_max_tokens},
+        {"max_tokens", options_.default_max_tokens},
+        {"temperature", options_.greedy ? 0.0F : overrides.temperature.value_or(-1.0F)},
+        {"top_k", overrides.top_k.value_or(-1)},
+        {"top_p", overrides.top_p.value_or(1.0F)},
+        {"min_p", overrides.min_p.value_or(0.0F)},
+        {"presence_penalty", overrides.presence_penalty.value_or(0.0F)},
+        {"frequency_penalty", overrides.frequency_penalty.value_or(0.0F)},
+    };
+    params["seed"] = overrides.seed ? nlohmann::json(*overrides.seed) : nlohmann::json(-1);
+    const nlohmann::json props = {
+        {"default_generation_settings",
+         {{"n_ctx", options_.max_context},
+          {"speculative", options_.speculative.backend != SpeculativeBackend::None},
+          {"params", std::move(params)}}},
+        {"total_slots", options_.max_concurrency},
+        {"model_alias", public_model_id_},
+        {"model_path", options_.artifact_path},
+        {"modalities", {{"vision", options_.enable_vision}, {"audio", false}}},
+        {"is_sleeping", false},
+        // Endpoints this server actually implements; the WebUI hides the panels that would
+        // otherwise poll a missing one.
+        {"endpoint_slots", false},
+        {"endpoint_props", true},
+        {"endpoint_metrics", false},
+        {"cors_proxy_enabled", false},
+    };
+    res.set_content(props.dump(), "application/json");
 }
 
 bool HttpServer::webui_enabled() const noexcept {

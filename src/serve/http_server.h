@@ -86,6 +86,7 @@ private:
     void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
+    void handle_props(const httplib::Request& req, httplib::Response& res) const;
     [[nodiscard]] bool webui_enabled() const noexcept;
     void handle_webui(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
