@@ -138,7 +138,7 @@ jobs:
           PKG="ninfer-v100-${V}-linux-x86_64-sm70"
           mkdir -p "dist/$PKG/bin"
           cp build/apps/ninfer build/apps/ninfer-serve build/apps/ninfer-perplexity "dist/$PKG/bin/"
-          cp README.md README.zh-CN.md LICENSE docs/V100-BUILD.md "dist/$PKG/"
+          cp README.md LICENSE docs/V100-BUILD.md "dist/$PKG/"
           tar czf "dist/$PKG.tar.gz" -C dist "$PKG"
           rm -rf "dist/$PKG"
 

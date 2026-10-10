@@ -1,23 +1,21 @@
-**English** | [简体中文](README.zh-CN.md)
-
-> **JimmyMax/ninfer-v100** — fork of [liujun-7788/ninfer-v3-v100](https://github.com/liujun-7788/ninfer-v3-v100) (itself a fork of [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100), the Tesla V100 port of [Neroued/ninfer](https://github.com/Neroued/ninfer)).
->
-> **Supported `.ninfer` artifact versions: v2 and v3.**
-> - **v2 artifacts** — the original container format (e.g. `orcarouter-Qwen3.8-27B-Uncensored-nvfp4-NInfer`), as supported by geoffwatts' fork.
-> - **v3 artifacts** — the upstream container format introduced at Neroued/ninfer `f76e19c0` (model/weight decoupling, 32-byte header with UUID), via liujun-7788's v3 reader.
->
-> This fork additionally adds **nvfp4full support for Qwen3.8-27B v3 artifacts**:
-> - Official `qwen3.8-27b/nvfp4` artifacts keep the last 8 layers' MLP in FP8; nvfp4full community conversions (e.g. [kvnxiao/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-ninfer](https://huggingface.co/kvnxiao/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-ninfer)) store the MLP as NVFP4 in **all 64 layers**.
-> - The binder now probes each artifact's actual tensor format (`Binder::peek`) and binds NVFP4 or FP8 per artifact, so **both layouts work with one binary**.
-> - Note: some community v3 artifacts declare a custom `metadata.name` (e.g. `swift-1.5-qwen3.8-27b-orcarouter`). The registry keys on `qwen3.8-27b`; if you hit `artifact identity ... has no registered target`, patch the JSON directory's `metadata.name` to `qwen3.8-27b` with length-preserving whitespace padding (no checksums inside the container).
->
-> Hardware target: NVIDIA Tesla **V100 (sm_70)** only. For the verified V100 build recipe, runtime flags, and MTP benchmark data see [docs/V100-BUILD.md](docs/V100-BUILD.md).
-
-> **ninfer-v3-v100** — a maintained fork of [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100) (the Tesla V100 fork of [Neroued/ninfer](https://github.com/Neroued/ninfer)) that adds **direct support for upstream v3 `.ninfer` artifacts** — official downloads such as [neroued/Qwen3.8-27B-nvfp4-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) run without conversion. For the verified V100 build recipe, runtime flags, and MTP benchmark data see [docs/V100-BUILD.md](docs/V100-BUILD.md). This fork is not affiliated with or endorsed by the upstream authors.
-
 # NInfer
 
 > Up to 219 decode tok/s from Qwen 3.8 27B on a single V100.  With software NVFP4 on Volta.
+
+> **Supported `.ninfer` artifact versions: v2 and v3.**
+> - **v2** — the original container format (e.g. `orcarouter-Qwen3.8-27B-Uncensored-nvfp4-NInfer`).
+> - **v3** — the upstream container format (model/weight decoupling, 32-byte header with UUID).
+>
+> Both `qwen3.8-27b/nvfp4` layouts bind with one binary: official artifacts keep the last 8 layers'
+> MLP in FP8, while nvfp4full community conversions store the MLP as NVFP4 in all 64 layers. The
+> binder probes each artifact's actual tensor format at load time.
+>
+> Some community v3 artifacts declare a custom `metadata.name`; the registry keys on `qwen3.8-27b`,
+> so patch that field (length-preserving) if startup reports `artifact identity ... has no
+> registered target`.
+>
+> Hardware target: NVIDIA Tesla **V100 (sm_70)**. Build recipe and runtime flags:
+> [docs/V100-BUILD.md](docs/V100-BUILD.md).
 
 NInfer is a from-scratch C++/CUDA inference engine optimized for selected Qwen checkpoints on NVIDIA Tesla V100.
 
@@ -116,6 +114,30 @@ QPN prepacking work was inspired by
 
 The 35B-A3B production DFlash round at a 2,048-token context uses K=3: **125.9 tok/s** and 3.8
 mean output tokens per round over ten measured rounds after two warmups.
+
+### Single-GPU long-context decode (8K–193K tokens)
+
+Full-context serving on a V100-PCIE-32GB with Qwen3.8-27B `nvfp4`, MTP draft 3, INT8 group-64 KV
+and `--max-context 200000`. Decode is the mean of 2 seeds x 1024 generated tokens; first token is
+the cold prefill of the same prompt. Prompts are the synthetic code / Chinese documents generated
+by `bench/v100/ctx_prompt.py`.
+
+| Prompt tokens | Prompt | Decode tok/s before -> after | First token before -> after |
+|---|---|---:|---:|
+| 7,353 | code | 78.2 -> 81.1 (+3.7%) | 6.8 s -> 6.8 s |
+| 7,792 | Chinese | 55.2 -> 59.2 (+7.2%) | 7.4 s -> 7.4 s |
+| 31,538 | code | 63.7 -> 74.3 (+16.6%) | 34.1 s -> 32.4 s |
+| 31,924 | Chinese | 50.3 -> 54.8 (+9.0%) | 34.5 s -> 32.9 s |
+| 186,420 | code | 37.4 -> 51.3 (**+37.3%**) | 461.7 s -> 341.1 s (**-26%**) |
+| 193,104 | Chinese | 25.8 -> 38.1 (**+47.4%**) | 490.6 s -> 350.2 s (**-29%**) |
+
+"before" is the pre-v1.3.0 image, "after" is v1.3.0, which rewrites the INT8 small-T decode
+attention kernel (key-split 8-warp `Bc=64` with a `byte_perm` int8->fp16 dequant) and retunes the
+D256 flash prompt kernel for Volta. The decode gain is isolated to the attention kernel by
+`NINFER_SM70_ATTN_V2` in-image A/B (+43% code, +46% Chinese at 186K/193K); the first-token gain
+comes from the prompt retune alone. Gains scale with context because attention's share of decode
+grows with it. The Volta INT8 decode attention rewrite is adapted from
+[huangserva/ninfer-v100-tpx](https://github.com/huangserva/ninfer-v100-tpx).
 
 ## Quick start
 
@@ -318,6 +340,7 @@ capacities remain fixed for the process lifetime.
 - [CLI](docs/cli.md)
 - [HTTP serving](docs/serving.md)
 - [V100 qualification and performance](docs/v100.md)
+- [V100 performance plan](docs/V100-PERF-PLAN.md)
 - [Perplexity evaluation](docs/perplexity.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)
