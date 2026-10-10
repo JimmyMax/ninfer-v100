@@ -121,6 +121,10 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
 #else
         (void)prepack_for_qpn;
 #endif
+        if (plan.input_columns) {
+            out.input_columns = static_cast<const std::int32_t*>(
+                materialized.device_data(*plan.input_columns));
+        }
         return out;
     }
     (void)prepack_for_qpn;
@@ -154,8 +158,27 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
 }
 
 Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
-    if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n ||
-        block.layout != QuantLayout::RowSplit) {
+    if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n) {
+        throw std::logic_error("invalid target row view");
+    }
+    if (block.layout == QuantLayout::GgufBlocks) {
+        // GGML blocks are row-aligned: a row view only advances qdata by whole rows of blocks.
+        const auto gblock = gguf_block_shape(block.qtype);
+        if (gblock.elements == 0 || block.k % gblock.elements != 0) {
+            throw std::logic_error("GGUF row view needs whole-block columns");
+        }
+        const std::int64_t row_bytes =
+            static_cast<std::int64_t>(block.k / gblock.elements) * gblock.bytes;
+        Weight out                = block;
+        out.qdata                 = static_cast<const std::byte*>(block.qdata) +
+                                    static_cast<std::int64_t>(row_begin) * row_bytes;
+        out.payload_bytes         = static_cast<std::int64_t>(row_count) * row_bytes;
+        out.n                     = row_count;
+        out.shape[0]              = row_count;
+        out.padded_shape[0]       = row_count;
+        return out;
+    }
+    if (block.layout != QuantLayout::RowSplit) {
         throw std::logic_error("invalid target row view");
     }
     const std::uint64_t groups    = static_cast<std::uint64_t>(block.padded_shape[1] / block.group);
@@ -183,8 +206,14 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
 DensePostMixerPayload load_mlp(const MlpPlan& plan,
                                const artifact::MaterializedArtifact& materialized) {
     DensePostMixerPayload out;
-    out.gate_up = materialized_weight(materialized, plan.gate_up, 34816, 5120);
-    out.down    = materialized_weight(materialized, plan.down, 5120, 17408);
+    out.gate_up = materialized_weight(materialized, plan.gate_up,
+                                      plan.gate_up.rows != 0 ? plan.gate_up.rows : 34816, 5120);
+    if (plan.up) {
+        out.up = materialized_weight(materialized, *plan.up,
+                                     plan.up->rows != 0 ? plan.up->rows : 17408, 5120);
+    }
+    out.down = materialized_weight(materialized, plan.down,
+                                   plan.down.rows != 0 ? plan.down.rows : 5120, 17408);
 #ifdef NINFER_VOLTA_BUILD
     // The mixed profile allows gate_up and down formats to differ; prepack
     // each NVFP4 weight on its own qtype instead of keying off gate_up.
@@ -207,6 +236,27 @@ load_attention_projection(const FullAttentionPlan& plan,
             .gate_value = materialized_weight(materialized, split->gate_value, 7168, 5120),
         };
     }
+    if (const auto* gguf = std::get_if<GgufAttentionProjectionPlan>(&plan.projection)) {
+        // Materialize each distinct physical parent once; components sharing a parent take row
+        // views of the same weight.
+        std::vector<std::pair<std::size_t, Weight>> parents;
+        auto parent_weight = [&](const WeightPlan& wp) -> const Weight& {
+            for (const auto& [index, weight] : parents) {
+                if (index == wp.object.index) { return weight; }
+            }
+            parents.emplace_back(wp.object.index,
+                                 materialized_weight(materialized, wp, wp.rows, 5120));
+            return parents.back().second;
+        };
+        GgufAttentionProjectionPayload out;
+        for (const auto& entry : gguf->entries) {
+            out.weights.parts.push_back(ops::GgufProjectionPart{
+                .weight = row_view(parent_weight(entry.parent), entry.row, entry.rows),
+                .output = entry.output,
+                .row    = 0});
+        }
+        return out;
+    }
     const auto& fused = std::get<FusedAttentionProjectionPlan>(plan.projection);
     return FusedAttentionProjectionPayload{
         .query_key_gate_value =
@@ -221,6 +271,33 @@ load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtif
             .query_key = materialized_weight(materialized, split->query_key, 4096, 5120),
             .value_z   = materialized_weight(materialized, split->value_z, 12288, 5120),
         };
+    }
+    if (const auto* gguf = std::get_if<GgufGdnInputProjectionPlan>(&plan.input_projection)) {
+        // q/k/v at rows 0/2048/4096 of the qkv plane; z at row 0 of its own plane (or at 10240
+        // of the shared parent when the artifact fuses all four into one [16384,5120] matrix).
+        const Weight qkv_parent =
+            materialized_weight(materialized, gguf->query_key_value, gguf->query_key_value.rows,
+                                5120);
+        Weight z_parent = qkv_parent;
+        std::int32_t z_row = 10240;
+        if (gguf->z) {
+            z_parent = materialized_weight(materialized, *gguf->z, gguf->z->rows, 5120);
+            z_row    = 0;
+        }
+        GgufGdnInputProjectionPayload out;
+        out.weights.parts.push_back(
+            ops::GgufProjectionPart{.weight = row_view(qkv_parent, 0, 2048), .output = 0,
+                                    .row    = 0});
+        out.weights.parts.push_back(
+            ops::GgufProjectionPart{.weight = row_view(qkv_parent, 2048, 2048), .output = 0,
+                                    .row    = 2048});
+        out.weights.parts.push_back(
+            ops::GgufProjectionPart{.weight = row_view(qkv_parent, 4096, 6144), .output = 0,
+                                    .row    = 4096});
+        out.weights.parts.push_back(
+            ops::GgufProjectionPart{.weight = row_view(z_parent, z_row, 6144), .output = 1,
+                                    .row    = 0});
+        return out;
     }
     const auto& fused = std::get<FusedGdnInputProjectionPlan>(plan.input_projection);
     return FusedGdnInputProjectionPayload{
@@ -294,6 +371,131 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
             bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::Q4G64_F16S, {34816, 5120});
         target.mlp.down =
             bind_weight(binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S, {5120, 17408});
+    }
+}
+
+// Returns a plan that binds the object with the format the artifact actually stores.
+WeightPlan bind_adaptive(artifact::Binder& binder, std::string_view name,
+                         std::initializer_list<std::uint64_t> /*expected_shape*/ = {},
+                         artifact::TensorPlacement placement = artifact::TensorPlacement::Device) {
+    const auto* descriptor = binder.peek(name);
+    if (descriptor == nullptr) {
+        throw artifact::ArtifactError(std::string("missing artifact object ") + std::string(name));
+    }
+    const auto* tensor = std::get_if<artifact::TensorDescriptor>(descriptor);
+    if (tensor == nullptr) {
+        throw artifact::ArtifactError(std::string("artifact object is not a tensor: ") +
+                                      std::string(name));
+    }
+    WeightPlan plan{.object  = binder.require_tensor(name, tensor->format, tensor->layout,
+                                                     std::span<const std::uint64_t>(
+                                                         tensor->shape)),
+                    .format  = tensor->format,
+                    .rows    = static_cast<std::int32_t>(tensor->shape.at(0))};
+    if (placement == artifact::TensorPlacement::Device) {
+        binder.materialize_on_device(plan.object);
+    } else {
+        binder.validate_only(plan.object);
+    }
+    return plan;
+}
+
+void bind_gguf_text_layers(artifact::Binder& binder, BindingPlan& out) {
+    // The input-gather columns table is one shared INT32 object referenced by every GDN output
+    // binding; bind it on first sight and reuse the handle (an object can only be bound once).
+    std::optional<artifact::ObjectHandle> columns_handle;
+    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+        TextLayerPlan& target    = out.text_layers[layer];
+        const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
+        target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
+                                                                NumericFormat::BF16, {5120});
+        target.is_full_attention = is_full_layer(layer);
+        if (target.is_full_attention) {
+            // The four components may share GGUF parents; group them by physical object and
+            // slice the rows in the canonical [query, key, gate, value] order.
+            const std::array<const char*, 4> names = {"attention/query", "attention/key",
+                                                      "attention/gate", "attention/value"};
+            const std::array<std::int32_t, 4> rows = {6144, 1024, 6144, 1024};
+            const std::array<std::int32_t, 4> out  = {0, 2, 1, 3};
+            std::array<const artifact::TensorDescriptor*, 4> desc{};
+            for (std::size_t i = 0; i < 4; ++i) {
+                const auto* d = binder.peek(prefix + names[i]);
+                if (d == nullptr || !std::holds_alternative<artifact::TensorDescriptor>(*d)) {
+                    throw artifact::ArtifactError("missing attention component " +
+                                                  std::string(names[i]));
+                }
+                desc[i] = &std::get<artifact::TensorDescriptor>(*d);
+            }
+            GgufAttentionProjectionPlan plan;
+            std::array<std::uint64_t, 4> bound_offsets{};
+            bool bound[4] = {false, false, false, false};
+            // row cursor per distinct physical object, advanced in canonical order
+            std::array<std::uint64_t, 4> cursors{};
+            for (std::size_t i = 0; i < 4; ++i) {
+                std::size_t group = i;
+                for (std::size_t j = 0; j < i; ++j) {
+                    if (desc[j]->offset == desc[i]->offset) { group = j; break; }
+                }
+                if (!bound[group]) {
+                    plan.entries[group].parent = bind_adaptive(binder, prefix + names[i]);
+                    bound[group]               = true;
+                }
+                plan.entries[i].parent = plan.entries[group].parent;
+                plan.entries[i].row    = static_cast<std::int32_t>(cursors[group]);
+                plan.entries[i].rows   = rows[i];
+                plan.entries[i].output = out[i];
+                cursors[group] += static_cast<std::uint64_t>(rows[i]);
+            }
+            target.attention.projection = std::move(plan);
+            target.attention.query_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
+            target.attention.key_norm = artifact::bind_device_tensor(
+                binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
+            target.attention.output = bind_adaptive(binder, prefix + "attention/output",
+                                                    {5120, 6144});
+        } else {
+            target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
+                                                                  NumericFormat::FP32, {48});
+            target.gdn.dt_bias     = artifact::bind_device_tensor(binder, prefix + "gdn/dt_bias",
+                                                                  NumericFormat::FP32, {48});
+            target.gdn.convolution = artifact::bind_device_tensor(
+                binder, prefix + "gdn/convolution", NumericFormat::BF16, {4, 10240});
+            target.gdn.control_projection = SplitGdnControlProjectionPlan{
+                .a_projection = bind_weight(binder, prefix + "gdn/a_projection",
+                                            NumericFormat::BF16, {48, 5120}),
+                .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
+                                            NumericFormat::BF16, {48, 5120}),
+            };
+            // q/k/v/z are contiguous GGML block rows of one fused [16384,5120] parent, or a
+            // [10240,5120] qkv parent plus a separate [6144,5120] z parent. The aliases point at
+            // the whole physical object, so bind each parent exactly once.
+            {
+                GgufGdnInputProjectionPlan gdn_input;
+                gdn_input.query_key_value = bind_adaptive(binder, prefix + "gdn/query");
+                if (gdn_input.query_key_value.rows != 16384) {
+                    gdn_input.z = bind_adaptive(binder, prefix + "gdn/z");
+                }
+                target.gdn.input_projection = std::move(gdn_input);
+            }
+            target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
+                                                           NumericFormat::BF16, {128});
+            target.gdn.output       = bind_adaptive(binder, prefix + "gdn/output", {5120, 6144});
+            if (!columns_handle && binder.contains(prefix + "gdn/output/input_columns")) {
+                columns_handle = bind_adaptive(binder, prefix + "gdn/output/input_columns",
+                                               {6144}).object;
+            }
+            target.gdn.output.input_columns = columns_handle;
+        }
+        target.post_attention_norm = artifact::bind_device_tensor(
+            binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
+        // gate and up are either one fused [gate;up] parent or two independent parents. The
+        // fused parent exposes the whole [34816,5120] matrix through either alias; a 17408-row
+        // parent is one half only, so bind up separately.
+        target.mlp.gate_up = bind_adaptive(binder, prefix + "mlp/gate");
+        if (target.mlp.gate_up.rows != 34816) {
+            target.mlp.up = bind_adaptive(binder, prefix + "mlp/up");
+        }
+        target.mlp.down = bind_adaptive(binder, prefix + "mlp/down", {5120, 17408});
     }
 }
 
@@ -630,13 +832,23 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
 
-    const NumericFormat vocabulary_format = endpoint_format(weights_profile);
-    out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+    const bool gguf_profile = weights_profile == WeightsProfile::Qwen38Gguf;
+    if (gguf_profile) {
+        // The GGUF bundle stores the vocabulary endpoints in their own block formats; the
+        // endpoint_format profiles (W8/FP8) do not apply.
+        out.token_embedding = bind_adaptive(binder, "text/token_embedding", {248320, 5120});
+    } else {
+        const NumericFormat vocabulary_format = endpoint_format(weights_profile);
+        out.token_embedding =
+            bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+    }
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
         bind_groupwise_text_layers(binder, out);
+        break;
+    case WeightsProfile::Qwen38Gguf:
+        bind_gguf_text_layers(binder, out);
         break;
     case WeightsProfile::Qwen36Nvfp4:
         bind_nvfp4_text_layers(binder, out);
@@ -655,43 +867,75 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
+    out.output_head =
+        gguf_profile ? bind_adaptive(binder, "text/output_head", {248320, 5120})
+                     : bind_weight(binder, "text/output_head", endpoint_format(weights_profile),
+                                   {248320, 5120});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
-    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
-                                           {131072, 5120}, proposal_placement);
-    out.draft_head_token_ids = artifact::bind_tensor(
-        binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
-    validate_draft_ids(binder, out.draft_head_token_ids);
+    // The GGUF bundle names the indexed proposal head "proposal/head" / "proposal/token_ids".
+    const std::string_view draft_head_name =
+        gguf_profile ? std::string_view("proposal/head") : std::string_view("text/draft_head");
+    const std::string_view draft_ids_name =
+        gguf_profile ? std::string_view("proposal/token_ids")
+                     : std::string_view("text/draft_head_token_ids");
+    if (gguf_profile) {
+        out.draft_head           = bind_adaptive(binder, draft_head_name, {131072, 5120},
+                                                 proposal_placement);
+        out.draft_head_token_ids = bind_adaptive(binder, draft_ids_name, {131072},
+                                                 proposal_placement);
+    } else {
+        out.draft_head = WeightPlan{
+            .object = artifact::bind_tensor(binder, draft_head_name, NumericFormat::Q4G64_F16S,
+                                             {131072, 5120}, proposal_placement),
+            .format = NumericFormat::Q4G64_F16S};
+        out.draft_head_token_ids = WeightPlan{
+            .object = artifact::bind_tensor(binder, draft_ids_name, NumericFormat::I32, {131072},
+                                            proposal_placement),
+            .format = NumericFormat::I32};
+    }
+    validate_draft_ids(binder, out.draft_head_token_ids.object);
+
 
     const artifact::TensorPlacement mtp_placement = features.mtp()
                                                         ? artifact::TensorPlacement::Device
                                                         : artifact::TensorPlacement::ValidateOnly;
-    const auto bind_mtp                           = [&](std::string_view name, NumericFormat format,
-                              std::initializer_list<std::uint64_t> shape) {
+    const auto bind_mtp_handle                    = [&](std::string_view name, NumericFormat format,
+                                        std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
+    // The GGUF bundle keys its single MTP layer as "mtp/layers/0/...".
+    const std::string mtp_layer = gguf_profile ? "mtp/layers/0/" : "mtp/layer/";
+    const auto bind_mtp_weight                    = [&](std::string_view name,
+                                       NumericFormat native_format,
+                                       std::initializer_list<std::uint64_t> shape) {
+        return gguf_profile ? bind_adaptive(binder, name, shape, mtp_placement)
+                            : WeightPlan{
+                                  .object = bind_mtp_handle(name, native_format, shape),
+                                  .format = native_format};
+    };
     out.mtp.input_projection =
-        bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {5120, 10240});
-    out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {5120});
-    out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {5120});
-    out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {5120});
-    out.mtp.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
-                                            NumericFormat::W8G32_F16S, {14336, 5120});
-    out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
-    out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
-    out.mtp.output =
-        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {5120, 6144});
+        bind_mtp_weight("mtp/input_projection", NumericFormat::W8G32_F16S, {5120, 10240});
+    out.mtp.embedding_norm = bind_mtp_handle("mtp/embedding_norm", NumericFormat::BF16, {5120});
+    out.mtp.hidden_norm    = bind_mtp_handle("mtp/hidden_norm", NumericFormat::BF16, {5120});
+    out.mtp.input_norm = bind_mtp_handle(mtp_layer + "input_norm", NumericFormat::BF16, {5120});
+    out.mtp.query_key_gate_value =
+        bind_mtp_weight(mtp_layer + "attention/query_key_gate_value", NumericFormat::W8G32_F16S,
+                        {14336, 5120});
+    out.mtp.query_norm =
+        bind_mtp_handle(mtp_layer + "attention/query_norm", NumericFormat::BF16, {256});
+    out.mtp.key_norm =
+        bind_mtp_handle(mtp_layer + "attention/key_norm", NumericFormat::BF16, {256});
+    out.mtp.output = bind_mtp_weight(mtp_layer + "attention/output", NumericFormat::W8G32_F16S,
+                                     {5120, 6144});
     out.mtp.post_attention_norm =
-        bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {5120});
-    out.mtp.mlp.gate_up = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {34816, 5120}),
-        .format = NumericFormat::W8G32_F16S};
-    out.mtp.mlp.down = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {5120, 17408}),
-        .format = NumericFormat::W8G32_F16S};
-    out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
+        bind_mtp_handle(mtp_layer + "post_attention_norm", NumericFormat::BF16, {5120});
+    out.mtp.mlp.gate_up = bind_mtp_weight(mtp_layer + "mlp/gate_up", NumericFormat::W8G32_F16S,
+                                          {34816, 5120});
+    out.mtp.mlp.down = bind_mtp_weight(mtp_layer + "mlp/down", NumericFormat::W8G32_F16S,
+                                        {5120, 17408});
+    out.mtp.final_norm = bind_mtp_handle("mtp/final_norm", NumericFormat::BF16, {5120});
 
     const artifact::TensorPlacement vision_placement =
         features.vision ? artifact::TensorPlacement::Device
@@ -778,25 +1022,24 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16, {5120});
     output_head = materialized_weight(backing, plan.output_head, 248320, 5120);
     if (plan.features.optimized_proposal()) {
-        auto& proposal     = runtime.optimized_proposal.emplace();
-        proposal.head      = artifact::materialized_weight(backing, plan.draft_head,
-                                                           NumericFormat::Q4G64_F16S, 131072, 5120);
-        proposal.token_ids = artifact::materialized_tensor(backing, plan.draft_head_token_ids,
+        auto& proposal    = runtime.optimized_proposal.emplace();
+        proposal.head     = materialized_weight(backing, plan.draft_head, 131072, 5120);
+        proposal.token_ids = artifact::materialized_tensor(backing,
+                                                           plan.draft_head_token_ids.object,
                                                            NumericFormat::I32, {131072});
     }
 
     if (plan.features.mtp()) {
         auto& mtp            = runtime.mtp.emplace();
-        mtp.input_projection = artifact::materialized_weight(
-            backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S, 5120, 10240);
+        mtp.input_projection = materialized_weight(backing, plan.mtp.input_projection, 5120, 10240);
         mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
                                                              NumericFormat::BF16, {5120});
         mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.mtp.hidden_norm,
                                                              NumericFormat::BF16, {5120});
         mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
                                                              NumericFormat::BF16, {5120});
-        mtp.attention.packed = artifact::materialized_weight(
-            backing, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, 14336, 5120);
+        mtp.attention.packed =
+            materialized_weight(backing, plan.mtp.query_key_gate_value, 14336, 5120);
         mtp.attention.query       = row_view(mtp.attention.packed, 0, 6144);
         mtp.attention.key         = row_view(mtp.attention.packed, 6144, 1024);
         mtp.attention.output_gate = row_view(mtp.attention.packed, 7168, 6144);
@@ -805,8 +1048,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             artifact::materialized_tensor(backing, plan.mtp.query_norm, NumericFormat::BF16, {256});
         mtp.key_norm =
             artifact::materialized_tensor(backing, plan.mtp.key_norm, NumericFormat::BF16, {256});
-        mtp.output              = artifact::materialized_weight(backing, plan.mtp.output,
-                                                                NumericFormat::W8G32_F16S, 5120, 6144);
+        mtp.output              = materialized_weight(backing, plan.mtp.output, 5120, 6144);
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {5120});
         mtp.post_mixer = load_mlp(plan.mtp.mlp, backing);

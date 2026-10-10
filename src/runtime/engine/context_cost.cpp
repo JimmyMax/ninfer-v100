@@ -12,6 +12,10 @@
 #include <system_error>
 #include <utility>
 
+#if defined(_MSC_VER)
+#    include <intrin.h>
+#endif
+
 #include <unistd.h>
 
 namespace ninfer::runtime {
@@ -23,7 +27,9 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
+#if !defined(_MSC_VER)
 using U128 = unsigned __int128;
+#endif
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
@@ -36,18 +42,35 @@ std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
 }
 
 std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
+#if defined(_MSC_VER)
+    // MSVC has no __int128; the high half of the 64x64 product drives the clamp.
+    std::uint64_t product_hi = 0;
+    const std::uint64_t product_lo = _umul128(left, right, &product_hi);
+    return product_hi != 0 ? std::numeric_limits<std::uint64_t>::max() : product_lo;
+#else
     const U128 product = static_cast<U128>(left) * right;
     return product > std::numeric_limits<std::uint64_t>::max()
                ? std::numeric_limits<std::uint64_t>::max()
                : static_cast<std::uint64_t>(product);
+#endif
 }
 
 std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
     if (coefficient == 0 || units == 0) { return 0; }
+#if defined(_MSC_VER)
+    // product >= (2^64-1) << 32 exactly when the high half is 0xFFFFFFFF.
+    std::uint64_t product_hi = 0;
+    const std::uint64_t product_lo = _umul128(coefficient, units, &product_hi);
+    if (product_hi == 0xFFFFFFFFULL) { return std::numeric_limits<std::uint64_t>::max(); }
+    const std::uint64_t rounded_lo = product_lo + (kContextCostQ32One - 1U);
+    const std::uint64_t rounded_hi = product_hi + (rounded_lo < product_lo ? 1U : 0U);
+    return (rounded_hi << 32U) | (rounded_lo >> 32U);
+#else
     const U128 product        = static_cast<U128>(coefficient) * units;
     const U128 maximum_scaled = static_cast<U128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
     if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
     return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
+#endif
 }
 
 void require_object(const Json& value, std::string_view context) {

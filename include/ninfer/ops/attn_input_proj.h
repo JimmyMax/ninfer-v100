@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/gguf_projection.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -104,5 +105,17 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
                      Tensor& v, cudaStream_t stream);
+
+/**
+ * GGUF fused input projection: the q/gate/k/v rows come from independent GGUF block parents
+ * (each part writes rows [row, row + weight.n) of its output plane). The parts' formats may
+ * differ; every part projects through the shared gguf bridge with a q8_1 activation.
+ */
+[[nodiscard]] std::size_t attn_input_proj_workspace_capacity_bytes(
+    const GgufProjectionWeights& weights, std::int32_t min_tokens, std::int32_t max_tokens);
+
+void attn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& q,
+                     Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena& workspace,
+                     cudaStream_t stream);
 
 } // namespace ninfer::ops

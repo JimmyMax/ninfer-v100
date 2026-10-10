@@ -13,6 +13,10 @@
 #include <optional>
 #include <span>
 
+#if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
+#    include <intrin.h>
+#endif
+
 namespace ninfer::runtime {
 
 using ::ninfer::FinishReason;
@@ -244,6 +248,25 @@ struct PrefillWork {
     result.tokens                       = suffix_tokens;
     result.vision_items                 = vision_items;
     result.vision_patches               = vision_patches;
+#if defined(_MSC_VER) && !defined(__CUDA_ARCH__)
+    // MSVC has no __int128. Reproduce the identical saturating arithmetic with split
+    // 64-bit ops (_umul128), keeping the same clamp semantics for every input.
+    const std::uint64_t max64  = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t suffix = suffix_tokens;
+    std::uint64_t triangular   = max64; // suffix == max64 saturates unconditionally
+    if (suffix < max64) {
+        const std::uint64_t half_a = (suffix & 1U) == 0 ? suffix / 2U : suffix;
+        const std::uint64_t half_b = (suffix & 1U) == 0 ? suffix + 1U : (suffix + 1U) / 2U;
+        std::uint64_t triangular_hi = 0;
+        const std::uint64_t triangular_lo = _umul128(half_a, half_b, &triangular_hi);
+        triangular = triangular_hi == 0 ? triangular_lo : max64;
+    }
+    std::uint64_t linear_hi = 0;
+    const std::uint64_t linear_lo = _umul128(prefix_tokens, suffix, &linear_hi);
+    const std::uint64_t attention_lo = linear_lo + triangular;
+    const std::uint64_t attention_hi = linear_hi + (attention_lo < linear_lo ? 1U : 0U);
+    result.attention_pairs           = attention_hi == 0 ? attention_lo : max64;
+#else
     const unsigned __int128 suffix      = suffix_tokens;
     const unsigned __int128 linear      = static_cast<unsigned __int128>(prefix_tokens) * suffix;
     const unsigned __int128 triangular  = suffix * (suffix + 1U) / 2U;
@@ -253,6 +276,7 @@ struct PrefillWork {
     result.attention_pairs = attention > std::numeric_limits<std::uint64_t>::max()
                                  ? std::numeric_limits<std::uint64_t>::max()
                                  : static_cast<std::uint64_t>(attention);
+#endif
     return result;
 }
 

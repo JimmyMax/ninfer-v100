@@ -37,7 +37,56 @@ enum class QType : std::uint16_t {
     I32_CTRL             = 6,
     NVFP4                = 7,
     FP8_E4M3FN_ROW_BF16S = 8,
+    // ggml block types kept as a GGUF stored them (GgufBlocks layout only): each row is its K /
+    // block_elements blocks, byte for byte. Their products quantize the activation to ggml's q8_1.
+    // Numbering matches the fusion-kvmem upstream so shared artifacts stay portable.
+    GGUF_Q8_0    = 10,
+    GGUF_Q2_K    = 11,
+    GGUF_Q3_K    = 12,
+    GGUF_Q4_K    = 13,
+    GGUF_Q5_K    = 14,
+    GGUF_Q6_K    = 15,
+    GGUF_IQ2_XXS = 16,
+    GGUF_IQ2_XS  = 17,
+    GGUF_IQ2_S   = 18,
+    GGUF_IQ3_XXS = 19,
+    GGUF_IQ3_S   = 20,
+    GGUF_IQ1_S   = 21,
+    GGUF_IQ1_M   = 22,
+    GGUF_IQ4_NL  = 23,
+    GGUF_IQ4_XS  = 24,
 };
+
+[[nodiscard]] constexpr bool is_gguf(QType format) {
+    return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_IQ4_XS;
+}
+
+struct GgufBlockShape {
+    int elements = 0;
+    int bytes    = 0;
+};
+
+// ggml-common.h's block sizes; {0, 0} for every non-GGUF format.
+[[nodiscard]] constexpr GgufBlockShape gguf_block_shape(QType format) {
+    switch (format) {
+    case QType::GGUF_Q8_0: return {32, 34};
+    case QType::GGUF_Q2_K: return {256, 84};
+    case QType::GGUF_Q3_K: return {256, 110};
+    case QType::GGUF_Q4_K: return {256, 144};
+    case QType::GGUF_Q5_K: return {256, 176};
+    case QType::GGUF_Q6_K: return {256, 210};
+    case QType::GGUF_IQ2_XXS: return {256, 66};
+    case QType::GGUF_IQ2_XS: return {256, 74};
+    case QType::GGUF_IQ2_S: return {256, 82};
+    case QType::GGUF_IQ3_XXS: return {256, 98};
+    case QType::GGUF_IQ3_S: return {256, 110};
+    case QType::GGUF_IQ1_S: return {256, 50};
+    case QType::GGUF_IQ1_M: return {256, 56};
+    case QType::GGUF_IQ4_NL: return {32, 18};
+    case QType::GGUF_IQ4_XS: return {256, 136};
+    default: return {};
+    }
+}
 
 enum class QuantLayout : std::uint16_t {
     RowSplit            = 0,
@@ -45,6 +94,7 @@ enum class QuantLayout : std::uint16_t {
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
     VoltaQpnPrepacked   = 4,
+    GgufBlocks          = 5,
 };
 
 struct Weight {
@@ -69,6 +119,10 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+
+    // INT32 [K] input gather of a GGUF matrix whose stored columns are a permutation of its
+    // input's: column c multiplies input element input_columns[c]. Null for every other matrix.
+    const std::int32_t* input_columns = nullptr;
 };
 
 } // namespace ninfer

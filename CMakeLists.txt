@@ -50,6 +50,22 @@ option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
 
+# Vision = FFmpeg image/video decode + curl remote media acquisition (needs
+# pkg-config for discovery). OFF builds a text-only product with stubs that
+# throw at runtime if image input is attempted.
+option(NINFER_ENABLE_VISION "Build FFmpeg/curl vision and media acquisition" ON)
+
+if(MSVC)
+  # POSIX shim (unistd.h, sys/mman.h, sys/ioctl.h) resolves before system headers.
+  include_directories(BEFORE ${PROJECT_SOURCE_DIR}/portcompat)
+  # spdlog's bundled fmt refuses to compile without /utf-8; wrap it for nvcc so the
+  # flag reaches cl as a compiler option instead of being parsed as an input file.
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  add_compile_definitions(_CRT_NONSTDC_NO_WARNINGS _CRT_SECURE_NO_WARNINGS
+    NOMINMAX WIN32_LEAN_AND_MEAN UTF8PROC_STATIC)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
@@ -100,11 +116,13 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
 endif()
 
 find_package(CUDAToolkit REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-  libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
-if(NINFER_BUILD_MEDIA_ACQUIRE)
-  pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+if(NINFER_ENABLE_VISION)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+    libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7)
+  if(NINFER_BUILD_MEDIA_ACQUIRE)
+    pkg_check_modules(LIBCURL REQUIRED IMPORTED_TARGET libcurl>=7.85)
+  endif()
 endif()
 find_package(Threads REQUIRED)
 

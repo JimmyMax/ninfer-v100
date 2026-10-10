@@ -9,6 +9,7 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "core/tensor.h"
+#include <ninfer/ops/gguf_projection.h>
 
 #include <array>
 #include <cstddef>
@@ -26,12 +27,19 @@ inline constexpr std::size_t kGdnLayers           = 48;
 struct WeightPlan {
     artifact::ObjectHandle object;
     artifact::NumericFormat format          = artifact::NumericFormat::BF16;
+    std::int32_t rows                       = 0;
     std::uint32_t weight_scale_divisor_bits = 0;
     std::uint32_t input_scale_divisor_bits  = 0;
+    // INT32 [K] input-gather columns object bound alongside a GGUF matrix whose stored columns
+    // are a permutation of its input's. Empty when absent.
+    std::optional<artifact::ObjectHandle> input_columns;
 };
 
 struct MlpPlan {
     WeightPlan gate_up;
+    // Present for GGUF profiles whose gate and up halves are separate parents of possibly
+    // different block types; gate_up then holds the gate and up the up.
+    std::optional<WeightPlan> up;
     WeightPlan down;
 };
 
@@ -44,8 +52,24 @@ struct FusedAttentionProjectionPlan {
     WeightPlan query_key_gate_value;
 };
 
+// One GGUF attention component: a row range [row, row + rows) of a possibly shared parent.
+struct GgufAttentionProjectionEntry {
+    WeightPlan parent;
+    std::int32_t row    = 0;
+    std::int32_t rows   = 0;
+    std::int32_t output = 0; // 0 = q, 1 = gate, 2 = k, 3 = v
+};
+
+// The four components may share physical parents (e.g. a fused [query; key] matrix); entries
+// referencing the same object are bound once and sliced by row at materialization time.
+struct GgufAttentionProjectionPlan {
+    std::array<GgufAttentionProjectionEntry, 4> entries;
+};
+
 struct FullAttentionPlan {
-    std::variant<SplitAttentionProjectionPlan, FusedAttentionProjectionPlan> projection;
+    std::variant<SplitAttentionProjectionPlan, FusedAttentionProjectionPlan,
+                 GgufAttentionProjectionPlan>
+        projection;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
     WeightPlan output;
@@ -58,6 +82,13 @@ struct SplitGdnInputProjectionPlan {
 
 struct FusedGdnInputProjectionPlan {
     WeightPlan query_key_value_z;
+};
+
+// A GDN input projection stored as GGUF block matrices. The qkv parent holds q/k/v/z (fused) or
+// just q/k/v; the optional z parent covers the split layout (qkv [10240,5120] plus z [6144,5120]).
+struct GgufGdnInputProjectionPlan {
+    WeightPlan query_key_value;
+    std::optional<WeightPlan> z;
 };
 
 struct SplitGdnControlProjectionPlan {
@@ -77,7 +108,9 @@ struct GdnPlan {
     artifact::ObjectHandle dt_bias;
     artifact::ObjectHandle convolution;
     GdnControlProjectionPlan control_projection;
-    std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan> input_projection;
+    std::variant<SplitGdnInputProjectionPlan, FusedGdnInputProjectionPlan,
+                 GgufGdnInputProjectionPlan>
+        input_projection;
     artifact::ObjectHandle norm;
     WeightPlan output;
 };
@@ -92,14 +125,14 @@ struct TextLayerPlan {
 };
 
 struct MtpPlan {
-    artifact::ObjectHandle input_projection;
+    WeightPlan input_projection;
     artifact::ObjectHandle embedding_norm;
     artifact::ObjectHandle hidden_norm;
     artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_gate_value;
+    WeightPlan query_key_gate_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
+    WeightPlan output;
     artifact::ObjectHandle post_attention_norm;
     MlpPlan mlp;
     artifact::ObjectHandle final_norm;
@@ -145,8 +178,8 @@ struct BindingPlan {
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
     WeightPlan output_head;
-    artifact::ObjectHandle draft_head;
-    artifact::ObjectHandle draft_head_token_ids;
+    WeightPlan draft_head;
+    WeightPlan draft_head_token_ids;
     MtpPlan mtp;
     std::optional<DFlash2Plan> dflash2;
 
@@ -167,6 +200,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
 struct DensePostMixerPayload {
     Weight gate_up;
+    // Set when the GGUF profile stores gate and up as separate parents; gate_up then is the gate.
+    std::optional<Weight> up;
     Weight down;
 };
 
@@ -179,8 +214,14 @@ struct FusedAttentionProjectionPayload {
     Weight query_key_gate_value;
 };
 
+// Four independent GGUF block parents (q/gate/k/v), each written whole into its output plane.
+struct GgufAttentionProjectionPayload {
+    ops::GgufProjectionWeights weights;
+};
+
 using FullAttentionProjectionPayload =
-    std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload>;
+    std::variant<SplitAttentionProjectionPayload, FusedAttentionProjectionPayload,
+                 GgufAttentionProjectionPayload>;
 
 struct SplitGdnInputProjectionPayload {
     Weight query_key;
@@ -191,8 +232,14 @@ struct FusedGdnInputProjectionPayload {
     Weight query_key_value_z;
 };
 
+// Materialized GGUF GDN parts: q/k/v write the qkv plane at rows 0/2048/4096 and z its own plane.
+struct GgufGdnInputProjectionPayload {
+    ops::GgufProjectionWeights weights;
+};
+
 using GdnInputProjectionPayload =
-    std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload>;
+    std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload,
+                 GgufGdnInputProjectionPayload>;
 
 struct SplitGdnControlProjectionPayload {
     Weight a_projection;

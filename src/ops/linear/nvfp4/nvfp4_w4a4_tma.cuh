@@ -15,11 +15,24 @@
 
 namespace ninfer::ops::detail {
 
-struct alignas(128) Nvfp4W4a4TmaDescriptors {
-    CUtensorMap a_codes;
-    CUtensorMap b_codes;
-    CUtensorMap a_scales;
-    CUtensorMap b_scales;
+// MSVC x64 cannot pass by-value parameters whose alignment exceeds 8 (C2719), and
+// CUtensorMap is alignas(64). TMA requires sm_90 and never dispatches on Volta, so
+// the descriptors only need to exist for host stub generation: alias the map to a
+// layout-identical unaligned type and drop the struct's 128-alignment.
+#if defined(NINFER_VOLTA_BUILD)
+struct Nvfp4VoltaTensorMap { cuuint64_t opaque[CU_TENSOR_MAP_NUM_QWORDS]; };
+using Nvfp4TensorMap = Nvfp4VoltaTensorMap;
+#define NINFER_NVFP4_TMA_ALIGN
+#else
+using Nvfp4TensorMap = CUtensorMap;
+#define NINFER_NVFP4_TMA_ALIGN alignas(128)
+#endif
+
+struct NINFER_NVFP4_TMA_ALIGN Nvfp4W4a4TmaDescriptors {
+    Nvfp4TensorMap a_codes;
+    Nvfp4TensorMap b_codes;
+    Nvfp4TensorMap a_scales;
+    Nvfp4TensorMap b_scales;
 };
 
 inline void nvfp4_check_driver(CUresult status, const char* operation) {
@@ -30,18 +43,19 @@ inline void nvfp4_check_driver(CUresult status, const char* operation) {
                              (name != nullptr ? name : "CUDA error"));
 }
 
-inline CUtensorMap nvfp4_make_tma_2d(void* address, CUtensorMapDataType data_type,
+inline Nvfp4TensorMap nvfp4_make_tma_2d(void* address, CUtensorMapDataType data_type,
                                      std::uint64_t columns, std::uint64_t rows,
                                      std::uint64_t row_stride_bytes, std::uint32_t box_columns,
                                      std::uint32_t box_rows, CUtensorMapSwizzle swizzle,
                                      const char* operation) {
-    CUtensorMap map{};
+    Nvfp4TensorMap map{};
     const std::uint64_t global_dim[]     = {columns, rows};
     const std::uint64_t global_stride[]  = {row_stride_bytes};
     const std::uint32_t box_dim[]        = {box_columns, box_rows};
     const std::uint32_t element_stride[] = {1, 1};
     nvfp4_check_driver(
-        cuTensorMapEncodeTiled(&map, data_type, 2, address, global_dim, global_stride, box_dim,
+        cuTensorMapEncodeTiled(reinterpret_cast<CUtensorMap*>(&map), data_type, 2, address,
+                               global_dim, global_stride, box_dim,
                                element_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
                                CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
         operation);
@@ -155,7 +169,7 @@ __device__ __forceinline__ void nvfp4_tma_raster_blocks(int& block_x, int& block
     block_x = linear / rows;
 }
 
-__device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUtensorMap* descriptor,
+__device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const Nvfp4TensorMap* descriptor,
                                                   std::int32_t coordinate0,
                                                   std::int32_t coordinate1,
                                                   std::uint64_t* barrier) {
@@ -169,7 +183,7 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
 
 #else // __CUDA_ARCH__ < 900
 
-__device__ __forceinline__ void nvfp4_tma_load_2d(void*, const CUtensorMap*, std::int32_t,
+__device__ __forceinline__ void nvfp4_tma_load_2d(void*, const Nvfp4TensorMap*, std::int32_t,
                                                   std::int32_t, std::uint64_t*) {
     __trap();
 }

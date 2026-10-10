@@ -99,6 +99,21 @@ NumericFormat parse_format(std::string_view name) {
     if (name == "W8G32_F16S") { return NumericFormat::W8G32_F16S; }
     if (name == "NVFP4") { return NumericFormat::NVFP4; }
     if (name == "FP8_E4M3FN_ROW_BF16S") { return NumericFormat::FP8_E4M3FN_ROW_BF16S; }
+    if (name == "GGUF_Q8_0") { return NumericFormat::GGUF_Q8_0; }
+    if (name == "GGUF_Q2_K") { return NumericFormat::GGUF_Q2_K; }
+    if (name == "GGUF_Q3_K") { return NumericFormat::GGUF_Q3_K; }
+    if (name == "GGUF_Q4_K") { return NumericFormat::GGUF_Q4_K; }
+    if (name == "GGUF_Q5_K") { return NumericFormat::GGUF_Q5_K; }
+    if (name == "GGUF_Q6_K") { return NumericFormat::GGUF_Q6_K; }
+    if (name == "GGUF_IQ2_XXS") { return NumericFormat::GGUF_IQ2_XXS; }
+    if (name == "GGUF_IQ2_XS") { return NumericFormat::GGUF_IQ2_XS; }
+    if (name == "GGUF_IQ2_S") { return NumericFormat::GGUF_IQ2_S; }
+    if (name == "GGUF_IQ3_XXS") { return NumericFormat::GGUF_IQ3_XXS; }
+    if (name == "GGUF_IQ3_S") { return NumericFormat::GGUF_IQ3_S; }
+    if (name == "GGUF_IQ1_S") { return NumericFormat::GGUF_IQ1_S; }
+    if (name == "GGUF_IQ1_M") { return NumericFormat::GGUF_IQ1_M; }
+    if (name == "GGUF_IQ4_NL") { return NumericFormat::GGUF_IQ4_NL; }
+    if (name == "GGUF_IQ4_XS") { return NumericFormat::GGUF_IQ4_XS; }
     throw ArtifactError("unknown tensor format: " + std::string(name));
 }
 
@@ -107,6 +122,7 @@ StorageLayout parse_layout(std::string_view name) {
     if (name == "row-split-k128-v1") { return StorageLayout::RowSplitK128V1; }
     if (name == "blockscale-k16-m128x4-v1") { return StorageLayout::BlockScaleK16M128x4V1; }
     if (name == "row-scale-v1") { return StorageLayout::RowScaleV1; }
+    if (name == "gguf-blocks-v1") { return StorageLayout::GgufBlocksV1; }
     throw ArtifactError("unknown tensor layout: " + std::string(name));
 }
 
@@ -129,6 +145,21 @@ std::string_view map_v3_format(std::string_view value) {
     if (value == "q6_g64_fp16") { return "Q6G64_F16S"; }
     if (value == "q8_g32_fp16") { return "W8G32_F16S"; }
     if (value == "fp8_e4m3fn_row_bf16") { return "FP8_E4M3FN_ROW_BF16S"; }
+    if (value == "gguf_q8_0") { return "GGUF_Q8_0"; }
+    if (value == "gguf_q2_k") { return "GGUF_Q2_K"; }
+    if (value == "gguf_q3_k") { return "GGUF_Q3_K"; }
+    if (value == "gguf_q4_k") { return "GGUF_Q4_K"; }
+    if (value == "gguf_q5_k") { return "GGUF_Q5_K"; }
+    if (value == "gguf_q6_k") { return "GGUF_Q6_K"; }
+    if (value == "gguf_iq2_xxs") { return "GGUF_IQ2_XXS"; }
+    if (value == "gguf_iq2_xs") { return "GGUF_IQ2_XS"; }
+    if (value == "gguf_iq2_s") { return "GGUF_IQ2_S"; }
+    if (value == "gguf_iq3_xxs") { return "GGUF_IQ3_XXS"; }
+    if (value == "gguf_iq3_s") { return "GGUF_IQ3_S"; }
+    if (value == "gguf_iq1_s") { return "GGUF_IQ1_S"; }
+    if (value == "gguf_iq1_m") { return "GGUF_IQ1_M"; }
+    if (value == "gguf_iq4_nl") { return "GGUF_IQ4_NL"; }
+    if (value == "gguf_iq4_xs") { return "GGUF_IQ4_XS"; }
     return value;
 }
 
@@ -137,6 +168,7 @@ std::string_view map_v3_layout(std::string_view value) {
     if (value == "row_split_k128_v1") { return "row-split-k128-v1"; }
     if (value == "row_scale_v1") { return "row-scale-v1"; }
     if (value == "block_scale_k16_m128x4_v1") { return "blockscale-k16-m128x4-v1"; }
+    if (value == "gguf_blocks_v1") { return "gguf-blocks-v1"; }
     return value;
 }
 
@@ -218,9 +250,13 @@ public:
             throw std::system_error(errno, std::generic_category(), "open " + path.string());
         }
 
+#if defined(_MSC_VER)
+        struct __stat64 status {};
+        if (::_fstat64(fd, &status) != 0) {
+#else
         struct stat status {};
-
         if (::fstat(fd, &status) != 0) {
+#endif
             const int error = errno;
             ::close(fd);
             throw std::system_error(error, std::generic_category(), "fstat " + path.string());
@@ -264,15 +300,20 @@ public:
             reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
             throw ArtifactError("direct artifact read is not 4096-byte aligned");
         }
+#if !defined(_MSC_VER)
         if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
             destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
+            throw ArtifactError("direct artifact read exceeds platform I/O limits");
+        }
+#endif
+        if (destination.size() > static_cast<std::size_t>(std::numeric_limits<long long>::max())) {
             throw ArtifactError("direct artifact read exceeds platform I/O limits");
         }
 
         ssize_t bytes = -1;
         do {
             bytes = ::pread(fd_, destination.data(), destination.size(),
-                            static_cast<off_t>(absolute_offset));
+                            static_cast<long long>(absolute_offset));
         } while (bytes < 0 && errno == EINTR);
         if (bytes < 0) {
             throw std::system_error(errno, std::generic_category(), "direct artifact read");
@@ -400,6 +441,8 @@ struct Reader::Impl {
                         identity.weights_id = "groupwise-int";
                     } else if (recipe.find("nvfp4") != std::string::npos) {
                         identity.weights_id = "nvfp4";
+                    } else if (recipe.find("gguf") != std::string::npos) {
+                        identity.weights_id = "gguf";
                     }
                 }
                 if (identity.weights_id.empty()) {
@@ -417,6 +460,9 @@ struct Reader::Impl {
                         if (format == "nvfp4" || format == "NVFP4") {
                             identity.weights_id = "nvfp4";
                             break;
+                        }
+                        if (format.compare(0, 5, "gguf_") == 0) {
+                            identity.weights_id = "gguf";
                         }
                     }
                 }
@@ -622,6 +668,20 @@ struct Reader::Impl {
             }
         }
 
+        // Component names bound through "parts" (one row range of a fused parent) also register
+        // under the component name pointing at the whole physical object. The fork's GGUF GDN and
+        // attention binders accept either the fused parent or the independent components, and
+        // GGUF block rows are addressable as whole-object views, so the full-object alias is the
+        // useful granularity. Conflicts with an already-registered simple binding are ignored.
+        for (const auto& [name, entry] : bindings) {
+            if (entry.simple) { continue; }
+            const auto* entry_index = physical(entry.object);
+            if (entry_index == nullptr) {
+                throw ArtifactError("v3 binding references unknown object: " + entry.object);
+            }
+            add_logical(name, *entry_index, true);
+        }
+
         // Fused families: split component bindings expose one physical object;
         // the fork binds that object under the fused base name.
         for (const auto& [name, entry] : bindings) {
@@ -694,6 +754,26 @@ struct Reader::Impl {
                 if (std::string renamed = fork_rename(fork_divisor); !renamed.empty()) {
                     add_logical(renamed, *entry_index, true);
                 }
+            }
+            // Input-gather columns: uses[].auxiliaries.input_columns names an INT32 [K]
+            // auxiliary; expose it under "{parameter}/input_columns" so the fork binder can
+            // attach the gather to a GGUF matrix whose stored columns permute its input.
+            for (const auto& use : directory.at("uses")) {
+                if (!use.is_object()) { continue; }
+                const auto param_it = use.find("parameter");
+                if (param_it == use.end() || !param_it->is_string()) { continue; }
+                const auto aux_it = use.find("auxiliaries");
+                if (aux_it == use.end() || !aux_it->is_object()) { continue; }
+                const auto cols_it = aux_it->find("input_columns");
+                if (cols_it == aux_it->end() || !cols_it->is_object()) { continue; }
+                const auto obj_it = cols_it->find("object");
+                if (obj_it == cols_it->end() || !obj_it->is_string()) { continue; }
+                const auto& parameter = param_it->get_ref<const std::string&>();
+                const auto* entry_index = physical(obj_it->get_ref<const std::string&>());
+                if (entry_index == nullptr) {
+                    throw ArtifactError("v3 use references unknown input_columns object");
+                }
+                add_logical(parameter + "/input_columns", *entry_index, true);
             }
         }
 

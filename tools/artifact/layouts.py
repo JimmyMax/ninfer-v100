@@ -609,7 +609,7 @@ def _pack_high_bits(codes: torch.Tensor, bits: int) -> torch.Tensor:
     bit_weights = 1 << torch.arange(8, device=codes.device, dtype=torch.int32)
     chunk = max(
         1,
-        _PACK_TEMP_BYTES // max(1, group_size * high_bits * torch.int32.itemsize),
+        _PACK_TEMP_BYTES // max(1, group_size * high_bits * 4),  # int32 = 4 bytes
     )
     mask = (1 << bits) - 1
     for begin in range(0, groups, chunk):

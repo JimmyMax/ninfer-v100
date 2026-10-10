@@ -1,5 +1,12 @@
 #pragma once
 
+#if defined(_MSC_VER)
+// nvtx3's nvtxInit.h calls _wgetenv without including <stdlib.h>/<wchar.h> first,
+// which MSVC does not provide implicitly.
+#    include <cstdlib>
+#    include <cwchar>
+#endif
+
 #include <nvtx3/nvToolsExt.h>
 
 #include <array>

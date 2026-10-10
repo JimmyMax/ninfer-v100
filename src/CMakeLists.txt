@@ -64,6 +64,66 @@ set_target_properties(ninfer_nvfp4_non_rdc PROPERTIES
 target_compile_options(ninfer_nvfp4_non_rdc PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
 target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
 
+# ggml's block-quant kernels (third_party/ggml-quants) behind a plain bridge. They build as their
+# own archive: the ggml headers define CUDA_CHECK and friends, so no NInfer translation unit may
+# see them.
+set(NINFER_GGML_QUANTS_ROOT "${PROJECT_SOURCE_DIR}/third_party/ggml-quants")
+add_library(ninfer_ggml_quants STATIC
+  ops/linear/gguf/ggml_bridge.cu
+  ops/linear/gguf/ggml_mmq_q8_0.cu
+  ops/linear/gguf/ggml_mmq_q2_k.cu
+  ops/linear/gguf/ggml_mmq_q3_k.cu
+  ops/linear/gguf/ggml_mmq_q4_k.cu
+  ops/linear/gguf/ggml_mmq_q5_k.cu
+  ops/linear/gguf/ggml_mmq_q6_k.cu
+  ops/linear/gguf/ggml_mmq_iq2_xxs.cu
+  ops/linear/gguf/ggml_mmq_iq2_xs.cu
+  ops/linear/gguf/ggml_mmq_iq2_s.cu
+  ops/linear/gguf/ggml_mmq_iq3_xxs.cu
+  ops/linear/gguf/ggml_mmq_iq3_s.cu
+  ops/linear/gguf/ggml_mmq_iq1_s.cu
+  ops/linear/gguf/ggml_mmq_iq4_nl.cu
+  ops/linear/gguf/ggml_mmq_iq4_xs.cu
+  ops/linear/gguf/ggml_vec_q8_0.cu
+  ops/linear/gguf/ggml_vec_q2_k.cu
+  ops/linear/gguf/ggml_vec_q3_k.cu
+  ops/linear/gguf/ggml_vec_q4_k.cu
+  ops/linear/gguf/ggml_vec_q5_k.cu
+  ops/linear/gguf/ggml_vec_q6_k.cu
+  ops/linear/gguf/ggml_vec_iq2_xxs.cu
+  ops/linear/gguf/ggml_vec_iq2_xs.cu
+  ops/linear/gguf/ggml_vec_iq2_s.cu
+  ops/linear/gguf/ggml_vec_iq3_xxs.cu
+  ops/linear/gguf/ggml_vec_iq3_s.cu
+  ops/linear/gguf/ggml_vec_iq1_s.cu
+  ops/linear/gguf/ggml_vec_iq1_m.cu
+  ops/linear/gguf/ggml_vec_iq4_nl.cu
+  ops/linear/gguf/ggml_vec_iq4_xs.cu)
+target_include_directories(ninfer_ggml_quants PRIVATE
+  ops/linear/gguf
+  "${NINFER_GGML_QUANTS_ROOT}/include"
+  "${NINFER_GGML_QUANTS_ROOT}/src")
+# cuBLAS 12.8 SDK (headers + generated import lib) lives outside the toolkit
+# install on this box; the runtime DLL is staged next to the executable.
+if(EXISTS "${PROJECT_SOURCE_DIR}/../cublas-sdk/cublas.lib")
+  set(NINFER_CUBLAS_SDK_DIR "${PROJECT_SOURCE_DIR}/../cublas-sdk")
+  target_include_directories(ninfer_ggml_quants PRIVATE
+    "${NINFER_CUBLAS_SDK_DIR}/nvidia/cublas/include")
+  target_link_libraries(ninfer_ggml_quants PRIVATE
+    "${NINFER_CUBLAS_SDK_DIR}/cublas.lib" CUDA::cudart CUDA::cuda_driver)
+else()
+  target_link_libraries(ninfer_ggml_quants PRIVATE CUDA::cublas CUDA::cudart CUDA::cuda_driver)
+endif()
+set_target_properties(ninfer_ggml_quants PROPERTIES
+  CUDA_SEPARABLE_COMPILATION OFF
+  CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
+if(WIN32)
+  set_target_properties(ninfer_ggml_quants PROPERTIES CUDA_RUNTIME_LIBRARY Static)
+endif()
+target_compile_options(ninfer_ggml_quants PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=177>)
+
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
 add_library(ninfer_ops STATIC
@@ -273,6 +333,7 @@ add_library(ninfer_ops STATIC
   ops/sparse_moe/small_t/sparse_moe_small_t_kernels.cu
   ops/sparse_moe/small_t/sparse_moe_small_t_plan.cpp
   ops/linear/linear.cpp
+  ops/linear/gguf/gguf_linear.cpp
   ops/wrapper/add_bias.cpp
   ops/wrapper/argmax.cpp
   ops/wrapper/cast.cpp
@@ -385,7 +446,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
 endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc ninfer_ggml_quants)
 
 # Product-independent text and media mechanisms.
 add_library(ninfer_text STATIC
@@ -393,17 +454,30 @@ add_library(ninfer_text STATIC
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
 
-add_library(ninfer_media_decode STATIC
-  media/decode/decode.cpp)
-ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+if(NINFER_ENABLE_VISION)
+  add_library(ninfer_media_decode STATIC
+    media/decode/decode.cpp)
+  ninfer_internal_includes(ninfer_media_decode)
+  target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+else()
+  add_library(ninfer_media_decode STATIC
+    ${PROJECT_SOURCE_DIR}/portcompat/media_decode_stub.cpp)
+  ninfer_internal_includes(ninfer_media_decode)
+endif()
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
-  add_library(ninfer_media_acquire STATIC
-    product/media_acquire/acquire.cpp)
+  if(NINFER_ENABLE_VISION)
+    add_library(ninfer_media_acquire STATIC
+      product/media_acquire/acquire.cpp)
+  else()
+    add_library(ninfer_media_acquire STATIC
+      ${PROJECT_SOURCE_DIR}/portcompat/media_acquire_stub.cpp)
+  endif()
   ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  if(NINFER_ENABLE_VISION)
+    target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)

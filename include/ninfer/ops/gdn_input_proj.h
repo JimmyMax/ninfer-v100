@@ -4,6 +4,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/gguf_projection.h"
 #include "ninfer/ops/linear.h"
 
 #include <cuda_runtime.h>
@@ -243,6 +244,37 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
 
 /** Applies the A16-only single-parent record-producing form. */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
+                                const Tensor& conv_weight, const Tensor& conv_states,
+                                const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * GGUF parts form: output 0 is the packed qkv plane ([2048 q | 2048 k | 6144 v, T]) and output 1
+ * is z ([6144, T]). Every part lands at its stored row; together they cover both planes exactly.
+ */
+[[nodiscard]] std::size_t gdn_input_proj_workspace_capacity_bytes(
+    const GgufProjectionWeights& weights, std::int32_t min_tokens, std::int32_t max_tokens);
+
+void gdn_input_proj(const Tensor& x, const GgufProjectionWeights& weights, Tensor& qkv, Tensor& z,
+                    WorkspaceArena& workspace, cudaStream_t stream);
+
+[[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+    const GgufProjectionWeights& weights, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
+
+void gdn_input_proj_conv_snapshot(const Tensor& x, const GgufProjectionWeights& weights,
+                                  const Tensor& conv_weight, Tensor& conv_states,
+                                  const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                  const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                                  cudaStream_t stream);
+
+[[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
+    const GgufProjectionWeights& weights, std::int32_t batch_size, std::int32_t min_width,
+    std::int32_t max_width);
+
+void gdn_input_proj_conv_record(const Tensor& x, const GgufProjectionWeights& weights,
                                 const Tensor& conv_weight, const Tensor& conv_states,
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,

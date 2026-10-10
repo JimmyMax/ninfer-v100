@@ -6,6 +6,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
+#include "ops/linear/gguf/gguf_linear.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -36,6 +37,10 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     validate_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens || (gate_up_rows % 2) != 0) {
         throw std::invalid_argument("linear_swiglu workspace: invalid profile or token interval");
+    }
+    if (is_gguf(qtype)) {
+        const detail::GgufShape parent{qtype, gate_up_rows, input_rows};
+        return detail::gguf_swiglu_workspace_bytes(parent, nullptr, min_tokens, max_tokens);
     }
     if (qtype == QType::W8G32_F16S) {
         if (policy != LinearPolicy::A16Only) {
@@ -74,6 +79,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: x/out must be BF16");
     }
     const std::int32_t t   = x.ne[1];
+    if (is_gguf(gate_up_weight.qtype)) {
+        detail::gguf_swiglu(x, gate_up_weight, nullptr, out, ws, stream);
+        return;
+    }
     const bool large_shape = x.ne[0] == 5120 && out.ne[0] == 17408 && gate_up_weight.n == 34816 &&
                              gate_up_weight.k == 5120 && gate_up_weight.padded_shape[0] == 34816 &&
                              gate_up_weight.padded_shape[1] == 5120;
@@ -140,6 +149,31 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream) {
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
+}
+
+void linear_swiglu(const Tensor& x, const Weight& gate_weight, const Weight& up_weight, Tensor& out,
+                   LinearPolicy policy, WorkspaceArena& ws, cudaStream_t stream) {
+    validate_policy(policy);
+    if (!is_gguf(gate_weight.qtype) || !is_gguf(up_weight.qtype)) {
+        throw std::invalid_argument("linear_swiglu: the two-parent form is registered for GGUF");
+    }
+    (void)policy;  // GGUF activation quantization is the format's arithmetic, not a policy choice.
+    detail::gguf_swiglu(x, gate_weight, &up_weight, out, ws, stream);
+}
+
+std::size_t linear_swiglu_pair_workspace_capacity_bytes(
+    QType gate_qtype, QType up_qtype, std::int32_t rows, std::int32_t input_rows,
+    LinearPolicy policy, std::int32_t min_tokens, std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens || rows <= 0 || input_rows <= 0) {
+        throw std::invalid_argument("linear_swiglu pair workspace: invalid profile or token interval");
+    }
+    if (!is_gguf(gate_qtype) || !is_gguf(up_qtype)) {
+        throw std::invalid_argument("linear_swiglu pair workspace: registered for GGUF parents");
+    }
+    const detail::GgufShape gate{gate_qtype, rows, input_rows};
+    const detail::GgufShape up{up_qtype, rows, input_rows};
+    return detail::gguf_swiglu_workspace_bytes(gate, &up, min_tokens, max_tokens);
 }
 
 } // namespace ninfer::ops

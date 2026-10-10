@@ -5,6 +5,7 @@
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <limits>
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -78,6 +80,13 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    if (is_gguf(w.qtype)) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("linear: a GGUF weight needs the workspace overload");
+        }
+        detail::gguf_linear(x, w, out, *workspace, stream);
+        return;
+    }
     switch (w.qtype) {
     case QType::Q4G64_F16S:
         detail::q4_dispatch(x, w, out, policy, workspace, stream);
@@ -115,6 +124,11 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     validate_linear_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear workspace: invalid token interval");
+    }
+
+    if (is_gguf(qtype)) {
+        const detail::GgufShape shape{qtype, output_rows, input_rows};
+        return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
     }
 
     switch (qtype) {
@@ -165,6 +179,43 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     throw std::invalid_argument("linear workspace: unsupported weight qtype");
 }
 
+namespace {
+
+// A process-wide device scratch for GGUF products issued through the workspace-less linear()
+// convenience: those call sites (lm head, MTP projections) have no caller arena, and the GGUF
+// bridges need transient activation storage. Stream-ordered cudaMallocAsync keeps the allocation
+// legal inside CUDA graph capture; the block is intentionally never freed (one scratch per
+// process, grown only when a wider call appears).
+class GgufScratch {
+public:
+    static GgufScratch& instance() {
+        static GgufScratch scratch;
+        return scratch;
+    }
+
+    WorkspaceArena& arena() { return *arena_; }
+
+    void require(std::size_t bytes, cudaStream_t stream) {
+        if (bytes <= capacity_) { return; }
+        void* raw = nullptr;
+        if (cudaMallocAsync(&raw, bytes, stream) != cudaSuccess) {
+            throw std::runtime_error("linear: GGUF scratch allocation failed");
+        }
+        arena_.reset(new WorkspaceArena(DeviceSpan{static_cast<std::byte*>(raw), bytes}));
+        capacity_ = bytes;
+    }
+
+private:
+    GgufScratch() = default;
+    GgufScratch(const GgufScratch&)            = delete;
+    GgufScratch& operator=(const GgufScratch&) = delete;
+
+    std::unique_ptr<WorkspaceArena> arena_;
+    std::size_t capacity_ = 0;
+};
+
+} // namespace
+
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
             WorkspaceArena& workspace, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, policy);
@@ -173,6 +224,15 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     validate_linear_semantics(x, w, out, LinearPolicy::A16Only);
+    if (is_gguf(w.qtype)) {
+        // Size for the widest single product this call can make; the arena is reused afterwards.
+        const detail::GgufShape shape{w.qtype, w.n, w.k};
+        const std::int32_t t = x.ne[1];
+        GgufScratch& scratch = GgufScratch::instance();
+        scratch.require(detail::gguf_project_workspace_bytes({&shape, 1}, t, t), stream);
+        dispatch_linear(x, w, out, LinearPolicy::A16Only, &scratch.arena(), stream);
+        return;
+    }
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
 }
 

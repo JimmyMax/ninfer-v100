@@ -28,6 +28,22 @@ enum class NumericFormat {
     W8G32_F16S,
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
+    // GGUF block formats, stored byte-for-byte from the source GGUF (`gguf-blocks-v1` layout).
+    GGUF_Q8_0,
+    GGUF_Q2_K,
+    GGUF_Q3_K,
+    GGUF_Q4_K,
+    GGUF_Q5_K,
+    GGUF_Q6_K,
+    GGUF_IQ2_XXS,
+    GGUF_IQ2_XS,
+    GGUF_IQ2_S,
+    GGUF_IQ3_XXS,
+    GGUF_IQ3_S,
+    GGUF_IQ1_S,
+    GGUF_IQ1_M,
+    GGUF_IQ4_NL,
+    GGUF_IQ4_XS,
 };
 
 enum class StorageLayout {
@@ -35,6 +51,7 @@ enum class StorageLayout {
     RowSplitK128V1,
     BlockScaleK16M128x4V1,
     RowScaleV1,
+    GgufBlocksV1,
 };
 
 enum class ResourceEncoding {

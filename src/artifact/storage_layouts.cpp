@@ -27,6 +27,35 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment, std::string
     return biased / alignment * alignment;
 }
 
+// ggml block geometry, mirrored from third_party/ggml-quants' GGML_QUANT_SIZES (elements,
+// bytes per block). Kept as a local table so the artifact layer stays free of the vendored
+// ggml headers, which own their own CUDA_CHECK and must not leak into NInfer translation units.
+struct GgufBlockShape {
+    std::uint64_t elements;
+    std::uint64_t bytes;
+};
+
+bool gguf_block_shape(NumericFormat format, GgufBlockShape& out) {
+    switch (format) {
+    case NumericFormat::GGUF_Q8_0:    out = {32, 34};   return true;
+    case NumericFormat::GGUF_Q2_K:    out = {256, 84};  return true;
+    case NumericFormat::GGUF_Q3_K:    out = {256, 110}; return true;
+    case NumericFormat::GGUF_Q4_K:    out = {256, 144}; return true;
+    case NumericFormat::GGUF_Q5_K:    out = {256, 176}; return true;
+    case NumericFormat::GGUF_Q6_K:    out = {256, 210}; return true;
+    case NumericFormat::GGUF_IQ2_XXS: out = {256, 66};  return true;
+    case NumericFormat::GGUF_IQ2_XS:  out = {256, 74};  return true;
+    case NumericFormat::GGUF_IQ2_S:   out = {256, 82};  return true;
+    case NumericFormat::GGUF_IQ3_XXS: out = {256, 98};  return true;
+    case NumericFormat::GGUF_IQ3_S:   out = {256, 110}; return true;
+    case NumericFormat::GGUF_IQ1_S:   out = {256, 50};  return true;
+    case NumericFormat::GGUF_IQ1_M:   out = {256, 56};  return true;
+    case NumericFormat::GGUF_IQ4_NL:  out = {32, 18};   return true;
+    case NumericFormat::GGUF_IQ4_XS:  out = {256, 136}; return true;
+    default: return false;
+    }
+}
+
 struct QuantGeometry {
     std::uint64_t group_size;
     std::uint64_t base_bytes_per_group;
@@ -82,6 +111,36 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "NVFP4";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::GGUF_Q8_0:
+        return "GGUF_Q8_0";
+    case NumericFormat::GGUF_Q2_K:
+        return "GGUF_Q2_K";
+    case NumericFormat::GGUF_Q3_K:
+        return "GGUF_Q3_K";
+    case NumericFormat::GGUF_Q4_K:
+        return "GGUF_Q4_K";
+    case NumericFormat::GGUF_Q5_K:
+        return "GGUF_Q5_K";
+    case NumericFormat::GGUF_Q6_K:
+        return "GGUF_Q6_K";
+    case NumericFormat::GGUF_IQ2_XXS:
+        return "GGUF_IQ2_XXS";
+    case NumericFormat::GGUF_IQ2_XS:
+        return "GGUF_IQ2_XS";
+    case NumericFormat::GGUF_IQ2_S:
+        return "GGUF_IQ2_S";
+    case NumericFormat::GGUF_IQ3_XXS:
+        return "GGUF_IQ3_XXS";
+    case NumericFormat::GGUF_IQ3_S:
+        return "GGUF_IQ3_S";
+    case NumericFormat::GGUF_IQ1_S:
+        return "GGUF_IQ1_S";
+    case NumericFormat::GGUF_IQ1_M:
+        return "GGUF_IQ1_M";
+    case NumericFormat::GGUF_IQ4_NL:
+        return "GGUF_IQ4_NL";
+    case NumericFormat::GGUF_IQ4_XS:
+        return "GGUF_IQ4_XS";
     }
     return {};
 }
@@ -96,6 +155,8 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "blockscale-k16-m128x4-v1";
     case StorageLayout::RowScaleV1:
         return "row-scale-v1";
+    case StorageLayout::GgufBlocksV1:
+        return "gguf-blocks-v1";
     }
     return {};
 }
@@ -137,6 +198,21 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     }
     if (layout == StorageLayout::RowScaleV1) {
         return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::GgufBlocksV1) {
+        if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
+            throw ArtifactError("gguf-blocks-v1 requires a positive rank-two shape");
+        }
+        GgufBlockShape block{};
+        if (!gguf_block_shape(format, block)) {
+            throw ArtifactError("gguf-blocks-v1 requires a ggml block format");
+        }
+        const std::uint64_t blocks_per_row = shape[1] / block.elements;
+        if (shape[1] % block.elements != 0) {
+            throw ArtifactError("gguf-blocks-v1 columns must be whole blocks");
+        }
+        return checked_mul(shape[0], checked_mul(blocks_per_row, block.bytes, "gguf row bytes"),
+                           "gguf tensor encoded size");
     }
     throw ArtifactError("unknown tensor layout");
 }
