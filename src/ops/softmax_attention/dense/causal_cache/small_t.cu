@@ -10,6 +10,8 @@
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16_volta.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta.cuh"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta_v2.cuh"
+#include <cstdlib>
 #endif
 #include "core/device.h" // CUDA_CHECK
 #include "ninfer/ops/softmax_attention.h"
@@ -184,6 +186,42 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
                 static_cast<float*>(partial_l.data));
     };
+    if constexpr (TokenTile * Geometry::GroupSize <= 32) {
+        // Key-split 8-warp Bc=64 variant (small_t_i8_volta_v2.cuh). NINFER_SM70_ATTN_V2=0
+        // falls back to the original 4-warp kernel for A/B comparison.
+        static const bool use_v2 = [] {
+            const char* env = std::getenv("NINFER_SM70_ATTN_V2");
+            return env == nullptr || env[0] != '0';
+        }();
+        if (use_v2) {
+            const auto kernel =
+                causal_attention_small_t_tc_volta_partial_i8_v2_kernel<Geometry, MultiBatch, Masked,
+                                                                       CacheInput>;
+            static const cudaError_t attr = cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(kCausalSmallTI8VoltaV2SmemBytes));
+            CUDA_CHECK(attr);
+            kernel<<<volta_grid, kCausalSmallTI8VoltaV2Warps * 32, kCausalSmallTI8VoltaV2SmemBytes,
+                     stream>>>(
+                static_cast<const __nv_bfloat16*>(q.data), input,
+                static_cast<const std::int32_t*>(pos.data),
+                static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
+                static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
+                static_cast<const std::int32_t*>(cache.block_tables.data),
+                invocation.valid_columns == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                invocation.table_rows == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                cache.block_tables.ne[0], invocation.width, invocation.full_width,
+                invocation.column_begin, logical_capacity, scale,
+                static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
+                static_cast<float*>(partial_l.data));
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
     if constexpr (TokenTile == 6 && Geometry::GroupSize == 6) {
         // Below the 16K graph envelope the fifth-warp setup costs more than the tail pass it
         // replaces; the next envelope up is where sharing the K/V walk wins.

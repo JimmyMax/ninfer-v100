@@ -57,8 +57,9 @@ struct VoltaFlashTiling;
 
 template <>
 struct VoltaFlashTiling<CausalD256H24Kv4> {
+    // 64-column Q tile (see the sm70 D256/ncols=64 entry in fattn-mma-f16.cuh).
     static constexpr int ncols2 = 2;
-    static constexpr int ncols1 = 16;
+    static constexpr int ncols1 = 32;
 };
 
 template <>

@@ -126,7 +126,9 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     // genuine Volta entry above uses 64; giving 256/256 the same halves shared memory
     // to 35,072 B and doubles occupancy to 2 blocks/SM, with no change in accuracy.
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128,  64, 1, false);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128,  64, 1, false);
+    // ninfer sm70 sweep (2026-09-25, 131K/1024-token prefill): 8 warps, 64-key batches and 64-wide
+    // K/V sub-batches took the D256 prompt kernel from 27.8 to 37.4 TFLOP/s on V100-PG500.
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 1,  64,  64,  64,  64, 1, false);
 
     // TODO tune specifically for Volta
     return ggml_cuda_fattn_mma_get_config_ampere(DKQ, DV, ncols);
