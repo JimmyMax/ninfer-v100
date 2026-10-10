@@ -498,6 +498,7 @@ std::optional<AdmissionCandidate> ProgramImplCore::inspect_lane(
             const auto& history = *memory_histories[match->history];
             plan->memory_restore_frontier   = match->frontier;
             plan->memory_restore_generation = history.stamp.session.id;
+            plan->reuse_base                = plan->memory_restore_frontier;
         }
     }
 

@@ -854,15 +854,20 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         if (layer < 0 || layer >= shard.key_sums.ne[2]) {
             throw std::logic_error("KVMem statistics layer is outside its shard");
         }
+        // Decode columns are independent candidates, potentially belonging to different
+        // requests. Copy their represented keys without interpreting flattened columns as a
+        // consecutive logical token range.
+        const Tensor origin = block == 1 ? shard.candidate_origin : shard.prefill_origin;
         Tensor k_sum = shard.key_sums.slice(2, layer, 1)
                            .slice(1, 0, buckets)
                            .view({kCfg.kv_size, buckets});
-        ops::token_sums(kn.view({kCfg.kv_size, tokens}), shard.prefill_origin,
+        ops::token_sums(kn.view({kCfg.kv_size, tokens}), origin,
                         shard.ranges.slice(0, 0, 2), static_cast<std::uint32_t>(block), k_sum, s);
-        Tensor q_sum =
-            shard.query_sums.slice(2, layer, 1).view({kCfg.q_size, 1});
-        ops::token_sums(qn.view({kCfg.q_size, tokens}), shard.prefill_origin,
-                        shard.ranges.slice(0, 2, 2), 0, q_sum, s);
+        if (block != 1) {
+            Tensor q_sum = shard.query_sums.slice(2, layer, 1).view({kCfg.q_size, 1});
+            ops::token_sums(qn.view({kCfg.q_size, tokens}), origin,
+                            shard.ranges.slice(0, 2, 2), 0, q_sum, s);
+        }
     }
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;

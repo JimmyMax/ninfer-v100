@@ -689,12 +689,23 @@ void ProgramImplCore::restore_memory_prefix(SequenceState& sequence,
     const auto descriptor = backend.descriptor();
     const kvmem::CheckpointIdentity expected{descriptor.identity, descriptor.layout,
                                              checkpoint.identity.stamp};
-    if (!checkpoint.identity.compatible_with(expected) ||
-        !(checkpoint.identity.stamp.session == window.stamp.session) ||
-        frontier != checkpoint.identity.stamp.frontier || frontier > sequence.ledger.size() ||
-        !std::equal(checkpoint.prefix.begin(), checkpoint.prefix.end(), sequence.ledger.begin()) ||
-        !checkpoint.prefix_identity.prefix_equals(sequence.prefix_identity, frontier)) {
-        throw std::logic_error("KVMem rejected a stale query checkpoint before mutation");
+    if (!checkpoint.identity.compatible_with(expected)) {
+        throw std::logic_error("KVMem stale checkpoint: identity/layout mismatch");
+    }
+    if (!(checkpoint.identity.stamp.session == window.stamp.session)) {
+        throw std::logic_error("KVMem stale checkpoint: session mismatch");
+    }
+    if (frontier != checkpoint.identity.stamp.frontier) {
+        throw std::logic_error("KVMem stale checkpoint: frontier vs stamp");
+    }
+    if (frontier > sequence.ledger.size()) {
+        throw std::logic_error("KVMem stale checkpoint: frontier beyond ledger");
+    }
+    if (!std::equal(checkpoint.prefix.begin(), checkpoint.prefix.end(), sequence.ledger.begin())) {
+        throw std::logic_error("KVMem stale checkpoint: token prefix mismatch");
+    }
+    if (!checkpoint.prefix_identity.prefix_equals(sequence.prefix_identity, frontier)) {
+        throw std::logic_error("KVMem stale checkpoint: prefix identity mismatch");
     }
     const auto bytes = state_images->host_layout().image_bytes;
     // All prefix records were made durable at capture. Query appends cannot alter
@@ -794,6 +805,10 @@ std::optional<KvmemHistoryMatch> ProgramImplCore::memory_restorable_history(
             continue;
         }
         for (const auto kind : kKvmemCheckpointKinds) {
+            // The Base prefix checkpoint (a short prompt's pre-final-token capture) is restored
+            // through the MTP BeforeSuffix bridge flow, which this port does not carry yet; only
+            // complete execution endpoints participate in Host-history reuse.
+            if (kind == KvmemCheckpointKind::Base) { continue; }
             const auto* candidate = memory_checkpoint(*history, kind);
             if (!candidate) continue;
             const auto& checkpoint = *candidate;
@@ -802,7 +817,7 @@ std::optional<KvmemHistoryMatch> ProgramImplCore::memory_restorable_history(
             bool complete = frontier && checkpoint.state &&
                 checkpoint.state->size() == state_images->host_layout().image_bytes &&
                 frontier == checkpoint.identity.stamp.frontier && history->statistics &&
-                history->selector && history->statistics_frontier >= frontier &&
+                history->selector && history->statistics_frontier == frontier &&
                 history->archive.size() >= pages && history->host_versions.size() >= pages;
             for (std::uint32_t page = 0; complete && page < pages; ++page) {
                 complete = history->archive[page] &&

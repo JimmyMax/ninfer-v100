@@ -1001,17 +1001,32 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
         memory_statistics->ranks.resize(1);
         memory_statistics_host = std::make_unique<PinnedHostBuffer>(
             memory_statistics->key_bytes() + memory_statistics->query_bytes());
+        // Speculative decode keeps one FP32 column per candidate token (block_tokens = 1), so a
+        // round commits each row's represented key without flattening rows into one token range.
+        memory_candidate_statistics = *memory_statistics;
+        memory_candidate_statistics->columns =
+            (std::max(draft_window, static_cast<std::uint32_t>(qwen3_6::kMtpLookupMaximumWidth)) +
+             2U) * max_concurrency;
+        memory_candidate_host =
+            std::make_unique<PinnedHostBuffer>(memory_candidate_statistics->key_bytes());
         memory_statistics_ranges = {0, static_cast<std::int32_t>(capacity), 0, 0};
         const auto& layout = plan.persistent.memory_statistics.front();
         auto& statistics   = memory_statistics->ranks.front();
         statistics.first_layer = layout.first_layer;
         statistics.block_tokens = 64;
+        auto& candidates = memory_candidate_statistics->ranks.front();
+        candidates.first_layer = layout.first_layer;
+        candidates.block_tokens = 1;
         if (layout.layers != 0) {
             statistics.key_sums       = layout.key_sums.bind(backing);
             statistics.query_sums     = layout.query_sums.bind(backing);
             statistics.ranges         = layout.ranges.bind(backing);
             statistics.prefill_origin = layout.prefill_origin.bind(backing);
             statistics.candidate_origin = layout.candidate_origin.bind(backing);
+            candidates.key_sums       = layout.candidate_keys.bind(backing);
+            candidates.query_sums     = statistics.query_sums;
+            candidates.ranges         = statistics.ranges;
+            candidates.candidate_origin = statistics.candidate_origin;
             CUDA_CHECK(cudaMemcpyAsync(statistics.ranges.data, memory_statistics_ranges.data(),
                                        sizeof(memory_statistics_ranges), cudaMemcpyHostToDevice,
                                        device.stream));
@@ -10054,6 +10069,12 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
         request.allow_memory_reuse   = request_plan.allow_memory_reuse;
         request.memory_host_reservation = request_plan.memory_host_reservation;
         request.memory_session_key   = staged.prompt.context_cache.session_key;
+        sequence.mtp_draft_count     = 0;
+        sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
+        sequence.ledger.swap(materialization_ledger_);
+        sequence.prefix_identity.swap(materialization_identity_);
+        sequence.prefix_digests.swap(materialization_prefix_digests_);
+        sequence.rebuild_work       = request_plan.root_rebuild_work;
         if (kvmem_window_tokens) {
             // Retained Host history: exact checkpoint identity decides whether any bytes are
             // reused; a miss recomputes the quoted prefix under the reserved budget.
@@ -10070,12 +10091,6 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             }
             reserve_memory_history(sequence, request, staged.prompt);
         }
-        sequence.mtp_draft_count     = 0;
-        sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
-        sequence.ledger.swap(materialization_ledger_);
-        sequence.prefix_identity.swap(materialization_identity_);
-        sequence.prefix_digests.swap(materialization_prefix_digests_);
-        sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
         if (is_masked_draft_backend(speculative_backend)) {
