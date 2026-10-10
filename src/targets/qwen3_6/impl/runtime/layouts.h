@@ -84,6 +84,9 @@ struct SequencePlanningInputs {
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
+    // KVMem sparse working set: B+R device tokens per sequence; zero disables.
+    std::uint32_t kvmem_window_tokens = 0;
+    KvmemOptions kvmem;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -107,6 +110,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
+    // Zero window tokens keeps the KVMem integration disabled.
+    std::uint32_t kvmem_window_tokens = 0;
+    KvmemOptions kvmem;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;

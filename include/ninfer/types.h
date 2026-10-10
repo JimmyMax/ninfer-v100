@@ -148,6 +148,39 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+// Optional sparse KV working set (KVMem). B and R are independent whole-page budgets;
+// Host retains native page records, including quantization scale planes. Zero
+// selected_tokens disables the integration.
+enum class CudaMemoryPolicy : std::uint8_t {
+    DriverDefault,
+    StrictVram,
+    Mixed,
+};
+
+struct KvmemOptions {
+    std::uint32_t selected_tokens = 0; // B; zero disables KVMem
+    std::uint32_t reserve_tokens = 0;  // R; also covers each prefill chunk
+    // Whole-page rounding uses the backend's fixed 64-token page.
+    // Sink 0 keeps one page; a positive value rounds down and stays at least one page.
+    // Recent rounds down and must retain at least one page for the partial append tail.
+    // Values below 64 are rejected when KVMem is enabled; the default keeps one page.
+    std::uint32_t sink_tokens = 0;
+    std::uint32_t recent_tokens = 64;
+    std::uint64_t host_bytes = 0;      // H; hard bound on archived native payload
+    [[nodiscard]] std::uint32_t sink_blocks() const noexcept {
+        return sink_tokens < 64 ? 1U : sink_tokens / 64U;
+    }
+    [[nodiscard]] std::uint32_t recent_blocks() const noexcept { return recent_tokens / 64U; }
+    std::uint32_t retained_sessions = 4; // bounded inactive Host histories, 1..16
+    bool verify_transfers = false;    // correctness diagnostics, off in product runs
+    // Optional cold snapshots of named inactive text sessions. No online KV paging.
+    std::filesystem::path disk_path;
+    std::uint64_t disk_bytes = 0;
+    [[nodiscard]] std::uint64_t device_tokens() const noexcept {
+        return static_cast<std::uint64_t>(selected_tokens) + reserve_tokens;
+    }
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
@@ -166,6 +199,13 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    // KVMem sparse resident working set (B/R/H). Zero selected_tokens keeps it disabled.
+    KvmemOptions kvmem;
+    // StrictVram is a Windows single-device residency guard; Mixed attempts the requested
+    // capacity with ordinary cudaMalloc and accepts driver paging. DriverDefault is portable.
+    CudaMemoryPolicy cuda_memory_policy      = CudaMemoryPolicy::DriverDefault;
+    std::size_t cuda_vram_reserve_bytes      = 64ULL << 20;
+    std::size_t cuda_memory_probe_step_bytes = 128ULL << 20;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
@@ -782,7 +822,44 @@ struct VisionWorkspaceMemorySummary {
     std::size_t handoff_peak_bytes        = 0;
 };
 
+// Latest observed process residency, not a permanent physical-pinning guarantee. Intentional
+// pinned Host allocations are established before shared_baseline_bytes; device-driven growth
+// above that baseline invalidates a strict candidate. Zero counters while disabled are unknown.
+struct CudaResidencySummary {
+    bool enabled = false;
+    bool verified = false;
+    std::size_t cuda_free_bytes = 0;
+    std::size_t cuda_total_bytes = 0;
+    std::size_t dedicated_bytes = 0;
+    std::size_t shared_bytes = 0;
+    std::size_t shared_baseline_bytes = 0;
+    std::size_t device_allocated_bytes = 0;
+    std::size_t host_pool_bytes = 0;
+    std::size_t host_used_bytes = 0;
+    std::size_t verified_reserve_bytes = 0;
+};
+
+// Gauges of the current KVMem history (active or retained), not process-lifetime counters.
+// Payload H excludes statistics, checkpoint images and native workspace.
+struct KvmemMemorySummary {
+    bool enabled = false;
+    std::uint32_t selected_tokens = 0, reserve_tokens = 0;
+    std::uint64_t host_payload_budget_bytes = 0, host_payload_bytes = 0;
+    std::uint64_t statistics_bytes = 0, checkpoint_bytes = 0;
+    std::uint64_t transfer_staging_bytes = 0;
+    std::uint64_t statistics_staging_bytes = 0;
+    std::uint32_t mtp_resident_pages = 0;
+    std::uint32_t retained_sessions = 0;
+    std::uint64_t history_hits = 0, history_misses = 0, history_evictions = 0;
+    std::uint64_t disk_hits = 0, disk_writes = 0, disk_errors = 0;
+    std::uint64_t active_host_reservation_bytes = 0;
+    std::uint32_t evaluated_tokens = 0, checkpoint_tokens = 0, resident_pages = 0;
+    std::uint32_t history_swaps = 0;
+    std::uint64_t history_spilled_bytes = 0, history_restored_bytes = 0;
+};
+
 struct MemorySummary {
+    KvmemMemorySummary kvmem;
     int device                                = 0;
     std::uint32_t max_context                 = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
@@ -808,6 +885,7 @@ struct MemorySummary {
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    CudaResidencySummary cuda_residency;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -841,7 +919,10 @@ struct RuntimeHostWorkStats {
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
+    KvmemMemorySummary kvmem;
     RuntimeHostWorkStats host_work;
+    // Published by the worker so monitoring never takes the execution lock or queries CUDA/PDH.
+    CudaResidencySummary cuda_residency;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.

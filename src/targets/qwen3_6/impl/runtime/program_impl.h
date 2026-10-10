@@ -776,6 +776,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
+      kvmem_window_tokens(plan.kvmem_window_tokens), kvmem_options(plan.kvmem),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),

@@ -10,6 +10,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
+#include "targets/qwen3_6/impl/runtime/memory_statistics.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -38,6 +39,8 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // KVMem mean-K statistics target (post-RMSNorm/pre-RoPE block sums); null disables.
+    const qwen3_6::detail::MemoryStatistics* memory_statistics = nullptr;
 };
 
 struct PrefillContext {
@@ -54,6 +57,9 @@ struct PrefillContext {
     std::int32_t state_destination_slot                     = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    // KVMem compact-view shift: cache positions are logical positions minus this value;
+    // RoPE positions stay logical (rope_delta absorbs the shift).
+    std::uint32_t cache_position_shift = 0;
 };
 
 struct OrdinaryBatchContext {

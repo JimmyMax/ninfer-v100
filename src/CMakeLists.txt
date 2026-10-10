@@ -31,10 +31,16 @@ add_library(ninfer_core STATIC
   runtime/engine/context_cost.cpp
   runtime/engine/context_cost_defaults.cpp
   runtime/engine/kv_capacity.cpp
-  runtime/engine/public_types.cpp)
+  runtime/engine/public_types.cpp
+  core/resident_memory.cpp
+  core/resident_scan.cu)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+if(WIN32)
+  # resident_memory's StrictVram policy reads GPU shared-memory residency counters.
+  target_link_libraries(ninfer_core PRIVATE pdh)
+endif()
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
@@ -157,6 +163,7 @@ add_library(ninfer_ops STATIC
   ops/rmsnorm_rope/launch.cu
   ops/context_kv_materialize/context_kv_materialize.cpp
   ops/context_kv_materialize/materialize.cu
+  ops/token_sums/token_sums.cu
   ops/candidate_selector/bf16/candidate_selector_path.cu
   ops/candidate_selector/bf16/candidate_selector_path_plan.cpp
   # Softmax Attention and KV-cache state transitions.
@@ -516,7 +523,8 @@ target_link_libraries(ninfer_engine
     ninfer_core
     ninfer_ops
     ninfer_text
-    ninfer_media_decode)
+    ninfer_media_decode
+    kvmem)
 add_library(ninfer::engine ALIAS ninfer_engine)
 
 if(NINFER_BUILD_SERVE)

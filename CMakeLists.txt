@@ -133,6 +133,8 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
 endif()
 
 # --- Subdirectories ----------------------------------------------------------
+# Portable KVMem host core (KV working-set contracts, host archive, mean-K selection).
+add_subdirectory(kvmem)
 add_subdirectory(src)
 if(NINFER_BUILD_APPS)
   add_subdirectory(apps)

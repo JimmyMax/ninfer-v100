@@ -755,6 +755,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
+    impl->kvmem_window_tokens = inputs.kvmem_window_tokens;
+    impl->kvmem               = inputs.kvmem;
     impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
@@ -815,6 +817,38 @@ std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile) {
     validate_target_options(device, options);
+    // KVMem requires the native prefix catalog off: the bounded Host archive replaces it.
+    std::uint32_t kvmem_window_tokens = 0;
+    if (options.kvmem.selected_tokens != 0) {
+        const KvmemOptions& kvmem = options.kvmem;
+        if (!kvmem.disk_path.empty() || kvmem.disk_bytes) {
+            throw std::invalid_argument("KVMem cold disk snapshots are not enabled in this build");
+        }
+        if (kvmem.recent_blocks() == 0) {
+            throw std::invalid_argument("KVMem recent tokens must keep at least one page");
+        }
+        if (static_cast<std::uint64_t>(kvmem.sink_blocks()) + kvmem.recent_blocks() >
+            kvmem.selected_tokens / 64) {
+            throw std::invalid_argument("KVMem sink and recent blocks exceed the selection budget");
+        }
+        const std::uint64_t window = kvmem.device_tokens();
+        if (window > options.max_context || kvmem.selected_tokens < 128 ||
+            kvmem.selected_tokens % 64 != 0 || kvmem.reserve_tokens < 64 ||
+            kvmem.reserve_tokens % 64 != 0 || kvmem.host_bytes == 0 ||
+            kvmem.retained_sessions == 0 || kvmem.retained_sessions > 16 ||
+            options.prefill_chunk > kvmem.reserve_tokens ||
+            options.speculative.draft_tokens > kvmem.reserve_tokens ||
+            options.context_cache.enabled) {
+            throw std::invalid_argument(
+                "KVMem options are inconsistent: window must fit max_context, B/R page-aligned, "
+                "host_bytes nonzero, retained sessions 1..16, prefill chunk and draft window fit "
+                "R, and the native prefix cache must be disabled");
+        }
+        kvmem_window_tokens = static_cast<std::uint32_t>(window);
+    } else if (options.kvmem.reserve_tokens || options.kvmem.host_bytes ||
+               options.kvmem.verify_transfers) {
+        throw std::invalid_argument("KVMem reserve/host options require selected tokens");
+    }
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -829,6 +863,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
         .context_cache       = options.context_cache,
+        .kvmem_window_tokens = kvmem_window_tokens,
+        .kvmem               = options.kvmem,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

@@ -17,6 +17,12 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+/** Whole 64-token page count covering a logical token frontier. */
+[[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
+    return (tokens + static_cast<std::uint32_t>(kPagedKVPageSize) - 1) /
+           static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -106,6 +112,7 @@ class DeviceKVPagePool;
 class KVExecutionTablePool;
 class HostKVAllocationView;
 class HostKVAllocationConstView;
+struct HostKVPageLayout;
 
 /** Copyable, non-owning physical-page capability minted by one DeviceKVPagePool. */
 class DeviceKVPageHandle {
@@ -237,6 +244,27 @@ public:
                         std::span<const DeviceKVPageHandle> destination,
                         cudaStream_t stream = nullptr) const;
 
+    // Record-addressed forms for caller-owned host memory: page i is packed with `layout` at
+    // records[i]. Runs of consecutive physical pages whose records advance by one constant pitch
+    // are copied as one strided transfer per plane; `record_groups` (empty, or one id per record)
+    // names the allocation each record lies in, and records of different groups, or those further
+    // apart than the device's maximum copy pitch, are never joined into one run.
+    void copy_to_host_records(std::span<const DeviceKVPageHandle> source,
+                              std::span<std::byte* const> records,
+                              std::span<const std::uint32_t> record_groups,
+                              const HostKVPageLayout& layout, cudaStream_t stream = nullptr) const;
+    void copy_from_host_records(std::span<const std::byte* const> records,
+                                std::span<const std::uint32_t> record_groups,
+                                std::span<const DeviceKVPageHandle> destination,
+                                const HostKVPageLayout& layout, cudaStream_t stream = nullptr) const;
+    // The same restricted to planes [plane_begin, plane_end), so a caller can order the planes a
+    // consumer needs first ahead of the rest.
+    void copy_from_host_records(std::span<const std::byte* const> records,
+                                std::span<const std::uint32_t> record_groups,
+                                std::span<const DeviceKVPageHandle> destination,
+                                const HostKVPageLayout& layout, std::size_t plane_begin,
+                                std::size_t plane_end, cudaStream_t stream) const;
+
 private:
     friend class DeviceKVPageLease;
     friend class DeviceKVPageReservation;
@@ -250,6 +278,16 @@ private:
     void release_free_page(std::int32_t index) noexcept;
     void release_page(std::int32_t index, std::uint32_t generation) noexcept;
     void release_reservation(std::uint32_t pages) noexcept;
+    void copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin, std::size_t plane_end,
+                       std::int32_t first, std::size_t count, std::byte* host_base,
+                       std::size_t host_pitch, const HostKVPageLayout& host,
+                       cudaStream_t stream) const;
+    // Extends one strided run inside the invariants documented at copy_to_host_records.
+    static std::size_t host_record_run_end(std::span<const DeviceKVPageHandle> pages,
+                                           std::span<const std::byte* const> records,
+                                           std::span<const std::uint32_t> groups, std::size_t begin,
+                                           std::size_t page_stride, std::size_t max_pitch,
+                                           std::size_t& pitch) noexcept;
 
     struct FreePageRun {
         std::int32_t begin  = 0;

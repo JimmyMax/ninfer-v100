@@ -14,12 +14,18 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 #include "targets/qwen3_6/impl/runtime/host_kv_extent_store.h"
 #include "targets/qwen3_6/impl/runtime/logical_kv_store.h"
+#include "targets/qwen3_6/impl/runtime/memory_statistics.h"
 #include "targets/qwen3_6/impl/runtime/state_image_store.h"
 #include "targets/qwen3_6/impl/runtime/prefix_identity.h"
 #include "targets/qwen3_6/impl/runtime/resource_projection.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+
+#include <kvmem/kvmem_store.hpp>
+#include <kvmem/memory_contract.hpp>
+#include <kvmem/raw_kv_store.hpp>
+#include <ninfer/types.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -406,6 +412,63 @@ struct DecodeGraphFamily {
     std::vector<DecodeGraphTopology> topologies;
 };
 
+// KVMem sparse working-set state carried by one logical sequence: the compact device
+// view, the pageable Host archive of native records, mean-K statistics and checkpoints.
+struct KvmemPrefixCheckpoint {
+    kvmem::CheckpointIdentity identity;
+    std::vector<TokenId> prefix;
+    qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
+    std::vector<std::uint64_t> resident_pages;
+    std::vector<float> mean_tail;
+    std::unique_ptr<PinnedHostBuffer> state;
+};
+
+enum class KvmemCheckpointKind : std::uint8_t { Base, Endpoint, InputFallback, Reconstruction };
+// Lookup priority for equal frontiers.
+inline constexpr std::array kKvmemCheckpointKinds{
+    KvmemCheckpointKind::Endpoint, KvmemCheckpointKind::Reconstruction,
+    KvmemCheckpointKind::InputFallback, KvmemCheckpointKind::Base};
+struct KvmemHistoryMatch {
+    std::size_t history;
+    KvmemCheckpointKind kind;
+    std::uint32_t frontier;
+};
+
+using KvmemHostRecord = std::vector<std::byte>;
+
+struct KvmemWindowState {
+    std::optional<PreparedSessionKey> session_key;
+    std::uint64_t publication_order = 0;
+    bool update_session_index = true;
+    // Compact execution slots -> original logical pages. Host records retain native
+    // packed data AND scales. They never contain a second allocation of device KV.
+    std::vector<std::uint32_t> pages;
+    std::vector<std::uint32_t> media_pages;
+    std::vector<std::unique_ptr<KvmemHostRecord>> archive;
+    std::vector<std::uint64_t> host_versions;
+    kvmem::MemoryStamp stamp;
+    std::uint64_t host_bytes = 0;
+    std::uint64_t spilled_bytes = 0, restored_bytes = 0;
+    std::uint32_t removed_tokens = 0;
+    std::uint32_t swaps = 0;
+    std::unique_ptr<kvmem::RawKvStore> statistics;
+    std::unique_ptr<kvmem::KvMemStore> selector;
+    std::vector<float> query_sum;
+    std::uint32_t statistics_frontier = 0;
+    std::uint32_t query_tokens = 0;
+    std::uint32_t query_begin = 0, query_end = 0;
+    // Long prompts retain the pre-query boundary for selection/replay; short prompts
+    // retain the input prefix before its final token for request-to-request reuse.
+    std::unique_ptr<KvmemPrefixCheckpoint> prefix_checkpoint;
+    std::unique_ptr<KvmemPrefixCheckpoint> endpoint_checkpoint;
+    // An input fallback survives generated reconstruction captures: a caller may
+    // discard/replace the output while appending to the exact earlier input.
+    std::unique_ptr<KvmemPrefixCheckpoint> input_checkpoint;
+    std::unique_ptr<KvmemPrefixCheckpoint> reconstruction_checkpoint;
+    std::uint32_t reconstruction_frontier = 0;
+    bool query_replayed = false;
+};
+
 // Target model continuation for one logical sequence. This state remains meaningful after the
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
@@ -424,6 +487,7 @@ struct SequenceState {
     qwen3_6::detail::ResidentPrefixIdentity prefix_identity;
     qwen3_6::detail::PrefixShortlistDigests prefix_digests;
     std::int32_t rope_delta               = 0;
+    KvmemWindowState window;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
@@ -644,6 +708,10 @@ public:
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     const WorkspacePlan workspace_plan;
+    // KVMem sparse working set: B+R device tokens per active sequence and a bounded
+    // pageable Host archive. Zero window tokens keeps the integration disabled.
+    const std::uint32_t kvmem_window_tokens;
+    const KvmemOptions kvmem_options;
 
     DeviceArena persistent;
     DeviceArena workspace_storage;
@@ -667,6 +735,25 @@ public:
     std::optional<DFlashPersistentState> dflash;
     qwen3_6::RoundState io;
     Tensor prefill_hidden;
+    std::optional<qwen3_6::detail::MemoryStatistics> memory_statistics;
+    std::optional<qwen3_6::detail::MemoryStatistics> memory_candidate_statistics;
+    std::unique_ptr<PinnedHostBuffer> memory_candidate_host;
+    std::unique_ptr<PinnedHostBuffer> memory_statistics_host;
+    // Reused transfer staging is bounded by the physical window. Durable history
+    // uses ordinary host RAM, so pinned allocation count does not grow with H.
+    std::unique_ptr<PinnedHostBuffer> memory_kv_staging;
+    std::array<std::int32_t, 4> memory_statistics_ranges{};
+    // Inactive physical Host histories. Keys follow frontend ContextCacheHints;
+    // exact checkpoint identity still decides whether any bytes can be reused.
+    std::array<std::optional<KvmemWindowState>, 16> memory_histories;
+    struct MemoryPublication {
+        std::optional<PreparedSessionKey> key;
+        std::uint64_t order = 0;
+    };
+    // Bounded high-watermarks also cover newer requests that finish without
+    // retaining a checkpoint, preventing an older concurrent result publishing.
+    std::array<MemoryPublication, 32> memory_publications;
+    std::uint64_t memory_history_hits = 0, memory_history_misses = 0, memory_history_evictions = 0;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
     Tensor token_counts;
