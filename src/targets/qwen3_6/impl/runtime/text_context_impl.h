@@ -30,6 +30,7 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/token_sums.h"
 
 #include <cuda_runtime.h>
 
@@ -842,6 +843,27 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor kn          = results.normalized_key.view({kCfg.head_dim, kCfg.n_kv, T});
     ops::rmsnorm(q, *w.q_norm, kCfg.rms_eps, true, qn, s);
     ops::rmsnorm(k, *w.k_norm, kCfg.rms_eps, true, kn, s);
+    if (memory_statistics_ != nullptr && active_sequence_batch_ == 0) {
+        // KVMem mean-K statistics: only normalized, represented BF16 values BEFORE RoPE enter
+        // these reductions. Prefill aggregates complete logical 64-token blocks.
+        const auto& shard  = memory_statistics_->ranks.front();
+        const auto block   = static_cast<std::int32_t>(shard.block_tokens);
+        const auto tokens  = static_cast<std::int32_t>(T);
+        const auto buckets = (tokens + 2 * block - 2) / block;
+        const auto layer   = static_cast<std::int32_t>(fidx) - static_cast<std::int32_t>(shard.first_layer);
+        if (layer < 0 || layer >= shard.key_sums.ne[2]) {
+            throw std::logic_error("KVMem statistics layer is outside its shard");
+        }
+        Tensor k_sum = shard.key_sums.slice(2, layer, 1)
+                           .slice(1, 0, buckets)
+                           .view({kCfg.kv_size, buckets});
+        ops::token_sums(kn.view({kCfg.kv_size, tokens}), shard.prefill_origin,
+                        shard.ranges.slice(0, 0, 2), static_cast<std::uint32_t>(block), k_sum, s);
+        Tensor q_sum =
+            shard.query_sums.slice(2, layer, 1).view({kCfg.q_size, 1});
+        ops::token_sums(qn.view({kCfg.q_size, tokens}), shard.prefill_origin,
+                        shard.ranges.slice(0, 2, 2), 0, q_sum, s);
+    }
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =

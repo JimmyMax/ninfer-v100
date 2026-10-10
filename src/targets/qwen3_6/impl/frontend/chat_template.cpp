@@ -548,6 +548,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     }
 
     const long last_query_index  = last_real_user_query(messages);
+    std::optional<ByteSpan> memory_query;
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
     std::vector<std::size_t> rewrite_execution_boundaries;
@@ -597,7 +598,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         if (message.role == ChatRole::User) {
             rendered.append_template("<|im_start|>user\n");
             resolve_part_boundaries(rendered.size());
+            const std::size_t query_begin = rendered.size();
             rendered.append(content);
+            const std::size_t query_end = rendered.size();
+            if (static_cast<long>(i) == last_query_index && query_end > query_begin) {
+                memory_query = ByteSpan{query_begin, query_end};
+            }
             rendered.append_template("<|im_end|>\n");
             message_boundaries[i + 1U] = rendered.size();
             continue;
@@ -609,7 +615,12 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             if (opens_group) { rendered.append_template("<|im_start|>user"); }
             rendered.append_template("\n<tool_response>\n");
             resolve_part_boundaries(rendered.size());
+            const std::size_t tool_begin = rendered.size();
             rendered.append(content);
+            const std::size_t tool_end = rendered.size();
+            if (static_cast<long>(i) == last_query_index && tool_end > tool_begin) {
+                memory_query = ByteSpan{tool_begin, tool_end};
+            }
             rendered.append_template("\n</tool_response>");
             if (closes_group) { rendered.append_template("<|im_end|>\n"); }
             message_boundaries[i + 1U] = rendered.size();
@@ -736,7 +747,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                         .rewrite_checkpoint           = rewrite_checkpoint,
                         .rewrite_execution_boundaries = std::move(rewrite_execution_boundaries),
                         .message_boundaries           = std::move(message_boundaries),
-                        .cache_boundaries             = std::move(cache_boundaries)};
+                        .cache_boundaries             = std::move(cache_boundaries),
+                        .memory_query                 = memory_query};
 }
 
 } // namespace ninfer::targets::qwen3_6::frontend_internal

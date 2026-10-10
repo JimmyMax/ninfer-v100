@@ -568,6 +568,9 @@ struct RequestControl {
         // KVMem: frontier/generation licensed by the planner for a Host-history restore.
         std::uint32_t memory_restore_frontier   = 0;
         std::uint64_t memory_restore_generation = 0;
+        // Tokens already evaluated that the query replay re-evaluates; they must not be
+        // reported as new prompt progress twice.
+        std::uint32_t hidden_replay_tokens = 0;
     };
 
     std::optional<Prefill> prefill;

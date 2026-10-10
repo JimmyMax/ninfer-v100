@@ -1471,6 +1471,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             throw_context_length_exceeded(impl_->max_context);
         }
         result.token_ids                   = std::move(encoded.input_ids);
+        if (encoded.memory_query) {
+            result.memory_query = TokenSpan{encoded.memory_query->begin,
+                                            encoded.memory_query->count};
+        }
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =
             std::move(encoded.rewrite_execution_frontiers);

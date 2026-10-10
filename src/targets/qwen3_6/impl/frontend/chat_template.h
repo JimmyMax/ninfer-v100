@@ -131,6 +131,9 @@ struct RenderedChat {
     std::vector<std::optional<std::size_t>> message_boundaries;
     // One rendered byte boundary per requested cache marker.
     std::vector<std::optional<std::size_t>> cache_boundaries;
+    // Exact rendered byte span of the final real user query (or the trailing tool response when a
+    // truncated history begins there). Feeds the KVMem retrieval probe.
+    std::optional<ByteSpan> memory_query;
 };
 
 enum class ChatTemplateSemantics : std::uint8_t {

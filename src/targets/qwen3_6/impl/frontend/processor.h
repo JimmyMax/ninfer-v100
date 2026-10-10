@@ -131,6 +131,8 @@ struct EncodedChat {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
+    // KVMem retrieval query span, licensed only at an exact token boundary pair.
+    std::optional<TokenSpan> memory_query;
 };
 
 EncodedChat

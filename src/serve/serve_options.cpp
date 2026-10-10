@@ -131,6 +131,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
+    std::optional<std::size_t> kv_headroom_bytes;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -285,6 +286,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--kvmem-retained"), "kvmem-retained"));
         } else if (arg == "--kvmem-verify") {
             options.kvmem.verify_transfers = true;
+        } else if (arg == "--kv-headroom-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--kv-headroom-mib"), "kv-headroom-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--kv-headroom-mib is out of range");
+            }
+            kv_headroom_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
@@ -347,6 +355,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (kv_headroom_bytes) {
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+            throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");
+        }
+        options.kv_capacity.automatic_headroom_bytes = *kv_headroom_bytes;
     }
     if (!options.allow_prefix_reuse) {
         if (context_capacity_explicit) {

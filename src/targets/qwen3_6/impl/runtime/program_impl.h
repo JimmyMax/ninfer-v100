@@ -989,6 +989,38 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     token_counts    = plan.persistent.token_counts.bind(backing);
     sampling_config = plan.persistent.sampling_config.bind(backing);
+    if (!plan.persistent.memory_statistics.empty()) {
+        // KVMem mean-K statistics: bind the persistent planes and size the pinned readback.
+        memory_statistics.emplace();
+        memory_statistics->key_width   = static_cast<std::uint32_t>(TextConfig::kv_size);
+        memory_statistics->query_width = static_cast<std::uint32_t>(TextConfig::query_size);
+        memory_statistics->layers =
+            static_cast<std::uint32_t>(TextConfig::full_attention_layers());
+        memory_statistics->columns =
+            (std::min(prefill_chunk, capacity) + 126U) / 64U;
+        memory_statistics->ranks.resize(1);
+        memory_statistics_host = std::make_unique<PinnedHostBuffer>(
+            memory_statistics->key_bytes() + memory_statistics->query_bytes());
+        memory_statistics_ranges = {0, static_cast<std::int32_t>(capacity), 0, 0};
+        const auto& layout = plan.persistent.memory_statistics.front();
+        auto& statistics   = memory_statistics->ranks.front();
+        statistics.first_layer = layout.first_layer;
+        statistics.block_tokens = 64;
+        if (layout.layers != 0) {
+            statistics.key_sums       = layout.key_sums.bind(backing);
+            statistics.query_sums     = layout.query_sums.bind(backing);
+            statistics.ranges         = layout.ranges.bind(backing);
+            statistics.prefill_origin = layout.prefill_origin.bind(backing);
+            statistics.candidate_origin = layout.candidate_origin.bind(backing);
+            CUDA_CHECK(cudaMemcpyAsync(statistics.ranges.data, memory_statistics_ranges.data(),
+                                       sizeof(memory_statistics_ranges), cudaMemcpyHostToDevice,
+                                       device.stream));
+            CUDA_CHECK(cudaMemsetAsync(statistics.candidate_origin.data, 0, sizeof(std::int32_t),
+                                       device.stream));
+            CUDA_CHECK(cudaMemsetAsync(statistics.prefill_origin.data, 0, sizeof(std::int32_t),
+                                       device.stream));
+        }
+    }
     active_continuations.fill(continuation_capacity);
     for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) { lane_epochs[lane] = 1; }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
@@ -6635,6 +6667,7 @@ void ProgramImplCore::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.prefix_identity.clear();
     sequence.prefix_digests.clear();
     sequence.rope_delta              = 0;
+    sequence.window                  = {};
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
@@ -11006,6 +11039,7 @@ void ProgramImplCore::ordered_reset(SequenceState& sequence) {
     refresh_state_views(sequence);
     work.reset();
     set_device_i32(io.pos, 0);
+    if (kvmem_window_tokens) { sequence.window = {}; }
     set_device_i32(io.rope_pos, 0);
     set_device_i32(io.rope_delta, 0);
     if (io.mtp) { set_device_i32(io.mtp->position, 0); }
@@ -11561,6 +11595,14 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse};
     std::uint32_t processed_prompt_tokens = 0;
+    // The query replay re-evaluates an already reported range; subtract those tokens from the
+    // step progress so the Engine's admitted-suffix accounting stays exact.
+    const auto reported_tokens = [&]() -> std::uint32_t {
+        const std::uint32_t hidden =
+            std::min(staged.hidden_replay_tokens, processed_prompt_tokens);
+        staged.hidden_replay_tokens -= hidden;
+        return processed_prompt_tokens - hidden;
+    };
     const auto started                    = Clock::now();
     try {
         if (staged.next_capture < staged.capture_groups.size() &&
@@ -11656,7 +11698,13 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         (chunk_end == staged.prompt_tokens ? lead : 0U));
                     prepare_window(sequence, staged.cursor, mapped_end);
                     schedule_state.execution.cache_position_shift = sequence.window.removed_tokens;
+                    const auto query = staged.prompt.memory_query.value_or(TokenSpan{});
+                    prepare_memory_statistics(sequence, static_cast<std::uint32_t>(query.begin),
+                                              static_cast<std::uint32_t>(query.begin + query.count));
+                    schedule_state.execution.memory_statistics =
+                        memory_statistics ? &*memory_statistics : nullptr;
                 }
+                const std::uint32_t chunk_begin       = staged.cursor;
                 schedule_state.text_kv_base           = staged.cursor;
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
@@ -11669,7 +11717,8 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                     schedule_state.rewrite_checkpoint_hidden = nullptr;
                 }
 
-                const bool final_candidate = staged.cursor + remaining == staged.prompt_tokens;
+                const bool final_candidate = staged.cursor + remaining == staged.prompt_tokens &&
+                    !memory_query_probe(sequence, staged.prompt_tokens);
                 const std::optional<std::uint32_t> capture_frontier =
                     staged.next_capture < staged.capture_groups.size()
                         ? std::optional<std::uint32_t>(
@@ -11682,6 +11731,17 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                 if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
                     (!split_frontier || *rewrite_split < *split_frontier)) {
                     split_frontier = *rewrite_split;
+                }
+                // KVMem: a long prompt stops exactly at the pre-query boundary so the probe can
+                // select the retrieval view before the query is replayed.
+                std::uint32_t memory_frontier = 0;
+                if (kvmem_window_tokens) {
+                    memory_frontier = memory_checkpoint_frontier(sequence, staged.prompt_tokens,
+                                                                 request.allow_memory_reuse);
+                    if (memory_frontier > staged.cursor &&
+                        (!split_frontier || memory_frontier < *split_frontier)) {
+                        split_frontier = memory_frontier;
+                    }
                 }
                 schedule::PrefillChunkResult result;
                 timing.pause();
@@ -11714,10 +11774,19 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                     sequence.dflash_context_frontier = staged.cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
+                if (kvmem_window_tokens) {
+                    commit_memory_statistics(sequence, chunk_begin, staged.cursor);
+                }
 
                 // Prompt transitions are canonical immediately. If this was the first write after
                 // an immutable source, close the Fork before potentially freezing a new rewrite.
                 settle_state_fork(sequence);
+                if (kvmem_window_tokens && memory_frontier != 0 &&
+                    staged.cursor == memory_frontier &&
+                    (!sequence.window.prefix_checkpoint ||
+                     sequence.window.prefix_checkpoint->prefix.size() != memory_frontier)) {
+                    capture_memory_prefix(sequence, result.processed_tokens);
+                }
                 const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
                 if (reached_capture) {
                     if (result.finalized) {
@@ -11730,7 +11799,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                         staged.pending_capture_offer = next_capture_offer_id_;
                         return runtime::PrefillStepResult{
                             .summary                 = summary,
-                            .processed_prompt_tokens = processed_prompt_tokens,
+                            .processed_prompt_tokens = reported_tokens(),
                             .timing                  = timing.finish(),
                         };
                     }
@@ -11741,6 +11810,22 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
             }
 
             if (!finalized) {
+                if (staged.cursor == staged.prompt_tokens &&
+                    memory_query_probe(sequence, staged.prompt_tokens)) {
+                    // The probe evaluated Q once; the checkpoint restores the pre-query state and
+                    // the next step replays the query against the selected original-position KV.
+                    const auto completed = reported_tokens();
+                    rewind_memory_query(sequence);
+                    staged.cursor = sequence.window.query_begin;
+                    staged.hidden_replay_tokens += staged.prompt_tokens - staged.cursor;
+                    staged.elapsed_seconds +=
+                        std::chrono::duration<double>(Clock::now() - started).count();
+                    return runtime::PrefillStepResult{
+                        .summary                 = summary,
+                        .processed_prompt_tokens = completed,
+                        .timing                  = timing.finish(),
+                    };
+                }
                 if (staged.cursor == staged.prompt_tokens) {
                     throw std::logic_error("staged prefill reached the prompt without sampling");
                 }
@@ -11748,7 +11833,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
                     std::chrono::duration<double>(Clock::now() - started).count();
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
-                    .processed_prompt_tokens = processed_prompt_tokens,
+                    .processed_prompt_tokens = reported_tokens(),
                     .timing                  = timing.finish(),
                 };
             }
@@ -11838,7 +11923,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         return runtime::PrefillStepResult{
             .summary = summary,
             .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
-            .processed_prompt_tokens = processed_prompt_tokens,
+            .processed_prompt_tokens = reported_tokens(),
             .complete                = true,
             .timing                  = timing.finish(),
         };

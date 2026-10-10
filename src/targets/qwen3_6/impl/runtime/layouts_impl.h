@@ -253,6 +253,37 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     out.sampling_config = add_tensor(
         builder, DType::I32, {config_words, static_cast<std::int32_t>(plan.max_concurrency)},
         "sampling config");
+    if (plan.kvmem_window_tokens) {
+        // KVMem mean-K statistics: post-RMSNorm/pre-RoPE Q/K block sums per full-attention
+        // layer, plus the speculative candidate plane (one candidate column per verify row).
+        MemoryStatisticsLayout statistics;
+        statistics.first_layer = 0;
+        statistics.layers      = static_cast<std::uint32_t>(TextConfig::full_attention_layers());
+        const auto columns   = (std::min(plan.prefill_chunk, plan.capacity) + 126U) / 64U;
+        // One candidate column per verify row: the learned window or the widest lookup window,
+        // whichever the configured drafting can present.
+        const auto candidate_columns =
+            (std::max(plan.draft_window, static_cast<std::uint32_t>(qwen3_6::kMtpLookupMaximumWidth)) +
+             2U) * plan.max_concurrency;
+        statistics.key_sums = add_tensor(
+            builder, DType::FP32,
+            {TextConfig::kv_size, static_cast<std::int32_t>(columns),
+             static_cast<std::int32_t>(statistics.layers)},
+            "kvmem key sums");
+        statistics.candidate_keys = add_tensor(
+            builder, DType::FP32,
+            {TextConfig::kv_size, static_cast<std::int32_t>(candidate_columns),
+             static_cast<std::int32_t>(statistics.layers)},
+            "kvmem candidate keys");
+        statistics.candidate_origin = i32(1, "kvmem candidate origin");
+        statistics.prefill_origin   = i32(1, "kvmem prefill origin");
+        statistics.query_sums       = add_tensor(
+            builder, DType::FP32,
+            {TextConfig::query_size, 1, static_cast<std::int32_t>(statistics.layers)},
+            "kvmem query sums");
+        statistics.ranges = i32(4, "kvmem statistic ranges");
+        out.memory_statistics.push_back(statistics);
+    }
     out.bytes = builder.finish(kArenaAlign, "persistent layout");
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);

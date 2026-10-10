@@ -750,7 +750,8 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
     byte_boundaries.reserve((rendered.rewrite_checkpoint ? 1U : 0U) +
                             rendered.rewrite_execution_boundaries.size() +
                             rendered.message_boundaries.size() + rendered.cache_boundaries.size() +
-                            rendered.media_token_runs.size() * 2U);
+                            rendered.media_token_runs.size() * 2U +
+                            (rendered.memory_query ? 2U : 0U));
     if (rendered.rewrite_checkpoint) {
         byte_boundaries.push_back(rendered.rewrite_checkpoint->offset);
     }
@@ -766,12 +767,26 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         byte_boundaries.push_back(run.bytes.begin);
         byte_boundaries.push_back(run.bytes.end);
     }
+    if (rendered.memory_query) {
+        byte_boundaries.push_back(rendered.memory_query->begin);
+        byte_boundaries.push_back(rendered.memory_query->end);
+    }
 
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
         rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
         rendered.literal_spans);
     encoded.input_ids = std::move(tokenized.input_ids);
     if (encoded.input_ids.size() == maximum_tokens) { return encoded; }
+    if (rendered.memory_query) {
+        // The query span is licensed only when both ends land on exact token boundaries.
+        const auto& begin = tokenized.boundaries.at(tokenized.boundaries.size() - 2);
+        const auto& end   = tokenized.boundaries.back();
+        if (begin.exact_frontier && end.exact_frontier &&
+            *begin.exact_frontier < *end.exact_frontier) {
+            encoded.memory_query = TokenSpan{*begin.exact_frontier,
+                                             *end.exact_frontier - *begin.exact_frontier};
+        }
+    }
     std::size_t boundary_index = 0;
     const auto to_frontier     = [](std::size_t frontier, std::string_view kind) {
         if (frontier > std::numeric_limits<std::uint32_t>::max()) {
@@ -846,6 +861,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
             .frame_index = run.frame_index,
         });
     }
+    if (rendered.memory_query) { boundary_index += 2; }
     if (boundary_index != tokenized.boundaries.size()) {
         throw std::logic_error("rendered token boundary result count changed during encoding");
     }

@@ -40,6 +40,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
     card.set_cache_position_shift(execution.cache_position_shift);
+    card.set_memory_statistics(execution.memory_statistics);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;

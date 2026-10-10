@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
@@ -33,6 +34,18 @@ struct DFlashPersistentLayout {
     }
 };
 
+// KVMem mean-K statistics for one execution shard (this build has exactly one).
+struct MemoryStatisticsLayout {
+    std::uint32_t first_layer = 0;
+    std::uint32_t layers      = 0;
+    TensorLayout key_sums;
+    TensorLayout candidate_keys;
+    TensorLayout candidate_origin;
+    TensorLayout prefill_origin;
+    TensorLayout query_sums;
+    TensorLayout ranges;
+};
+
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
     qwen3_6::StateImageDeviceLayout state_images;
@@ -44,6 +57,8 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
+    // KVMem mean-K statistics (one shard on this single-device build).
+    std::vector<MemoryStatisticsLayout> memory_statistics;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };

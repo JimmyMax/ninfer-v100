@@ -7,6 +7,7 @@
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
 #include "core/tensor.h"
+#include "targets/qwen3_6/impl/runtime/memory_statistics.h"
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -186,6 +187,11 @@ public:
     // this shift; RoPE positions stay logical.
     void set_cache_position_shift(std::uint32_t shift) noexcept { cache_position_shift_ = shift; }
 
+    // KVMem mean-K statistics target (post-RMSNorm/pre-RoPE Q/K block sums); null disables.
+    void set_memory_statistics(const qwen3_6::detail::MemoryStatistics* statistics) noexcept {
+        memory_statistics_ = statistics;
+    }
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
 
@@ -323,6 +329,7 @@ private:
     std::int32_t active_sequence_width_                                            = 0;
     std::int32_t rope_delta_                                                       = 0;
     std::uint32_t cache_position_shift_                                            = 0;
+    const qwen3_6::detail::MemoryStatistics* memory_statistics_                    = nullptr;
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
