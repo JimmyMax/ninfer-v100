@@ -22,6 +22,10 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
+# This codebase does not use C++ modules. Disable CMake's per-translation-unit module scan so
+# Ninja can use the compiler's normal header dependency tracking on Windows.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+
 # CUTLASS: Volta (sm_70) has real FP16 tensor cores (mma.sync.m8n8k4) but no bf16/int
 # tensor-core support and no equivalent to the mma.cuh helpers this codebase's Ampere+
 # kernels use. Rather than hand-writing raw Volta mma.sync PTX (a large, error-prone
@@ -62,6 +66,8 @@ if(MSVC)
   # flag reaches cl as a compiler option instead of being parsed as an input file.
   add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
+  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
   # Ported from the official consolidated tree: /Zc:__cplusplus makes MSVC report the standard it
   # is actually compiling. Without it the macro stays at 199711L even under /std:c++20, and CUDA's
   # <vector_types.h> then hides the constexpr dim3 constructors behind its own
