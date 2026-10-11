@@ -106,6 +106,7 @@ shared-memory staging layer (e.g. `Bc=32` staged twice) is the obvious next expe
 | `--kv-dtype k8v4` / `nvfp4` | Engine refuses on Volta: `NVFP4 KV-cache storage is unavailable on Volta`. Closed, not a speed question |
 | `--spec dflash2 --draft-tokens 3` | 55.8 ms/round at 8K against MTP's 40.2 — 40% slower, no acceptance advantage |
 | `NINFER_MTP_ATTN_WINDOW` isolation | With speculation disabled, window 0 and 8192 produce byte-identical output, so the target model is untouched |
+| Prefill decomposition | 186K prefill is 188 s device + 149 s host-exposed and strictly serial; host CPU is idle during it (blocked); larger `--prefill-chunk` makes it worse |
 
 ## Landed in v1.4.0
 
@@ -135,11 +136,34 @@ it isolates the kernel from everything else and runs in seconds.
 acceptance on Chinese documents at 193K. Keep it off by default; enable it for deployments whose
 contexts are consistently beyond ~100K and whose content is code-like.
 
-### 3. Prefill (first token)
+### 3. Prefill: host-exposed serial time is 44% of the first token
 
-186K cold prefill is 341 s (547 tok/s) after the v1.3.0 retune — still the largest user-visible cost
-at long context. Nothing has been profiled here; the flash prompt kernel and the GDN/attention
-projections are the places to look.
+Measured on v1.4.0 (186K code prompt, `--prefill-chunk 2048`): `prompt_ms` 337 s, and the request
+log splits it exactly into **device wait 188 s + host submit 149 s**. The host time is not CPU burn:
+sampling `/proc/<pid>/task/*/stat` over a running prefill shows the process consuming essentially no
+CPU, so the host is blocked, not computing, and the two phases never overlap (their sum is the total
+in every configuration measured).
+
+| configuration | prefill | units | device | host submit | host per token |
+|---|---:|---:|---:|---:|---:|
+| 186K, chunk 2048 | 337.1 s | 94 | 188.0 s | 149.2 s | 0.80 ms |
+| 186K, chunk 4096 | 335.7 s | 48 | 168.2 s | 167.6 s | 0.90 ms |
+| 186K, chunk 8192 | 434.2 s | 25 | 182.9 s | 251.4 s | 1.35 ms |
+| 32K, chunk 2048 | 32.1 s | 18 | 17.8 s | 14.3 s | 0.45 ms |
+
+Larger chunks make the host phase worse (10.1 s per 8192-token chunk against 1.6 s per 2048-token
+chunk), so the per-chunk cost grows with chunk size *and* with the accumulated prefix — an O(n²)
+shaped host operation at fixed chunk size. Ruled out by A/B at 32K (all 31.9–32.1 s): sync mode
+(`NINFER_CUDA_SYNC=blocking`), prefix reuse (`--no-prefix-reuse`), CUDA graphs (`--no-cuda-graph`),
+host KV mirror size (`--host-kv-mib 128`), checkpoint slots (`--host-state-slots 1
+--device-state-slots 1`), the draft path (server started without `--spec`), and vision (`--vision`
+removed). The single-request `ninfer` CLI reproduces it exactly (31.8 s for the same 32K prompt), so
+it lives in the shared Program prefill path, not in the server's HTTP or context-cache layers.
+
+Next step: sub-phase timers inside `ProgramImplCore::advance_prefill` / `prefill_text_chunk` and the
+per-chunk preparation, or bisect by disabling subsystems; the quadratic shape points at a per-token
+operation against the whole prefix on the host path. Removing or overlapping this time would take
+the 186K first token from 341 s to roughly 200 s.
 
 ### 4. Product-side backlog
 
