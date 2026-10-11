@@ -130,8 +130,8 @@ Drift control: the baseline image was re-run after the candidate and matched its
 
 ### 1. Port the remaining single-GPU changes from the sibling project
 
-`huangserva/ninfer-v100-tpx` has two unported changes that matter on one card, from two commits, the
-second depending on the first:
+An independent V100 port of this codebase carries two unported changes that matter on one card,
+from two commits, the second depending on the first:
 
 | Source | Change | Their measurement |
 |---|---|---|
