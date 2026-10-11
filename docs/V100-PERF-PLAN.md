@@ -159,17 +159,31 @@ roughly 1% of a decode round - and it did not survive qualification:
 Verdict: ~1% end-to-end is not worth three extra verified states. v1.5.0 stays as shipped and the
 QPN batching below is the next thing to port.
 
-Verification, in this order:
+#### Next session: start here
 
-1. `ninfer_softmax_attention_test` on the ported tree (attention numerics change in row 1) plus
-   `ninfer_qwen3_6_runtime_mechanisms_test` and the DFlash2 real-model test (`7 1 1 2`, skip code 77).
-2. Two images (baseline `master`, candidate) and the drift-controlled ladder 8K / 32K / 186K with
-   draft 4: **baseline -> candidate -> baseline**, comparing `ms/round` and repeating the baseline
-   last, exactly as the v1.4.0 and v1.5.0 changes were qualified.
-3. Bit-identical check for rows 2-3 only (they claim it): same greedy prompt with speculation off at
-   window 0 and 8192. Row 1 changes accumulation order and is expected to differ in the last bits.
-4. Optional kernel-level numbers: add `ninfer_linear_bench` to the iteration image's target list and
-   measure the affected shapes (5120x17408 down projection, T=4) before and after.
+The remaining change is a software pipeline over our chunk loop rather than a mechanical port,
+because this kernel already batches its four groups per chunk: per `st` it issues 32 code bytes (two
+`uint4`) and one 32-bit scale word, then decodes the four groups out of registers. What the source
+commit shows on the equivalent loop is that those loads still stall (Nsight: 70% DRAM throughput with
+long scoreboard as the top stall) and that keeping the *next* chunk in flight while the current one
+is decoded is what removes them.
+
+1. `src/ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh`, the `st` loop at the top of the kernel body:
+   prologue-load chunk `st0`, then per iteration issue the loads for `st + 1` before the four-group
+   decode and mma of `st`, and rotate the buffered pair (two `uint4` + one `std::uint32_t`). Two live
+   chunks is all it needs; the source's 8-group buffered variant spills and is unusable.
+2. Leave the activation loads (`raw0`/`raw1`) where they are: they are already known per chunk and
+   consumed immediately by the mma.
+3. Gate it with `NINFER_NVFP4_QPN_PIPE=0` restoring the current loop, so the A/B ladder and any later
+   bisect remain possible.
+4. Kernel numbers first: `ninfer_linear_bench --qtype nvfp4` already carries the affected shape
+   (`27b.mtp_down`, 5120x17408, continuous T). Add `ninfer_linear_bench` to the target list in
+   `Dockerfile.opt.local` so the iteration image can run it. Expect ~-8% on the kernel (source:
+   96.0 -> 88.4 us at T=4) and ~-2% on a decode round at 186K.
+5. Then the usual evidence: the ladder (baseline -> candidate -> baseline, draft 4, 8K / 32K / 186K),
+   a bit-identical check (this change must not alter accumulation order, and the source reports
+   identical output), and `ninfer_qwen3_6_runtime_mechanisms_test` plus the DFlash2 real-model test
+   (`7 1 1 2`, skip code 77) on the candidate image.
 
 ### 2. Decode attention: what is left after v1.5.0
 
