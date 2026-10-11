@@ -48,80 +48,103 @@ docker run --rm --gpus '"device=1"' -v /tmp/tests/tests:/tests ninfer:<tag> /tes
 docker run --rm --gpus '"device=1"' -v /tmp/tests/tests:/tests ninfer:<tag> /tests/ninfer_qwen3_6_runtime_mechanisms_test
 ```
 
-## Where the round time goes (v1.3.0)
+## Where the round time goes (measured)
 
-Decode throughput is `(1 + 3 × accept) / round`. Round time depends only on context length, not on
-the content, while `accept` ranges from 0.45 (Chinese documents) to 0.80 (code) **at the same round
-time**: at 7.4K, `ms/round` is 39.5 for both kinds, and tok/s is 85 for code against 60 for Chinese.
-Acceptance and round time are therefore two independent levers, and `ms/round` — not tok/s — is the
-invariant to compare across runs, images, or machines.
+Decode throughput is `(1 + draft_tokens × accept) / round`. Round time depends only on context
+length, not on the content, while `accept` ranges from 0.36 (Chinese at 193K) to 0.79 (code at 8K)
+at the same round time. `ms/round` — not tok/s — is the invariant to compare across runs, images,
+or machines. The server's own `engine_timing` puts 95% of a round in device wait and 5% in host
+exposure (2.9 ms of a 62.6 ms round at 186K), so every remaining lever is device-side.
 
-| | 7.4K | 31.5K | 186K |
+| round time (ms) | 7.4K | 31.5K | 186K |
 |---|---:|---:|---:|
-| round (ms), v1.3.0 kernel | 39.5 | 43.0 | 63.0 |
-| round (ms), previous kernel (`NINFER_SM70_ATTN_V2=0`) | 41.0 | 49.3 | 89.9 |
-| accept, code / Chinese | 0.79 / 0.51 | 0.77 / 0.49 | 0.68–0.80 / 0.45–0.50 |
+| pre-v1.3.0 kernel, draft 3 | 41.0 | 49.3 | 89.9 |
+| v1.3.0, draft 3 | 39.5 | 43.0 | 63.0 |
+| v1.4.0, draft 4 | 38.6 | 41.3 | 62.5 |
+| v1.4.0, draft 4, `NINFER_MTP_ATTN_WINDOW=8192` | 38.5 | 41.2 | 59.4 |
 
-Context-proportional cost is `(63.0 − 39.5) / 179K = 0.131 µs/token`, down from 0.267 before the v1.3.0 kernel. Two pools are unexplained by that measurement:
+Pools at 186K, draft 3 (62.6 ms round):
 
-1. **~15 ms/round is context-independent** (38% of the 7.4K round, 24% of the 186K round). Weight
-   streaming accounts for ~24 ms of the 39.5 ms round (19.1 GiB at ~850 GB/s), KV for ~0.2 ms at
-   7.4K; the rest is launch, host, and fixed draft work.
-2. **The context-proportional cost is 3.9x the KV bandwidth floor.** This is a hybrid model: only the
-   full-attention blocks keep a KV cache, and the pool fits inside the logged 10.9 GiB runtime,
-   which bounds those blocks at ≤14 (4 kv heads × 256 head dim × K,V × 1 byte int8 = ≤28 KB per
-   token). At ~850 GB/s that floor is **0.034 µs/token**, a quarter of the measured 0.131. So the
-   growth is not KV bandwidth, and it is either a latency/page-overhead-bound decode attention
-   kernel (up to ~18 ms/round recoverable at 186K, +29%) or every MTP draft step streaming the
-   context KV again (3 drafts ≈ 3x the traffic), which would put the same cost in the draft path.
+| pool | ms/round | basis |
+|---|---:|---|
+| weight streaming | 24.1 | 19.1 GiB at ~850 GB/s, unavoidable |
+| decode attention | 23.8 | Op microbench: 1.19 ms per layer × 20 attention layers |
+| draft path | 3 × 2.0 fixed + 0.012 µs/token | draft sweep slope |
+| other device | ~6 | projections, GDN, LM head, launches |
+| host | 2.9 | `engine_timing` |
 
-Two cheap measurements separate those cases and should run before any kernel work:
+KV bytes per token are measured, not assumed: two `--max-context` allocations (100,032 vs 200,000
+tokens) differ by 3.93 GiB of runtime, i.e. 42.2 KB per token, which is exactly 20 attention layers
+× 2112 bytes (4 kv heads × 256 head dim × K,V int8 + group-64 scales). This model is a hybrid: most
+blocks are GDN/recurrent and keep no KV. At ~850 GB/s the KV floor for one full pass is 9.3 ms at
+186K, so **the decode attention runs at ~2.6x its bandwidth floor**: the Op microbench reads
+2112 B/token and lands at 294 GB/s before the v1.4.0 port and 325 GB/s after, against ~850 GB/s
+achievable. Per-CTA accounting at 186K says why: 389 splits × 4 kv heads = 1556 CTAs, one resident
+CTA per SM (93 KB of shared memory), each reading 253 KB in ~55 µs ≈ 4.6 GB/s. The per-tile
+pipeline is serialized — dequantize into shared memory, three barriers, tensor-core work — and the
+register double buffer only hides the load latency, not the dequant/staging cost. A double-buffered
+shared-memory staging layer (e.g. `Bc=32` staged twice) is the obvious next experiment.
 
-- `--draft-tokens 1` vs `3` vs `5` at 186K in one image: the round-time slope per extra draft token
-  is the draft path's context cost. A slope near 0.034 µs/token puts the cost in attention.
-- `bench/ops/causal_softmax_attention_bench` (needs `-DNINFER_BUILD_BENCHMARKS=ON`) at 8K/32K/186K:
-  the kernel's own time against the same floor, with no draft path in the way.
+## Probes and what they settled
+
+| Probe | Result |
+|---|---|
+| Draft sweep 1/3/4/5 at 8K/32K/186K | Draft 4 wins everywhere (+9% / +17% / +14% tok/s against draft 3); each draft costs ~2.0 ms fixed + 0.012 µs/token; draft 5 collapses above 32K (118.8 ms/round at 186K) |
+| Attention Op microbench (`bench/ops/causal_softmax_attention_bench`) | 1.34 ms -> 1.21 ms per layer at 186K W=4 (−10%), 325 GB/s vs 850 achievable |
+| 8K attribution | Host is 5% of the round; `--no-cuda-graph` is net-neutral (it moves 2.6 ms from host to device); weight streaming is 24.1 ms of the 39.5 ms round |
+| Concurrency 1 vs 2 at 8K | +21% aggregate throughput, +35% per-request latency (round time is shared, so production's `--max-concurrency 2` is justified) |
+| `--kv-dtype k8v4` / `nvfp4` | Engine refuses on Volta: `NVFP4 KV-cache storage is unavailable on Volta`. Closed, not a speed question |
+| `--spec dflash2 --draft-tokens 3` | 55.8 ms/round at 8K against MTP's 40.2 — 40% slower, no acceptance advantage |
+| `NINFER_MTP_ATTN_WINDOW` isolation | With speculation disabled, window 0 and 8192 produce byte-identical output, so the target model is untouched |
+
+## Landed in v1.4.0
+
+| Change | Effect |
+|---|---|
+| Port `53f65504` (fp16 activation staging for QPN residual/down projections) | part of −10% Op time |
+| Port `2c9e20c9` (NVFP4 residual fused into the QPN epilogue; wider small-T split reduce; draft key window) | part of −10% Op time |
+| `--draft-tokens 4` in the deployment | +9% to +17% tok/s at 8K–32K, +14% at 186K |
+
+Drift control: the baseline image was re-run after the candidate and matched its first run within
+0.3% (40.2/43.5/62.6 ms vs 40.3/43.5/62.6 ms), so the 7–11% round-time gains are not session drift.
 
 ## Next items
 
-### 1. Attribute the two pools above (up to +29% at 186K, up to +38% at 8K)
+### 1. Decode attention at 2.6x its bandwidth floor (up to ~14 ms/round at 186K, +22%)
 
-Run the two measurements, then decide. An nsys trace of one 8K decode round attributes the ~15 ms
-fixed pool directly (8K needs no long prefill, so the loop is fast). Likely suspects: per-round
-host/launch work, CUDA-graph coverage of the draft steps, sampling and logits handoff, KV append.
-This is where the remaining tpx commits (`53f65504` fp16 staging, `2c9e20c9` fused residual epilogue)
-would act, so measure first and then pick from them.
+The measured gap and the per-CTA arithmetic above are the strongest remaining signal. Candidate
+changes, in order of expected value: double-buffered shared-memory staging (`Bc=32` staged twice
+keeps the 93 KB footprint) so dequant overlaps the previous tile's MMA; a second resident CTA per SM
+by cutting shared memory (`K` kept as int8 in shared, converted in registers); a split-policy retune
+(more splits only help the tail, not the per-CTA rate). Verify each with the Op microbench first —
+it isolates the kernel from everything else and runs in seconds.
 
-### 2. Acceptance is half of tok/s (config-only first)
+### 2. Draft key window as an opt-in
 
-Chinese documents accept at ~0.47 against code's ~0.75, which is a 40% tok/s difference at identical
-round time. Sweep `--draft-tokens` (2–6) and the MTP key-window knob from `2c9e20c9`; treat `accept`
-and `ms/round` as separate reported quantities in every benchmark.
+`NINFER_MTP_ATTN_WINDOW=8192` is worth +11% at 186K code and no harm at 8K, but −7% at 32K and −24%
+acceptance on Chinese documents at 193K. Keep it off by default; enable it for deployments whose
+contexts are consistently beyond ~100K and whose content is code-like.
 
-### 3. KV dtype: real bytes, wrong kernels today
+### 3. Prefill (first token)
 
-`--kv-dtype k8v4` (−25% KV bytes) and `nvfp4` (−50%) are supported, but the Volta small-T v2 kernel
-only handles INT8 group-64; the other dtypes fall back to the older paths (~+27 ms/round at 186K),
-so they lose more than they save today. Extending the v2 kernel to k8v4 keeps the fast path and
-removes a quarter of the KV traffic — worth it at long context, but it is kernel work, not a flag.
+186K cold prefill is 341 s (547 tok/s) after the v1.3.0 retune — still the largest user-visible cost
+at long context. Nothing has been profiled here; the flash prompt kernel and the GDN/attention
+projections are the places to look.
 
-### 4. Concurrency
-
-Every number here is single-request, while the deployment runs `--max-concurrency 2`. The
-bandwidth-bound part will not double, but the ~15 ms fixed pool may overlap. Nothing is known yet.
-
-### 5. Product-side backlog
+### 4. Product-side backlog
 
 Prometheus metrics, constrained decoding, custom Jinja template support — all exist upstream and
 have not been ported.
 
-### 6. Deferred
+### 5. Deferred
 
 Tensor parallel across two V100s (the source port reaches 101.9 tok/s at 186K with TP2). Needs a
 second V100 in the same host; out of scope until then.
 
 ## Publishing
 
-`v1.3.0` is published: master, the tag, a GitHub release with the long-context numbers, and the
-ghcr.io image. `v1.2.0` stays a local tag because its content is included in v1.3.0; `wip-a8e212ac`
-and the `ninfer:v1.3.0b` image are local-only reference material and must not be pushed.
+`v1.3.0` is published (master, tag, GitHub release, ghcr.io image). `v1.4.0` is local only: it is
+tagged in this tree, built as `ninfer:v1.4.0`, and running in the local deployment; pushing it would
+trigger the release workflow. `v1.2.0` stays a local tag because its content is included in v1.3.0;
+`wip-a8e212ac` and the `ninfer:v1.3.0b` image are local-only reference material and must not be
+pushed.
