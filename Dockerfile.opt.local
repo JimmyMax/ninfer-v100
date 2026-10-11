@@ -1,0 +1,58 @@
+# 迭代构建：应用 + 内核基准，ccache 挂在 buildkit 缓存里，改一两个文件时增量编译很快。
+# 用法：
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.opt.local --target opt -t ninfer:opt .
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.opt.local --target testexport --output type=local,dest=/tmp/opt-tests .
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        ccache \
+        cmake \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libcurl4-openssl-dev \
+        libswscale-dev \
+        ninja-build \
+        pkg-config \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN --mount=type=cache,target=/ccache \
+    CCACHE_DIR=/ccache CCACHE_MAXSIZE=12G CCACHE_NOHASHDIR=1 \
+    cmake -S . -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=70 \
+        -DNINFER_BUILD_APPS=ON \
+        -DBUILD_TESTING=ON \
+        -DNINFER_BUILD_BENCHMARKS=ON \
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+        -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+        -DFETCHCONTENT_SOURCE_DIR_CUTLASS=/src/third_party/cutlass \
+    && cmake --build /build --parallel \
+        --target ninfer ninfer-serve ninfer_causal_softmax_attention_bench \
+                 ninfer_softmax_attention_test ninfer_qwen3_6_runtime_mechanisms_test \
+                 ninfer_qwen3_6_27b_dflash2_real_test ninfer_kv_cache_test ninfer_device_test
+
+FROM ninfer:v1.2.0 AS runtime
+COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
+COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+
+FROM ninfer:v1.2.0 AS opt
+COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
+COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+COPY --from=build /build/bench/ninfer_causal_softmax_attention_bench /usr/local/bin/
+
+FROM ninfer:v1.2.0 AS testrun
+COPY --from=build /build/tests/ /tests/
+
+FROM scratch AS testexport
+COPY --from=build /build/tests/ninfer_softmax_attention_test /tests/
+COPY --from=build /build/tests/ninfer_qwen3_6_27b_dflash2_real_test /tests/
+COPY --from=build /build/tests/ninfer_qwen3_6_runtime_mechanisms_test /tests/

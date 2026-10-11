@@ -40,12 +40,22 @@ Build and verify recipe:
 # runtime image straight from the working tree (small export, ~35 min cold)
 docker build -f Dockerfile.build-runtime.local --target runtime -t ninfer:<tag> .
 
-# test binaries only (small local export, reuses the build stage)
-docker build -f Dockerfile.build-runtime.local --target testexport --output type=local,dest=/tmp/tests .
+# iteration image: apps + the Op benchmarks + selected tests, ccache-backed (Dockerfile.opt.local)
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.opt.local --target opt -t ninfer:<tag> .
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.opt.local --target runtime -t ninfer:<tag> .
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.opt.local --target testrun -t ninfer:<tag>-tests .
 
-# numeric + regression checks
-docker run --rm --gpus '"device=1"' -v /tmp/tests/tests:/tests ninfer:<tag> /tests/ninfer_softmax_attention_test
-docker run --rm --gpus '"device=1"' -v /tmp/tests/tests:/tests ninfer:<tag> /tests/ninfer_qwen3_6_runtime_mechanisms_test
+# the decode attention Op in isolation: 1.2 ms per layer at 186K, W=4, int8 KV
+docker run --rm --gpus '"device=1"' ninfer:<tag> ninfer_causal_softmax_attention_bench \
+  --entry cached --geometry d256-h24-kv4 --kv-dtype int8 --batch 1 --tokens 1,4 \
+  --context 7353,31538,186432 --cache warm --execution eager --repeat 20
+
+# numeric + regression checks (the dflash2 batch is the fourth positional argument; the
+# default of 8 exhausts memory on a 32 GB card — use 2)
+docker run --rm --gpus '"device=1"' ninfer:<tag>-tests /tests/ninfer_softmax_attention_test
+docker run --rm --gpus '"device=1"' -e NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS=<artifact> \
+  -v <models-dir>:/workspace/models:ro ninfer:<tag>-tests \
+  /tests/ninfer_qwen3_6_27b_dflash2_real_test 7 1 1 2
 ```
 
 ## Where the round time goes (measured)
