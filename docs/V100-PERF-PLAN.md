@@ -106,7 +106,7 @@ shared-memory staging layer (e.g. `Bc=32` staged twice) is the obvious next expe
 | `--kv-dtype k8v4` / `nvfp4` | Engine refuses on Volta: `NVFP4 KV-cache storage is unavailable on Volta`. Closed, not a speed question |
 | `--spec dflash2 --draft-tokens 3` | 55.8 ms/round at 8K against MTP's 40.2 — 40% slower, no acceptance advantage |
 | `NINFER_MTP_ATTN_WINDOW` isolation | With speculation disabled, window 0 and 8192 produce byte-identical output, so the target model is untouched |
-| Prefill decomposition | 186K prefill is 188 s device + 149 s host-exposed and strictly serial; host CPU is idle during it (blocked); larger `--prefill-chunk` makes it worse |
+| Prefill decomposition | 186K prefill is 188 s device + 149 s host-exposed; instrumented counters put ~100% of the prefill path inside the model's per-chunk prefill execution (engine helpers ~0), with one device wait at the end of the chunk |
 
 ## Landed in v1.4.0
 
@@ -120,6 +120,11 @@ Drift control: the baseline image was re-run after the candidate and matched its
 0.3% (40.2/43.5/62.6 ms vs 40.3/43.5/62.6 ms), so the 7–11% round-time gains are not session drift.
 
 ## Next items
+
+Prefill was profiled first (see item 3 in the previous section): its host cost is eager per-layer
+submission inside the prefill execution, so fixing it is an architectural change to the prefill path.
+Per the agreed decision rule that verdict sends the next work item to the decode attention kernel,
+whose fix is local, additive and fast to verify.
 
 ### 1. Decode attention at 2.6x its bandwidth floor (up to ~14 ms/round at 186K, +22%)
 
@@ -139,10 +144,12 @@ contexts are consistently beyond ~100K and whose content is code-like.
 ### 3. Prefill: host-exposed serial time is 44% of the first token
 
 Measured on v1.4.0 (186K code prompt, `--prefill-chunk 2048`): `prompt_ms` 337 s, and the request
-log splits it exactly into **device wait 188 s + host submit 149 s**. The host time is not CPU burn:
-sampling `/proc/<pid>/task/*/stat` over a running prefill shows the process consuming essentially no
-CPU, so the host is blocked, not computing, and the two phases never overlap (their sum is the total
-in every configuration measured).
+log splits it into **device wait 188 s + host submit 149 s** (the remainder is post and boundary
+bookkeeping). The host phase is real CPU work, not idle blocking: reading `/proc/<pid>/stat` across a
+running prefill shows **100.4% of one core** with two threads carrying ~72 s and ~19 s of that time.
+The two phases are attributed serially by the engine — the sum lands on the prefill total in every
+configuration measured — but they overlap in reality, because the host launches each layer while the
+device still executes the previous ones; the device wait is the residual after the last launch.
 
 | configuration | prefill | units | device | host submit | host per token |
 |---|---:|---:|---:|---:|---:|
@@ -160,10 +167,22 @@ host KV mirror size (`--host-kv-mib 128`), checkpoint slots (`--host-state-slots
 removed). The single-request `ninfer` CLI reproduces it exactly (31.8 s for the same 32K prompt), so
 it lives in the shared Program prefill path, not in the server's HTTP or context-cache layers.
 
-Next step: sub-phase timers inside `ProgramImplCore::advance_prefill` / `prefill_text_chunk` and the
-per-chunk preparation, or bisect by disabling subsystems; the quadratic shape points at a per-token
-operation against the whole prefix on the host path. Removing or overlapping this time would take
-the 186K first token from 341 s to roughly 200 s.
+Next step: the host cost sits in the model's per-chunk prefill execution, not in the engine's
+bookkeeping. Instrumented counters (temporary probe, not merged) over a 32K + 186K pair give
+`card_prefill_chunk` ~142 s against `advance_prefill` ~138 s, while `state_selectors`,
+`settle_state_fork`, `ensure_kv_mapped`, `commit_sequence_kv` and `copy_tail` are all ~0.000 s;
+`TextContext::prefill_impl` contains a single `begin_wait()` at its very end, so the whole per-layer
+launch sequence is attributed to the host phase. In other words the host time is CPU-side kernel
+submission plus per-layer host setup inside the prefill execution, and it grows with the number of
+attention splits (which follows the prefix) and with the chunk size. The natural fix is to reduce
+that submission work per chunk — graph-captured prefill, or fewer and larger launches — which is an
+architectural change in the prefill path, not a local tweak. `--no-cuda-graph` changes nothing
+today, which is consistent with prefill running eagerly.
+
+Correction to an earlier revision of this document: a perf profile whose addresses were resolved
+naively pointed at `ProgramImplCore::prepare_materialization`. Instrumentation disproves it — that
+function runs twice per request, walks 0 pages, and takes ~0 s. The perf `--symfs` route is the one
+to use if this is revisited.
 
 ### 4. Product-side backlog
 
