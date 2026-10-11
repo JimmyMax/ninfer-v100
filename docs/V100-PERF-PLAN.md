@@ -6,14 +6,21 @@ or are rejected; it is the entry point for "what next" alongside
 
 ## Current state
 
-Released as **v1.3.0** (commit `b0ad4799`, image `ninfer:v1.3.0`, published on origin with a GitHub
-release), running in the local deployment. It contains:
+Local release **v1.5.0** (tag `v1.5.0`, image `ninfer:v1.5.0`) is what the deployment runs. It stacks
+the v1.3.0 attention rewrite, the v1.4.0 decode-side ports and the v1.5.0 PV epilogue change on top
+of the earlier correctness ports:
 
 | Change | Effect |
 |---|---|
 | Volta D256 flash prompt retune (64-column Q tile) | first token −26% to −29% at 186K–193K |
 | INT8 small-T decode attention v2 (key-split 8-warp `Bc=64`, `byte_perm` int8→fp16 dequant) | decode +37% to +47% at 186K–193K, +4% to +17% at 8K–32K |
+| v1.4.0 ports: fp16 activation staging for QPN residual/down projections, NVFP4 residual fused into the QPN epilogue, wider small-T split reduce | decode round −7% to −11% |
+| v1.5.0: chained fp16 PV accumulator in the decode attention kernel | decode round −1.0% (8K) to −4.6% (186K) |
+| Deployment switch to `--draft-tokens 4` | tok/s +9% to +17% (8K–32K), +14% (186K) |
 | Earlier upstream ports: DFlash prefill binding + cleanup synchronization, spin sync, materialization planner | correctness fixes; no measurable throughput effect on V100 |
+
+v1.3.0 is published on origin (tag, GitHub release, ghcr.io image). v1.4.0 and v1.5.0 are local tags
+and local images only; pushing them would trigger the release workflow.
 
 Rejected after measurement: the upstream `perf(engine): reduce preparation and context management
 overhead` port (a8e212ac). It showed no effect on prepare time or TTFT when measured with
@@ -126,14 +133,50 @@ submission inside the prefill execution, so fixing it is an architectural change
 Per the agreed decision rule that verdict sends the next work item to the decode attention kernel,
 whose fix is local, additive and fast to verify.
 
-### 1. Decode attention at 2.6x its bandwidth floor (up to ~14 ms/round at 186K, +22%)
+### 1. Decode attention: measured, instruction-issue bound, first win landed (v1.5.0)
 
-The measured gap and the per-CTA arithmetic above are the strongest remaining signal. Candidate
-changes, in order of expected value: double-buffered shared-memory staging (`Bc=32` staged twice
-keeps the 93 KB footprint) so dequant overlaps the previous tile's MMA; a second resident CTA per SM
-by cutting shared memory (`K` kept as int8 in shared, converted in registers); a split-policy retune
-(more splits only help the tail, not the per-CTA rate). Verify each with the Op microbench first —
-it isolates the kernel from everything else and runs in seconds.
+An ablation build settled what limits the INT8 small-T decode attention. Template variants that
+skip one part each (`NINFER_SM70_ATTN_ABLATE=1..4`, diagnostic only because every non-zero value
+produces wrong numbers) give, at 31.5K with W=4:
+
+| variant | median | delta |
+|---|---:|---:|
+| exact | 305 us | - |
+| skip the PV mma loop | 226 us | -26% |
+| skip the QK^T mma loop | 248 us | -19% |
+| skip the tile loads | 280 us | -8% |
+| skip the int8 dequant | 287 us | -6% |
+
+So the kernel is **instruction-issue bound, dominated by the PV epilogue**, and the earlier framing
+of "3.9x off the KV bandwidth floor" (or "2.6x") was misleading: the tile loads are only 8% of the
+kernel, so a bandwidth-roofline comparison does not describe what a fix could recover.
+
+Landed in v1.5.0: the PV loop now chains one fp16 accumulator per output chunk across the whole
+64-key tile instead of starting a fresh accumulator per 8-key group and converting each result
+(4 conversions and 8 float adds per 4 mma). That is the fp16-accumulate form of `mma.m8n8k4`, which
+issues at twice the fp32 rate on Volta, and it cuts the epilogue instruction count 8x. The 64-key
+partial sum now rounds once in fp16; the public-contract oracle test passes on both paths
+(`NINFER_SM70_ATTN_V3=0` restores the old epilogue for in-image A/B).
+
+| measurement | before | after |
+|---|---:|---:|
+| Op microbench 8K W=4 | 108.5 us | 94.2 us (-13%) |
+| Op microbench 31.5K W=4 | 304.1 us | 251.9 us (-17%) |
+| Op microbench 186K W=4 | 1403.9 us | 1137.7 us (-19%) |
+| decode round 8K (draft 4) | 38.7 ms | 38.3 ms (-1.0%) |
+| decode round 32K | 41.5 ms | 41.0 ms (-1.2%) |
+| decode round 186K | 62.9 ms | 60.0 ms (-4.6%) |
+
+Drift control: the baseline ladder was repeated after the change and matched its first run exactly
+(8K 38.7 ms, 32K 41.5 ms, 186K 62.9 ms).
+
+What is left is spread thinly: after this change the remaining kernel time is QK^T (~19% before,
+already f32-accumulate with two loads per mma), four barriers per tile, the softmax, the P-tile
+stores and the address math. The two candidates worth measuring if this line is reopened are a
+second resident CTA per SM (needs the shared-memory footprint cut from 93 KB, e.g. by keeping K as
+int8 in shared and converting in registers) and a barrier reduction per tile. Both are rewrites of
+the same delicate kernel, and the end-to-end return above shows why the ceiling is modest: at 8K the
+attention Op is only ~6% of a decode round.
 
 ### 2. Draft key window as an opt-in
 

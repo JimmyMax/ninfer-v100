@@ -146,6 +146,11 @@ draft 3) for about 3 ms more per round, while draft 5 collapses above 32K (118.8
 +11% at 186K code but -7% at 32K, so it is off by default; with speculation disabled it provably
 leaves target-model output unchanged (identical bytes at window 0 and 8192).
 
+v1.5.0 additionally chains the PV accumulator of the INT8 decode attention in fp16: the ablation that
+removes the old per-group epilogue costs 26% of the kernel, so the loop was instruction-issue bound
+rather than bandwidth bound. It cuts 13-22% off the isolated Op and 1.0% (8K) to 4.6% (186K) off the
+decode round; `NINFER_SM70_ATTN_V3=0` restores the previous epilogue for in-image A/B.
+
 v1.3.0 rewrites the INT8 small-T decode attention kernel (key-split 8-warp `Bc=64` with a
 `byte_perm` int8->fp16 dequant) and retunes the D256 flash prompt kernel for Volta; the decode gain
 is isolated to that kernel by an in-image `NINFER_SM70_ATTN_V2` A/B. v1.4.0 adds three decode-side
