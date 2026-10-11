@@ -1,6 +1,18 @@
-# NInfer
+# NInfer V100
 
-> Up to 219 decode tok/s from Qwen 3.8 27B on a single V100.  With software NVFP4 on Volta.
+**This repository exists for one thing: pushing a single Tesla V100 (sm_70) as far as it goes.**
+One GPU, one resident model, 1–8 concurrent requests, prebuilt sm_70 binaries and `ghcr.io` images,
+a local deployment recipe, and a measurement protocol with drift control. Multi-GPU tensor
+parallelism is deliberately out of scope — the sibling project
+[huangserva/ninfer-v100-tpx](https://github.com/huangserva/ninfer-v100-tpx) covers 2x V100.
+
+> **Result, in one line:** Qwen3.8-27B `nvfp4` on a V100-PCIE-32GB reaches **219 decode tok/s** at
+> short context (K=1, 99.2% MTP acceptance) and **101 / 95 / 62 tok/s at 8K / 32K / 186K** in
+> production shape (draft 4, INT8 KV). Against the version this fork started from, long-context
+> decode is **+65%**, cold 186K first token is **-26%** (462 s -> 341 s), and the whole ladder is
+> drift-controlled and reproducible with [`bench/v100/`](bench/v100/README.md). See
+> [Performance](#performance) for the tables and [docs/V100-PERF-PLAN.md](docs/V100-PERF-PLAN.md)
+> for the round-time decomposition, what was measured and rejected, and what is left.
 
 > **Supported `.ninfer` artifact versions: v2 and v3.**
 > - **v2** — the original container format (e.g. `orcarouter-Qwen3.8-27B-Uncensored-nvfp4-NInfer`).
@@ -17,9 +29,8 @@
 > Hardware target: NVIDIA Tesla **V100 (sm_70)**. Build recipe and runtime flags:
 > [docs/V100-BUILD.md](docs/V100-BUILD.md).
 
-NInfer is a from-scratch C++/CUDA inference engine optimized for selected Qwen checkpoints on NVIDIA Tesla V100.
-
-It supports text, image, and video input through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs. The runtime is intentionally narrow: one GPU, one resident model, 1–8 active requests.
+NInfer itself is a from-scratch C++/CUDA inference engine for selected Qwen checkpoints. It supports
+text, image, and video input through a local CLI or OpenAI-/Anthropic-compatible HTTP APIs.
 
 ## Models
 
