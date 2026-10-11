@@ -130,14 +130,16 @@ Drift control: the baseline image was re-run after the candidate and matched its
 
 ### 1. Port the remaining single-GPU changes from the sibling project
 
-`huangserva/ninfer-v100-tpx` has three unported changes that matter on one card. They come from two
-commits, and the second depends on the first:
+`huangserva/ninfer-v100-tpx` has two unported changes that matter on one card, from two commits, the
+second depending on the first:
 
 | Source | Change | Their measurement |
 |---|---|---|
-| `2b3f16cd`, attention hunks | PV epilogue uses `mma.m8n8k4...f32.f16.f16.f32` straight into the fp32 accumulator (no half2 conversions at all), a fast interior-tile load path (a 64-key tile is exactly one page, so every address is a page-relative constant), and a corrected per-element `alpha` rescale (`acc_f[c][i] *= (i & 2) == 0 ? alpha_lo : alpha_hi`) | conversions were ~10% of the kernel at 186K |
 | `2b3f16cd`, `nvfp4_volta_qpn_gemm.cuh` | batch eight group loads before decoding any of them | single card 5120x17408 T=4: 96.0 -> 88.4 us |
 | `9913bc22`, same file | double-buffered four-group prefetch on top of that; unroll count behind `NINFER_NVFP4_QPN_UNROLL` | 186K round 31.5 -> 30.9 ms, output bit-identical; the 8-group buffered variant spills and is unusable |
+
+Both are decode-side kernel changes with claimed bit-identical output, so the verification order below
+is short: the kernel shape measured directly, then the drift-controlled ladder.
 
 **The attention hunk from the same commit was attempted and abandoned.** It switches the PV epilogue to
 `mma.m8n8k4...f32.f16.f16.f32` accumulating straight into the fp32 register block. Ported behind a
