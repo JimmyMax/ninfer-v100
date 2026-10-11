@@ -34,7 +34,8 @@ inline constexpr std::size_t kCausalSmallTI8VoltaV2SmemBytes =
     + sizeof(float) * kCausalSmallTI8VoltaV2Warps * 32                         // red_s
     + sizeof(std::int32_t) * kCausalSmallTI8VoltaV2Pages;                      // pages_s
 
-template <typename Geometry, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, bool MultiBatch, bool Masked, typename CacheInput,
+          bool ChainedPv = false>
 __launch_bounds__(kCausalSmallTI8VoltaV2Warps * 32, 1) __global__
     void causal_attention_small_t_tc_volta_partial_i8_v2_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
@@ -409,6 +410,22 @@ __launch_bounds__(kCausalSmallTI8VoltaV2Warps * 32, 1) __global__
 #pragma unroll
             for (int i = 0; i < 8; ++i) { acc_f[c][i] *= alpha; }
         }
+        // ChainedPv keeps one fp16 mma accumulator per output chunk for the whole tile and
+        // converts to float once, instead of starting a fresh accumulator per 8-key group and
+        // converting each group's result. The per-group epilogue (4 half2->float2 conversions and
+        // 8 float adds for 4 mma) dominated this loop: the ablation that removes it costs 26% of
+        // the whole kernel at 31.5K, and the loads it needs are only 8%. Chaining is exactly the
+        // fp16-accumulate form of mma.m8n8k4, which on Volta runs at twice the fp32-accumulate
+        // rate, so the tile's 64-key partial sum rounds once in fp16 (the public-contract oracle
+        // test covers that rounding).
+        half2 pv_tile[DChunksLocal][4];
+        if constexpr (ChainedPv) {
+#pragma unroll
+            for (int c = 0; c < DChunksLocal; ++c) {
+#pragma unroll
+                for (int n = 0; n < 4; ++n) { pv_tile[c][n] = __float2half2_rn(0.0f); }
+            }
+        }
 #pragma unroll
         for (int g = 0; g < KeyGroups; ++g) {
             half2 p[4];
@@ -420,11 +437,26 @@ __launch_bounds__(kCausalSmallTI8VoltaV2Warps * 32, 1) __global__
                              reinterpret_cast<const half2*>(
                                  &v_s[g * 8 * Stride + warp * DSlice + c * 8]),
                              Stride / 2);
-                half2 pv[4] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
-                volta_mma_pv(pv, p, vf);
+                if constexpr (ChainedPv) {
+                    volta_mma_pv(pv_tile[c], p, vf);
+                } else {
+                    half2 pv[4] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+                    volta_mma_pv(pv, p, vf);
+#pragma unroll
+                    for (int n = 0; n < 4; ++n) {
+                        const float2 contrib = __half22float2(pv[n]);
+                        acc_f[c][2 * n + 0] += contrib.x;
+                        acc_f[c][2 * n + 1] += contrib.y;
+                    }
+                }
+            }
+        }
+        if constexpr (ChainedPv) {
+#pragma unroll
+            for (int c = 0; c < DChunksLocal; ++c) {
 #pragma unroll
                 for (int n = 0; n < 4; ++n) {
-                    const float2 contrib = __half22float2(pv[n]);
+                    const float2 contrib = __half22float2(pv_tile[c][n]);
                     acc_f[c][2 * n + 0] += contrib.x;
                     acc_f[c][2 * n + 1] += contrib.y;
                 }

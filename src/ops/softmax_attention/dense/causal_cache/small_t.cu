@@ -201,10 +201,17 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             const char* env = std::getenv("NINFER_SM70_ATTN_V2");
             return env == nullptr || env[0] != '0';
         }();
+        // NINFER_SM70_ATTN_V3=0 restores the per-group PV epilogue of the v2 kernel for A/B
+        // (chained fp16 accumulation is the default; see small_t_i8_volta_v2.cuh).
+        static const bool chained_pv = [] {
+            const char* env = std::getenv("NINFER_SM70_ATTN_V3");
+            return env == nullptr || env[0] != '0';
+        }();
         if (use_v2) {
+            const auto launch_v2 = [&]<bool Chained>() {
             const auto kernel =
                 causal_attention_small_t_tc_volta_partial_i8_v2_kernel<Geometry, MultiBatch, Masked,
-                                                                       CacheInput>;
+                                                                       CacheInput, Chained>;
             static const cudaError_t attr = cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                 static_cast<int>(kCausalSmallTI8VoltaV2SmemBytes));
@@ -227,6 +234,12 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                 static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
                 static_cast<float*>(partial_l.data), ::ninfer::ops::small_t_key_window());
             CUDA_CHECK(cudaGetLastError());
+            };
+            if (chained_pv) {
+                launch_v2.template operator()<true>();
+            } else {
+                launch_v2.template operator()<false>();
+            }
             return;
         }
     }
