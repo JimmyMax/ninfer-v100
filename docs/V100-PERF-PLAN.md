@@ -128,12 +128,57 @@ Drift control: the baseline image was re-run after the candidate and matched its
 
 ## Next items
 
-Prefill was profiled first (see item 3 in the previous section): its host cost is eager per-layer
-submission inside the prefill execution, so fixing it is an architectural change to the prefill path.
-Per the agreed decision rule that verdict sends the next work item to the decode attention kernel,
-whose fix is local, additive and fast to verify.
+### 1. Port the remaining single-GPU changes from the sibling project
 
-### 1. Decode attention: measured, instruction-issue bound, first win landed (v1.5.0)
+`huangserva/ninfer-v100-tpx` has three unported changes that matter on one card. They come from two
+commits, and the second depends on the first:
+
+| Source | Change | Their measurement |
+|---|---|---|
+| `2b3f16cd`, attention hunks | PV epilogue uses `mma.m8n8k4...f32.f16.f16.f32` straight into the fp32 accumulator (no half2 conversions at all), a fast interior-tile load path (a 64-key tile is exactly one page, so every address is a page-relative constant), and a corrected per-element `alpha` rescale (`acc_f[c][i] *= (i & 2) == 0 ? alpha_lo : alpha_hi`) | conversions were ~10% of the kernel at 186K |
+| `2b3f16cd`, `nvfp4_volta_qpn_gemm.cuh` | batch eight group loads before decoding any of them | single card 5120x17408 T=4: 96.0 -> 88.4 us |
+| `9913bc22`, same file | double-buffered four-group prefetch on top of that; unroll count behind `NINFER_NVFP4_QPN_UNROLL` | 186K round 31.5 -> 30.9 ms, output bit-identical; the 8-group buffered variant spills and is unusable |
+
+**The attention hunk from the same commit was attempted and abandoned.** It switches the PV epilogue to
+`mma.m8n8k4...f32.f16.f16.f32` accumulating straight into the fp32 register block. Ported behind a
+three-way `NINFER_SM70_ATTN_V3` switch (0 = original per-group fp16, 1 = v1.5.0 chained fp16,
+2 = fp32 mma) it measured 186K W=4 at 1092 us against 1115 us for v1.5.0 - about 2% of the kernel,
+roughly 1% of a decode round - and it did not survive qualification:
+
+- with the existing per-lane `alpha` rescale, mode 2 fails the public-contract oracle: the fp32 mma
+  writes 8 elements per thread whose rows are selected by `i & 2`, so the online-softmax rescale has
+  to be per element;
+- with that per-element rescale applied to every mode, mode 0 fails the same oracle, so the rescale
+  semantics would have to be per mode and each state re-qualified;
+- the fast interior-tile load path from the same commit is what broke the oracle first, while the
+  rest of the port had already been reverted. Its page-relative arithmetic is equivalent on paper to
+  the generic path, but it needs its own qualification before it can be used.
+
+Verdict: ~1% end-to-end is not worth three extra verified states. v1.5.0 stays as shipped and the
+QPN batching below is the next thing to port.
+
+Verification, in this order:
+
+1. `ninfer_softmax_attention_test` on the ported tree (attention numerics change in row 1) plus
+   `ninfer_qwen3_6_runtime_mechanisms_test` and the DFlash2 real-model test (`7 1 1 2`, skip code 77).
+2. Two images (baseline `master`, candidate) and the drift-controlled ladder 8K / 32K / 186K with
+   draft 4: **baseline -> candidate -> baseline**, comparing `ms/round` and repeating the baseline
+   last, exactly as the v1.4.0 and v1.5.0 changes were qualified.
+3. Bit-identical check for rows 2-3 only (they claim it): same greedy prompt with speculation off at
+   window 0 and 8192. Row 1 changes accumulation order and is expected to differ in the last bits.
+4. Optional kernel-level numbers: add `ninfer_linear_bench` to the iteration image's target list and
+   measure the affected shapes (5120x17408 down projection, T=4) before and after.
+
+### 2. Decode attention: what is left after v1.5.0
+
+After the v1.5.0 epilogue change the remaining kernel time is QK^T, four barriers per tile, the
+softmax, the P-tile stores and the address math. The two candidates worth measuring are a second
+resident CTA per SM (needs the shared-memory footprint cut from 93 KB, e.g. by keeping K as int8 in
+shared and converting in registers) and a barrier reduction per tile. Both are rewrites of the same
+delicate kernel, and the end-to-end ceiling is modest: at 8K the attention Op is only ~6% of a decode
+round.
+
+### 2b. Decode attention ablation (v1.5.0), for reference
 
 An ablation build settled what limits the INT8 small-T decode attention. Template variants that
 skip one part each (`NINFER_SM70_ATTN_ABLATE=1..4`, diagnostic only because every non-zero value
@@ -178,13 +223,13 @@ int8 in shared and converting in registers) and a barrier reduction per tile. Bo
 the same delicate kernel, and the end-to-end return above shows why the ceiling is modest: at 8K the
 attention Op is only ~6% of a decode round.
 
-### 2. Draft key window as an opt-in
+### 3. Draft key window as an opt-in
 
 `NINFER_MTP_ATTN_WINDOW=8192` is worth +11% at 186K code and no harm at 8K, but −7% at 32K and −24%
 acceptance on Chinese documents at 193K. Keep it off by default; enable it for deployments whose
 contexts are consistently beyond ~100K and whose content is code-like.
 
-### 3. Prefill: host-exposed serial time is 44% of the first token
+### 4. Prefill: host-exposed serial time is 44% of the first token
 
 Measured on v1.4.0 (186K code prompt, `--prefill-chunk 2048`): `prompt_ms` 337 s, and the request
 log splits it into **device wait 188 s + host submit 149 s** (the remainder is post and boundary
@@ -227,12 +272,12 @@ naively pointed at `ProgramImplCore::prepare_materialization`. Instrumentation d
 function runs twice per request, walks 0 pages, and takes ~0 s. The perf `--symfs` route is the one
 to use if this is revisited.
 
-### 4. Product-side backlog
+### 5. Product-side backlog
 
 Prometheus metrics, constrained decoding, custom Jinja template support — all exist upstream and
 have not been ported.
 
-### 5. Deferred
+### 6. Deferred
 
 Tensor parallel across two V100s (the source port reaches 101.9 tok/s at 186K with TP2). Needs a
 second V100 in the same host; out of scope until then.

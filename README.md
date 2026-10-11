@@ -3,8 +3,7 @@
 **This repository exists for one thing: pushing a single Tesla V100 (sm_70) as far as it goes.**
 One GPU, one resident model, 1–8 concurrent requests, prebuilt sm_70 binaries and `ghcr.io` images,
 a local deployment recipe, and a measurement protocol with drift control. Multi-GPU tensor
-parallelism is deliberately out of scope — the sibling project
-[huangserva/ninfer-v100-tpx](https://github.com/huangserva/ninfer-v100-tpx) covers 2x V100.
+parallelism is deliberately out of scope: nothing here shards a model across cards.
 
 > **Result, in one line:** Qwen3.8-27B `nvfp4` on a V100-PCIE-32GB reaches **219 decode tok/s** at
 > short context (K=1, 99.2% MTP acceptance) and **101 / 95 / 62 tok/s at 8K / 32K / 186K** in
