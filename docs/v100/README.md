@@ -8,6 +8,7 @@
 |---|---|
 | [PLAN.md](PLAN.md) | 路线图 S0–S5：目标、改动点、验收标准、工期、风险与回退 |
 | [baseline-2026-10-12.md](baseline-2026-10-12.md) | 第一条 V100-32GB 基线：Gemma 4 可用性与两线 A/B 数据 |
+| [S0.5-port-inventory.md](S0.5-port-inventory.md) | S0.5 的移植清单：来源提交、落点结构、分步计划与验收标准 |
 
 相关资产：
 
