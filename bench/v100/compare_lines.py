@@ -166,9 +166,10 @@ def run_one(args: argparse.Namespace, image: str, index: int, extra: str) -> Run
         "-v", f"{args.host_mount}:/workspace/models:ro",
         "-p", f"127.0.0.1:{args.port}:8000",
         "--entrypoint", "ninfer-serve",
-        image, args.model,
-        *args.base_args,
     ]
+    for kv in args.env:
+        cmd += ["-e", kv]
+    cmd += [image, args.model, *args.base_args]
     if args.api_key:
         cmd += ["--api-key", args.api_key, "--model-id", args.model_id]
     if extra.strip():
@@ -233,6 +234,8 @@ def main() -> int:
     p.add_argument("--warmup-prompt", default="你好，简单介绍下你自己。")
     p.add_argument("--startup-timeout", type=float, default=420)
     p.add_argument("--keep", action="store_true", help="跑完保留容器")
+    p.add_argument("--env", action="append", default=[], metavar="K=V",
+                   help="传给容器的环境变量，可重复（用于开关，如 NINFER_SM70_ATTN_V2=0）")
     p.add_argument("--json", dest="json_out", default=None)
     args = p.parse_args()
     args.base_args = args.base_args.split()

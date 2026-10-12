@@ -11,6 +11,7 @@
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
 #if defined(NINFER_SM70)
 #    include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
+#    include "ops/softmax_attention/dense/causal_cache/small_t_i8_volta_v2.cuh"
 #endif
 
 #include <cstdlib>
@@ -29,6 +30,19 @@ inline bool small_t_pv_f16() {
     }();
     if (forced >= 0) { return forced == 1; }
     return device_route_schedule("attn_pv_f16", 1) == "on";
+}
+
+// 本仓库增量（docs/v100/PLAN.md S0.5）：fork 的 INT8 small-T 解码内核 v2（8 warp / Bc=64
+// key-split）是否启用。它只覆盖一个 Volta row tile（TokenTile * GroupSize <= 32），
+// 且只处理 INT8 key + 未打包 INT8 value 这一条路径。NINFER_SM70_ATTN_V2=0 关闭，
+// 回退到上游的 causal_attention_small_t_sm70_i8_kernel，便于 A/B 对照。
+inline bool small_t_i8_v2_enabled(int row_count) {
+    if (row_count > 32) { return false; }
+    static const bool enabled = [] {
+        const char* env = std::getenv("NINFER_SM70_ATTN_V2");
+        return env == nullptr || env[0] != '0';
+    }();
+    return enabled;
 }
 
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
@@ -77,6 +91,35 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         run.template operator()<true, KvKeyCoding::RootE8>();
     } else if (packed_values) {
         run.template operator()<true, KvKeyCoding::Int8>();
+    } else if (small_t_i8_v2_enabled(TokenTile * Geometry::GroupSize)) {
+        // 本仓库增量：fork 的 v2 内核（8 warp、Bc=64、每个 warp 只算自己 8 个 key 的 QK^T、
+        // fp16 PV 累加链）。与上游内核同一契约：同样的 grid / splits / partial 输出，
+        // 因此共享同一个 reduce。
+        const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+        auto kernel = causal_attention_small_t_tc_volta_partial_i8_v2_kernel<
+            Geometry, MultiBatch, Masked, CacheInput, /*ChainedPv=*/true>;
+        static const cudaError_t v2_attr = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(kCausalSmallTI8VoltaV2SmemBytes));
+        CUDA_CHECK(v2_attr);
+        kernel<<<grid, kCausalSmallTI8VoltaV2Warps * 32, kCausalSmallTI8VoltaV2SmemBytes,
+                 stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data), input,
+            static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
+            static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
+            static_cast<__half*>(cache_v_scale.data),
+            static_cast<const std::int32_t*>(cache.block_tables.data),
+            invocation.valid_columns == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+            invocation.table_rows == nullptr
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.table_rows->data),
+            cache.block_tables.ne[0], invocation.width, invocation.full_width,
+            invocation.column_begin, logical_capacity, scale,
+            static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
+            static_cast<float*>(partial_l.data),
+            /*key_window=*/0); // 上游的 causal small-T 路径只服务全注意力；滑窗走 sliding_window_attention
     } else {
         run.template operator()<false, KvKeyCoding::Int8>();
     }
