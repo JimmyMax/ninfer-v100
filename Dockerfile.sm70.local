@@ -1,0 +1,66 @@
+# Dockerfile.sm70.local — Tesla V100 (sm_70) 全量构建
+#
+# 上游 Dockerfile 面向 sm86 / sm120a（CUDA 13.4）；V100 需要 CUDA 12.8/12.9（CUDA 13 起
+# nvcc 不再编译 sm_70，CMakeLists.txt 会直接拒绝），因此单独保留这一份。
+#
+#   docker build -f Dockerfile.sm70.local -t ninfer:v100-gemma4 .
+#
+# 关键点
+#   * -DCMAKE_CUDA_ARCHITECTURES=70 —— 上游自 PR #58 起接受 70
+#   * third_party/ 全部 vendored，配置期不下载任何依赖
+#   * 外部依赖：libavformat>=60 libavcodec>=60 libavutil>=58 libswscale>=7 libcurl>=7.85
+#   * 约 1 小时、~10 GB 中间产物；根分区紧张时改走 PLAN.md §6 的容器 + /mnt/data 方案
+#   * 构建机直连可用时不要走代理（apt 源建议换国内镜像）
+#
+# 运行阶段复用已有镜像提供的 CUDA 12.8 runtime、cublas、ffmpeg 6.1 与 libcurl；
+# 若没有该基底，可换成 nvidia/cuda:12.8.1-runtime-ubuntu22.04 并自行安装 ffmpeg/curl 运行库。
+
+ARG CUDA_VERSION=12.8.0
+ARG UBUNTU_VERSION=24.04
+ARG RUNTIME_BASE=ninfer:v100-stable
+
+# --- 构建阶段 ------------------------------------------------------------------------------------
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV http_proxy=${HTTP_PROXY} https_proxy=${HTTPS_PROXY}
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        cmake \
+        ninja-build \
+        pkg-config \
+        libavformat-dev \
+        libavcodec-dev \
+        libavutil-dev \
+        libswscale-dev \
+        libcurl4-openssl-dev \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+# ninfer-serve 已包含所需内核；构建单目标以缩短时间。
+RUN cmake -S . -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=70 \
+        -DNINFER_BUILD_APPS=ON \
+        -DBUILD_TESTING=OFF \
+        -DNINFER_BUILD_BENCHMARKS=OFF \
+    && cmake --build /build --parallel 16 --target ninfer-serve
+
+# --- 运行阶段 ------------------------------------------------------------------------------------
+FROM ${RUNTIME_BASE}
+
+COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+RUN chmod +x /usr/local/bin/ninfer-serve
+
+WORKDIR /workspace
+EXPOSE 8000
+
+# 与其它 ninfer 镜像一致：不设 ENTRYPOINT，编排里的 command 直接执行二进制名。
+CMD ["ninfer-serve", "--help"]

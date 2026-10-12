@@ -1,0 +1,61 @@
+# Gemma 线（V100 / sm_70）编排示例
+#
+# 这是 docs/v100/PLAN.md 里 Gemma 线的参考编排；生产副本在 Docker 仓库：
+#   /home/max/code/docker/ai/ninfer-v100/docker-compose.yml        （本文件，Gemma 线）
+#   /home/max/code/docker/ai/ninfer-v100/docker-compose.swift.yml  （fork 的 Qwen 线）
+# 两条线共用容器名 llama-cpp-text 与 8000 端口，同一时刻只能跑一条，切换约 30–60 秒。
+#
+# 与 fork 线的差异（仅 3 处）：
+#   1. image              → 本分支自建的 sm70 镜像
+#   2. 去掉 --lm-head-draft（Gemma 4 的 assistant 没有 proposal head，带上会启动失败）
+#   3. --draft-tokens 4 → 2（V100-32G 实测 157.5 vs 119.0 tok/s）
+
+services:
+  llama-cpp-text:
+    image: ninfer:v100-gemma4
+    container_name: llama-cpp-text
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - /mnt/data/dockerdata/llama-cpp/models:/workspace/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    command:
+      - ninfer-serve
+      - /workspace/models/Gemma4-26B-A4B-QAT-Uncensored-HauhauCS-Balanced-MTP-ninfer-v3.ninfer
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --api-key
+      - "sk-itzy"
+      - --model-id
+      - qwen
+      - --max-context
+      - "200000"
+      - --prefill-chunk
+      - "2048"
+      - --kv-capacity
+      - "auto"
+      - --kv-dtype
+      - "int8"
+      - --max-concurrency
+      - "2"
+      - --spec
+      - mtp
+      - --draft-tokens
+      - "2"
+      - --preserve-thinking
+      - --vision
+    networks:
+      - ai-net
+
+networks:
+  ai-net:
+    external: true

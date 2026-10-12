@@ -1,0 +1,16 @@
+# Dockerfile.sm70-runtime.local — 复用已编好的 sm_70 ninfer-serve 打包镜像（秒级）
+#
+#   mkdir -p docker-runtime && cp /mnt/data/ninfer-build-sm70/apps/ninfer-serve docker-runtime/
+#   docker build -f Dockerfile.sm70-runtime.local -t ninfer:v100-gemma4 docker-runtime/
+#
+# 用途：内核移植/调参时避免重复全量构建（全量约 1 小时）。
+
+ARG RUNTIME_BASE=ninfer:v100-stable
+FROM ${RUNTIME_BASE}
+
+COPY ninfer-serve /usr/local/bin/ninfer-serve
+RUN chmod +x /usr/local/bin/ninfer-serve
+
+WORKDIR /workspace
+EXPOSE 8000
+CMD ["ninfer-serve", "--help"]

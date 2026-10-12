@@ -43,6 +43,7 @@ measurements on one RTX 5090. The `groupwise-int` artifacts run on every support
 
 ## Repository-local guides
 
+- [V100 (sm_70) Gemma support and Volta acceleration](v100/README.md) — 本仓库对单张 Tesla V100 的增量：Gemma 4 可用性、加速路线图（S0–S5）与两线对照基线
 - [Benchmarks](../bench/README.md)
 - [Tests](../tests/README.md)
 - [Tools](../tools/README.md)
