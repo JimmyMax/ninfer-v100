@@ -89,3 +89,6 @@ repro/
 
 # WebUI releases unpacked by scripts/fetch-webui.sh for -DNINFER_WEBUI_DIR.
 third_party/webui/
+
+# 本仓库 V100 增量：秒级重打包用的二进制，不入库
+docker-runtime/

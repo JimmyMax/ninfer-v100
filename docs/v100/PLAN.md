@@ -98,7 +98,7 @@ git push -u origin gemma
 * 验收：`ninfer:v100-gemma4` 镜像可从本仓库源码重建；`ninfer-serve --version` 正常；
   Gemma 4 在 V100 上加载并出词（见 §3）。
 
-### S0.5 用 Qwen 家族验证"正向搬运"可行 ☐
+### S0.5 用 Qwen 家族验证"正向搬运"可行 ◐（第 1–2 步完成，见 [结果](S0.5-result-2026-10-13.md)）
 
 以**同源代码**的注意力内核作为样板，证明 fork 的 Volta 加速能落到上游线上。
 
