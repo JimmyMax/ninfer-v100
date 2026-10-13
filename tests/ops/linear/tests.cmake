@@ -4,6 +4,11 @@ ninfer_test_includes(ninfer_linear_test_support)
 ninfer_op_oracle_options(ninfer_linear_test_support)
 target_link_libraries(ninfer_linear_test_support PUBLIC ninfer_ops)
 
+# 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 加载时置换（prepack）的数值 oracle。
+ninfer_add_op_test(ninfer_linear_nvfp4_qpn_prepack_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_nvfp4_qpn_prepack.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
 ninfer_add_op_test(ninfer_linear_q4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

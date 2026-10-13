@@ -33,6 +33,10 @@ struct DevicePlacement {
     // Set when the row-split object is permuted into the panel layout after every upload
     // (Binder::panel_device); the device parent then carries QuantLayout::RowSplitPanel.
     bool panel = false;
+    // 本仓库 V100 增量：Set when the NVFP4 object is permuted into the Volta QPN fragment order
+    // after every upload (Binder::qpn_prepack_device); the device parent then carries
+    // QuantLayout::VoltaQpnPrepacked.
+    bool qpn_prepack = false;
 };
 
 // Offset inside the one page-locked Host block (Residency::Pinned).

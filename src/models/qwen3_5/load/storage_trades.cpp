@@ -1,5 +1,6 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/permute_nvfp4_qpn.h" // 本仓库 V100 增量：NVFP4 QPN 加载时重排
 #include "artifact/permute_row_split.h"
 
 #include <stdexcept>
@@ -118,6 +119,19 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
                 geometry.layout == QuantLayout::RowSplit &&
                 artifact::row_split_panel_supported(geometry)) {
                 bindings.binder.panel_device(part.object);
+            }
+            // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 的 MLP 投影（gate_up 34816x5120 与
+            // down 5120x{6144,17408}）在加载时重排成 Volta QPN 的片段序。sm_70 上这两个形状
+            // 的全部消费路径都认这个布局：t <= 32 走 QPN（拆分/残差），更宽走 CUTLASS sm_70。
+            // 形状过滤是必要的：其余 NVFP4（如注意力投影）仍走 sm_70 的 SIMT 解码路线。
+            const bool mlp_shape =
+                geometry.shape.size() == 2 &&
+                ((geometry.shape[0] == 34816 && geometry.shape[1] == 5120) ||
+                 (geometry.shape[0] == 5120 &&
+                  (geometry.shape[1] == 6144 || geometry.shape[1] == 17408)));
+            if (geometry.format == QType::NVFP4 && mlp_shape &&
+                artifact::nvfp4_qpn_prepack_supported(geometry)) {
+                bindings.binder.qpn_prepack_device(part.object);
             }
         }
     }

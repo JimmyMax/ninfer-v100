@@ -15,6 +15,10 @@
 #include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
+#if defined(NINFER_SM70)
+// 本仓库 V100 增量（docs/v100/PLAN.md）：--prepack 用实测加载时 QPN prepack 的收益。
+#    include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#endif
 
 #include <cuda_bf16.h>
 #include <cuda_profiler_api.h>
@@ -39,6 +43,11 @@ using namespace ninfer;
 using ninfer::ops::LinearPolicy;
 
 namespace {
+
+#if defined(NINFER_SM70)
+// 本仓库 V100 增量：NVFP4 权重是否在 bench 里跑一次加载时 prepack（--prepack）。
+bool g_prepack_nvfp4 = false;
+#endif
 
 // Hardware ceilings come from bench::device_specs(), which derives the DRAM spec from the device
 // and carries measured per-architecture sustained-read and tensor-core rates. They were literals
@@ -381,6 +390,10 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--sweep") {
             opt.sweep      = parse_sweep(next("sweep"));
             opt.have_sweep = true;
+#if defined(NINFER_SM70)
+        } else if (arg == "--prepack") {
+            g_prepack_nvfp4 = true;
+#endif
         } else if (arg == "--suite") {
             opt.suite      = lower(next("suite"));
             opt.have_suite = true;
@@ -533,6 +546,9 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
     if (qtype == QType::NVFP4) {
         bench::PackedQuantizedWeight packed = bench::make_nvfp4_weight(n, k);
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
+#if defined(NINFER_SM70)
+        if (g_prepack_nvfp4) { ops::detail::nvfp4_prepack_qpn_sm70(packed.weight); }
+#endif
         return {std::move(packed.storage), packed.weight, model_bytes};
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16) {

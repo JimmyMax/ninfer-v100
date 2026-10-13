@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 
 #include "artifact/framing.h"
+#include "artifact/permute_nvfp4_qpn.h"
 #include "artifact/permute_row_split.h"
 #include "artifact/transcode.h"
 
@@ -131,6 +132,18 @@ void Binder::panel_device(ObjectHandle object) {
     demand.panel = true;
 }
 
+void Binder::qpn_prepack_device(ObjectHandle object) {
+    const auto& tensor = reader_.directory().tensor(object);
+    auto& demand       = demands_.at(object.index);
+    if (!demand.device) {
+        throw ArtifactError(tensor.id + ": the QPN prepack requires a device placement");
+    }
+    if (!nvfp4_qpn_prepack_supported(reader_.geometry(object))) {
+        throw ArtifactError(tensor.id + ": object cannot take the QPN prepack");
+    }
+    demand.qpn_prepack = true;
+}
+
 void Binder::evict_device(ObjectHandle object, std::uint32_t rank) {
     const auto& tensor = reader_.directory().tensor(object);
     auto& demand       = demands_.at(object.index);
@@ -259,7 +272,8 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         auto& capacity      = plan.device_capacity_by_rank[rank];
         const auto offset   = align_up(capacity, demand.alignment, "device offset");
         plan.device_objects.push_back({ObjectHandle{index}, offset, bytes, demand.alignment,
-                                       demand.transcode, rank, demand.tail, demand.panel});
+                                       demand.transcode, rank, demand.tail, demand.panel,
+                                       demand.qpn_prepack});
         capacity = checked_add(checked_add(offset, bytes, "device capacity"), demand.tail,
                                "device capacity");
     };

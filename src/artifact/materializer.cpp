@@ -1,6 +1,7 @@
 #include "artifact/materializer.h"
 
 #include "artifact/framing.h"
+#include "artifact/permute_nvfp4_qpn.h"
 #include "artifact/permute_row_split.h"
 #include "artifact/transcode.h"
 #include "artifact/reader.h"
@@ -322,6 +323,15 @@ UploadTotals upload_device_objects(const Reader& reader,
                                    bases[placement.rank] + placement.offset, nullptr);
         permuted_rank[placement.rank] = true;
     }
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 的 QPN 片段序同样在每次上传之后原地施加，
+    // 所以模型挂起后重新上传（upload_device_objects_again 走这里）不会退回 artifact 的布局。
+    for (const auto& placement : placements) {
+        if (!placement.qpn_prepack) { continue; }
+        const ScopedRank bound(device, placement.rank);
+        permute_nvfp4_to_qpn(placement_geometry(reader, placement),
+                             bases[placement.rank] + placement.offset, nullptr);
+        permuted_rank[placement.rank] = true;
+    }
     for (std::size_t rank = 0; rank < permuted_rank.size(); ++rank) {
         if (!permuted_rank[rank]) { continue; }
         const ScopedRank bound(device, rank);
@@ -502,6 +512,14 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 throw ArtifactError("a panel placement names an object without the layout");
             }
             geometry.layout = QuantLayout::RowSplitPanel;
+        }
+        if (placement.qpn_prepack) {
+            // 本仓库 V100 增量：QPN 的片段序要求 NVFP4 的 BlockScaleK16M128x4 几何。
+            if (geometry.format != QType::NVFP4 ||
+                geometry.layout != QuantLayout::BlockScaleK16M128x4) {
+                throw ArtifactError("a QPN prepack placement names an object without the layout");
+            }
+            geometry.layout = QuantLayout::VoltaQpnPrepacked;
         }
         auto& object = out.objects_.at(placement.object.index);
         if (placement.rank >= rank_count) {
