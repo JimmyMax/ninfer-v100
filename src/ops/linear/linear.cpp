@@ -5,6 +5,9 @@
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#if defined(NINFER_SM70)
+#    include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
+#endif
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -135,6 +138,14 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::bf16_dispatch(x, w, out, policy, stream);
         return;
     case QType::NVFP4:
+#if defined(NINFER_SM70)
+        // 本仓库 V100 增量（docs/v100/PLAN.md）：解码/校验宽度上交由 fork 的 QPN 内核，
+        // 它直接消费 NVFP4 码；上游的 Volta A16 路线在同一形状上只有 85 GB/s（DRAM 9.5%）。
+        if (detail::nvfp4_volta_takes(w, x.ne[1])) {
+            detail::nvfp4_volta_project(x, w, out, stream);
+            return;
+        }
+#endif
         detail::nvfp4_dispatch(x, w, out, policy, workspace, stream);
         return;
     case QType::FP8_E4M3FN_ROW_BF16:

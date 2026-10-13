@@ -4,6 +4,11 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_dispatch_unified.cpp"
+  # 本仓库 V100 增量（docs/v100/PLAN.md）：Volta QPN 路径
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_volta_sm70.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_volta_qpn_gemm.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_volta_mma_gemm.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_prepack_sm70.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n14336_k5120_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n16384_k5120.cu"

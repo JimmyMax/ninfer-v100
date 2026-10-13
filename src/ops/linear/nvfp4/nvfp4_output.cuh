@@ -36,4 +36,17 @@ struct Nvfp4ContiguousOutput {
     }
 };
 
+// 本仓库 V100 增量（docs/v100/PLAN.md）：residual += value with a single BF16 round
+// (linear_add without a projected temporary).
+struct Nvfp4ResidualOutput {
+    __nv_bfloat16* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        const std::int64_t index = static_cast<std::int64_t>(token) * rows + parent_row;
+        data[index] = __float2bfloat16_rn(value + __bfloat162float(data[index]));
+    }
+};
+
 } // namespace ninfer::ops::detail

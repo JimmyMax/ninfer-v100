@@ -97,6 +97,9 @@ enum class QuantLayout : std::uint16_t {
     // Rows of whole ggml blocks, as a GGUF stores them.
     GgufBlocks = 5,
     RowInterleaved = 6,
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 权重在加载时被就地重排成 Volta QPN2 片段顺序
+    // （nvfp4_prepack_sm70.cu）。载荷大小不变，从不存入 `.ninfer`。
+    VoltaQpnPrepacked = 7,
 };
 
 // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the

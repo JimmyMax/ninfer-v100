@@ -3,6 +3,39 @@
 #include "core/tensor.h"
 #include <cuda_runtime.h>
 
+#if defined(NINFER_SM70)
+// 本仓库 V100 增量（docs/v100/PLAN.md）：fork 的 Volta NVFP4 QPN 路径。
+#    include "core/arena.h"
+#    include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#endif
+
 namespace ninfer::ops::detail {
 using Nvfp4Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+#if defined(NINFER_SM70)
+// Quadpair-split-N form (nvfp4_volta_qpn_gemm.cuh), the fourth sibling of the q4/w8/fp8 QPN
+// kernels. The tile height is mirrored here because dispatch is host code and cannot see the
+// device header; the launcher static_asserts the two agree.
+inline constexpr std::int32_t kNvfp4VoltaQpnRowsPerTile = 8;
+inline constexpr std::int32_t kNvfp4VoltaQpnMaxTokens   = 32;
+void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+// x_fp16: the same activation pre-staged to fp16 (see fp8_stage_bf16_activation_sm70).
+void launch_nvfp4_volta_qpn_fp16(const Tensor& x, const void* x_fp16, const Weight&, Tensor&,
+                                 cudaStream_t);
+// residual += x x w^T through the QPN kernel with an fp16-staged activation (one BF16 round).
+void launch_nvfp4_volta_qpn_fp16_residual(const Tensor& x, const void* x_fp16, const Weight&,
+                                          Tensor& residual, cudaStream_t);
+[[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
+                                             std::int32_t t) noexcept;
+
+// Wide-T form (nvfp4_volta_mma_gemm.cuh): T on the mma A axis, dequantizing into shared memory
+// once per K-pass instead of QPN2's small-T-chunked re-streaming. Prefill's route.
+void launch_nvfp4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                            cudaStream_t stream, int splits_override = 0);
+[[nodiscard]] bool nvfp4_volta_mma_supported(std::int32_t n, std::int32_t k,
+                                             std::int32_t t) noexcept;
+[[nodiscard]] std::size_t nvfp4_volta_mma_workspace_bytes(std::int32_t n, std::int32_t k,
+                                                          std::int32_t t) noexcept;
+[[nodiscard]] int nvfp4_volta_mma_splits(std::int32_t n, std::int32_t k, std::int32_t t) noexcept;
+#endif
 }

@@ -119,3 +119,23 @@ docker exec ninfer-sm70-build bash -c 'cd /build && ./bench/ninfer_benches ninfe
   `589.8 µs → ~90 µs`、`DRAM_% 9.5% → 50%+`（decode），以及 T=2048 从 6207 µs 显著下降。
 * 它能把这条线从"慢 3.9×"拉到"慢 1.5×"（decode），prefill 基本追平。
 * 完全追平需要第二步：fp8 QPN + v1.4.0 那批 decode 侧端口。
+
+## 7. NVFP4 QPN 移植：第 1 阶段（解码宽度）进行中
+
+按 §4.3 的收窄范围动手，进程如下（2026-10-13）：
+
+| 步骤 | 状态 |
+|---|---|
+| 拷入 fork 的 6 个文件并统一宏（`NINFER_VOLTA_BUILD` → `NINFER_SM70`）：`nvfp4_volta_qpn_gemm.{cuh,cu}`(503+61)、`nvfp4_volta_mma_gemm.{cuh,cu}`(224+88)、`nvfp4_prepack_sm70.{cu,h}`(75+13) | ✅ |
+| 接口补齐：`QuantLayout::VoltaQpnPrepacked`（`core/weight.h`）、`Nvfp4ResidualOutput`（`nvfp4_output.cuh`）、`nvfp4_prepack_sm70.h` 补 `core/weight.h`、`nvfp4_launch.h` 增加 `NINFER_SM70` 声明块 | ✅ |
+| 单文件编译探针：3 个 `.cu` 全部零错误 | ✅ |
+| 新增 `nvfp4_volta_sm70.{h,cpp}`（`nvfp4_volta_takes` / `nvfp4_volta_project`），在 `linear.cpp` 的 `QType::NVFP4` 分支前挂接：解码宽度（tokens ≤ 32）且形状受 QPN 支持时走 QPN | ✅ 编译通过 |
+| `sources.cmake` 加入 4 个新文件 | ✅ |
+| 完整重建 + 链接 | ◐ 进行中（434 个目标） |
+| 算子级门禁：`ninfer_linear_bench --qtype nvfp4 --n 17408 --k 5120 --sweep 1:2:1` 期望 589.8 µs → ~90 µs、DRAM 9.5% → 50%+ | ☐ |
+| 端到端验收（短/42K/152K，`bench/v100/compare_lines.py`） | ☐ |
+| 第 2 阶段：prefill 宽 T（`launch_nvfp4_volta_mma`）+ 加载时 prepack（`VoltaQpnPrepacked`，需按 `panel` 的先例走 binder demand → materializer） | ☐ |
+
+关键设计选择：**第 1 阶段不依赖 prepack** —— fork 的 QPN 内核自带 `prepacked=false` 分支，
+可直接消费 artifact 原样的 `BlockScaleK16M128x4` 布局，因此不必先改 artifact 层。
+`VoltaQpnPrepacked` 与 `nvfp4_prepack_sm70.cu` 已就位，留作第 2 阶段（prepack 还能再省一截索引开销）。
