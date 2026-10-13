@@ -28,3 +28,9 @@ if(TARGET ninfer_nvfp4_non_rdc)
     "${CMAKE_CURRENT_LIST_DIR}/nvfp4_w4a4_tma.cu"
   )
 endif()
+
+# 本仓库 V100 增量：sm_70 的 NVFP4 宽 T（prefill）CUTLASS 路径，仅 Volta 构建编译。
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_cutlass_sm70.cu")
+endif()

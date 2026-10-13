@@ -101,6 +101,12 @@ int main() {
     }
     try {
         constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
+#if defined(NINFER_SM70)
+        // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 上 NVFP4 的 A16 覆盖到全部宽度——
+        // t <= 32 走 QPN 拆分（在册的窄 T 判据），更宽走 CUTLASS sm_70（合成路线，判据见下）。
+        constexpr std::array<std::int32_t, 5> kA16NarrowCases{1, 4, 8, 16, 24};
+        constexpr std::array<std::int32_t, 4> kA16WideCases{33, 64, 129, 257};
+#endif
         // 511 and 513 straddle the ragged floor: the first still reaches the composition, the
         // second is the narrowest ragged width the fused route admits and leaves one real token
         // in a third M tile. 767 leaves that tile all but full, and 1025 leaves one after four
@@ -110,9 +116,21 @@ int main() {
                                                         96,  97,  112, 128, 129, 255,  256,
                                                         257, 511, 512, 513, 767, 1024, 1025};
         int failures = check_negative_gate();
+#if defined(NINFER_SM70)
+        failures += run_profile("LinearSwiGLU NVFP4_A16",
+                                {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
+                                kA16NarrowCases);
+        // 宽 T prefill 的路线把 gate/up 先写成 BF16 平面再相乘，多一次 bf16 舍入，用同源的
+        // 宽 T 合成判据（相对 L2 放宽一倍，见 linear_swiglu_test_common.h）。
+        failures += run_profile(
+            "LinearSwiGLU NVFP4_A16_wide",
+            {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16}, kA16WideCases, {},
+            wide_composition_criterion(ActivationCompute::A16));
+#else
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
                                 kA16Cases);
+#endif
         failures += run_profile("LinearSwiGLU NVFP4_A4",
                                 {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
                                 kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});

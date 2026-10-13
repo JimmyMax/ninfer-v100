@@ -7,6 +7,12 @@ target_link_libraries(ninfer_ops PUBLIC ninfer_core)
 # ops/linear_swiglu/q4cublas/w4_cublas_prefill.h for why that route exists.
 target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
 
+# 本仓库 V100 增量：Volta 构建下 sm_70 的 NVFP4/FP8 宽 T 内核依赖 CUTLASS 头文件库
+# （顶层 CMakeLists.txt 里 FetchContent，锁定 v4.4.2）。
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
+endif()
+
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
 # self-contained kernels therefore use a non-RDC archive and host launchers.

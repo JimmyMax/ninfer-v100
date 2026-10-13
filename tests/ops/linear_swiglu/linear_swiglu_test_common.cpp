@@ -209,6 +209,17 @@ int compare_output(std::string_view label, const std::vector<double>& actual,
                             tolerance_for(activation_compute));
 }
 
+int compare_output(std::string_view label, const std::vector<double>& actual,
+                   const double* reference, const ReductionCriterion& criterion) {
+    if (actual.empty() || reference == nullptr) {
+        std::cerr << label << ": invalid numerical comparison\n";
+        return 1;
+    }
+
+    return verify_reduction(label, actual, std::span<const double>(reference, actual.size()),
+                            criterion);
+}
+
 int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& device,
                      const void* expected, std::size_t bytes) {
     if (device.bytes() != bytes) {
@@ -257,7 +268,7 @@ bool cuda_available() { return !test::cuda_unavailable(); }
 
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
-                std::span<const std::int32_t> graph_cases) {
+                std::span<const std::int32_t> graph_cases, ReductionCriterion criterion) {
     validate_profile(profile);
     if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
     for (std::size_t index = 0; index < token_cases.size(); ++index) {
@@ -361,7 +372,7 @@ int run_profile(std::string_view label, const Profile& profile,
                 failures += output.verify_guards(label_case);
                 const auto actual = read_bf16_output(output, elements);
                 failures +=
-                    compare_output(label_case, actual, expected.data(), profile.activation_compute);
+                    compare_output(label_case, actual, expected.data(), criterion);
                 if (replay)
                     failures += verify_unchanged(label_case + " input", device_activation,
                                                  input_bits.data(),
@@ -400,6 +411,24 @@ int run_profile(std::string_view label, const Profile& profile,
     failures += verify_unchanged(std::string(label) + " weight", device_weight,
                                  host_weight.payload.data(), host_weight.payload.size());
     return failures;
+}
+
+// 本仓库 V100 增量（docs/v100/PLAN.md）：宽 T prefill 的 NVFP4 走“先投影成 BF16 平面、再
+// silu_mul”的合成路线，门与 up 各自先舍入到 bf16 再相乘，比窄 T 融合内核多一次 bf16 舍入。
+// 于是 A16 判据在宽 T 上对任何实现都不可达（上游自己的 A4 宽 T 合成路线 rel_l2 也是 0.0042），
+// 所以相对 L2 界按同一依据放宽一倍，gross 界不变。实测（NINFER_OP_REPORT_STATS=1）：
+// 宽 T 合成路线 rel_l2 = 0.0046，2x 界 = 0.0066，比值 0.70，与本判据其他用例的 0.77–0.99 一致。
+ReductionCriterion wide_composition_criterion(ActivationCompute activation_compute) {
+    ReductionCriterion criterion = tolerance_for(activation_compute);
+    criterion.relative_l2 *= 2.0;
+    return criterion;
+}
+
+int run_profile(std::string_view label, const Profile& profile,
+                std::span<const std::int32_t> token_cases,
+                std::span<const std::int32_t> graph_cases) {
+    return run_profile(label, profile, token_cases, graph_cases,
+                       tolerance_for(profile.activation_compute));
 }
 
 } // namespace ninfer::test::linear_swiglu

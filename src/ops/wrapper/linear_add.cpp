@@ -19,6 +19,7 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #if defined(NINFER_SM70)
 #    include "ops/linear/nvfp4/nvfp4_launch.h" // 本仓库 V100 增量：QPN 常量/声明
+#    include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h" // 本仓库 V100 增量：宽 T 容量
 #endif
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
@@ -211,18 +212,17 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return linear_add_route_workspace_bytes(qtype, output_rows, input_rows, policy, lo, hi);
     };
     // Every width of a dense format takes an sm_70 route there.
-    const std::size_t base = detail::sm70::capacity(qtype, output_rows, input_rows, min_tokens,
-                                                    max_tokens, policy, routes);
 #if defined(NINFER_SM70)
-    // 本仓库 V100 增量：NVFP4 down 的 QPN residual 路径需要一块 fp16 激活暂存。
-    if (max_tokens <= detail::kNvfp4VoltaQpnMaxTokens &&
-        detail::nvfp4_volta_qpn_supported(output_rows, input_rows, max_tokens)) {
-        const std::size_t stage =
-            static_cast<std::size_t>(input_rows) * static_cast<std::size_t>(max_tokens) * 2 + 256;
-        return std::max(base, stage);
+    // 本仓库 V100 增量：NVFP4 down 的两个形状在 sm_70 上整段交给 nvfp4 plan 决定
+    // （t <= 32 走 QPN residual，更宽走 CUTLASS），不再经过 sm70 路线——所以容量也必须完全
+    // 由 plan 给出，才能保持“查询即执行高水位”。
+    if (qtype == QType::NVFP4 && output_rows == 5120 &&
+        (input_rows == 6144 || input_rows == 17408)) {
+        return routes(min_tokens, max_tokens);
     }
 #endif
-    return base;
+    return detail::sm70::capacity(qtype, output_rows, input_rows, min_tokens, max_tokens, policy,
+                                  routes);
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, WorkspaceArena& ws,
@@ -248,10 +248,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
 
     if (detail::sm70::covers(w, t)
 #if defined(NINFER_SM70)
-        // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 down 在 QPN 支持的宽度上交给
-        // nvfp4_linear_add_dispatch → Volta QPN 的 residual 输出（省掉临时投影与单独 residual_add）。
-        && !(w.qtype == QType::NVFP4 && t <= detail::kNvfp4VoltaQpnMaxTokens &&
-             detail::nvfp4_volta_qpn_supported(w.n, w.k, t))
+        // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 down 在 sm_70 上全宽度交给
+        // nvfp4_linear_add_dispatch——t <= 32 走 QPN residual，更宽走 CUTLASS sm_70 + residual_add。
+        && !(w.qtype == QType::NVFP4 && w.n == 5120 && (w.k == 6144 || w.k == 17408))
 #endif
     ) {
         auto scope            = ws.scope();

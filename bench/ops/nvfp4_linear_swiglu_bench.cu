@@ -110,7 +110,11 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.policy == ops::LinearPolicy::A16Only &&
         *std::max_element(options.t_sweep.begin(), options.t_sweep.end()) > 16) {
+        // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 上 A16 全宽度已注册
+        // （t <= 32 走 QPN 拆分，更宽走 CUTLASS sm_70），故此处不设宽度上限。
+#if !defined(NINFER_SM70)
         throw std::invalid_argument("A16 policy is registered only through T=16");
+#endif
     }
     return options;
 }
