@@ -10,7 +10,8 @@
 | [baseline-2026-10-12.md](baseline-2026-10-12.md) | 第一条 V100-32GB 基线：Gemma 4 可用性与两线 A/B 数据 |
 | [S0.5-port-inventory.md](S0.5-port-inventory.md) | S0.5 的移植清单：来源提交、落点结构、分步计划与验收标准 |
 | [S0.5-result-2026-10-13.md](S0.5-result-2026-10-13.md) | S0.5 首次 A/B 结果：短上下文 +5.3%，验收标准需改为 oracle |
-| [S0.5-oracle-and-longctx-2026-10-13.md](S0.5-oracle-and-longctx-2026-10-13.md) | oracle 单测（v2 数值正确）+ 42K/152K 长上下文 A/B：只有 +3~6%，瓶颈定量定位在投影层 |
+| [S0.5-oracle-and-longctx-2026-10-13.md](S0.5-oracle-and-longctx-2026-10-13.md) | oracle 单测（v2 数值正确）+ 42K/152K 长上下文 A/B：只有 +3~6% |
+| [profiling-nvfp4-2026-10-13.md](profiling-nvfp4-2026-10-13.md) | **定位测量**：4.3× 差距精确落在 NVFP4 投影路线（85 GB/s / DRAM 9.5%，同形状 fp8/q4/q5/q8 已达 480–620 GB/s） |
 
 相关资产：
 
