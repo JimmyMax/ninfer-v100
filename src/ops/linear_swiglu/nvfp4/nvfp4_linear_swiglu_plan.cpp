@@ -159,13 +159,27 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
 #if defined(NINFER_SM70)
-    // 本仓库 V100 增量（docs/v100/PLAN.md）：解码/校验宽度上的 NVFP4 gate_up
-    // （34816 x 5120，每层 178 M 参数，占模型 NVFP4 质量的三分之二）直接走 fork 的
-    // QPN 融合内核，绕过上游的 A16 路线（同形状实测只有 85 GB/s / DRAM 9.5%）。
-    if (x.ne[1] <= kNvfp4VoltaQpnMaxTokens &&
-        nvfp4_linear_swiglu_volta_qpn_supported(weight.k, x.ne[1])) {
-        nvfp4_linear_swiglu_volta_qpn_launch(x, weight, out, stream);
-        return;
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：解码/校验宽度（t = 1..32）上的 NVFP4 gate_up
+    // （34816 x 5120，每层 178 M 参数，占模型 NVFP4 质量的三分之二）走 fork 的 QPN 拆分路线：
+    // 两个独立 QPN2 pass（gate / up 各半）写 fp32 暂存，再由合并内核做 silu(gate)*up。
+    // fork 实测拆分 371.6 GB/s vs 融合内核 225.4 GB/s，故不用融合单内核。
+    if (nvfp4_linear_swiglu_qpn_split_supported(weight.k, x.ne[1])) {
+        constexpr std::int32_t kIntermediate = Nvfp4N34816K5120::kOutputRows / 2;
+        const std::size_t gate_bytes = static_cast<std::size_t>(kIntermediate) *
+                                       static_cast<std::size_t>(x.ne[1]) * sizeof(float);
+        const std::size_t act_bytes  = static_cast<std::size_t>(weight.k) *
+                                       static_cast<std::size_t>(x.ne[1]) * sizeof(std::uint16_t);
+        const std::size_t aligned_used = (workspace.used() + 255) / 256 * 256;
+        if (workspace.capacity() >= aligned_used &&
+            workspace.capacity() - aligned_used >= gate_bytes + act_bytes + 256) {
+            auto scope              = workspace.scope();
+            const DeviceSpan gate   = workspace.alloc_bytes(gate_bytes, 256);
+            const DeviceSpan act    = workspace.alloc_bytes(act_bytes, 256);
+            nvfp4_linear_swiglu_qpn_split_launch(x, weight, out,
+                                                 reinterpret_cast<float*>(gate.data), act.data,
+                                                 stream);
+            return;
+        }
     }
 #endif
     if (fused_route_table("unified/nvfp4_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {

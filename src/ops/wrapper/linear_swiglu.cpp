@@ -140,8 +140,22 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         return linear_swiglu_route_workspace_bytes(qtype, gate_up_rows, input_rows, policy, lo, hi);
     };
     // Every width of a dense format takes an sm_70 route there.
-    return detail::sm70::capacity(qtype, gate_up_rows, input_rows, min_tokens, max_tokens,
-                                  sm70_policy(policy), routes);
+    const std::size_t base = detail::sm70::capacity(qtype, gate_up_rows, input_rows, min_tokens,
+                                                    max_tokens, sm70_policy(policy), routes);
+#if defined(NINFER_SM70)
+    // 本仓库 V100 增量：NVFP4 gate_up 的 QPN 拆分路线需要 gate fp32 与激活 fp16 两块暂存。
+    if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120 &&
+        min_tokens <= detail::kNvfp4VoltaQpnMaxTokens &&
+        detail::nvfp4_linear_swiglu_qpn_split_supported(
+            input_rows, std::min(max_tokens, detail::kNvfp4VoltaQpnMaxTokens))) {
+        const std::int32_t t = std::min(max_tokens, detail::kNvfp4VoltaQpnMaxTokens);
+        const std::size_t split =
+            static_cast<std::size_t>(gate_up_rows / 2) * static_cast<std::size_t>(t) * 4 +
+            static_cast<std::size_t>(input_rows) * static_cast<std::size_t>(t) * 2 + 512;
+        return std::max(base, split);
+    }
+#endif
+    return base;
 }
 
 std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gate_up_rows,
@@ -203,9 +217,10 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 
     if (detail::sm70::covers(gate_up_weight, t)
 #if defined(NINFER_SM70)
-        // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 gate_up 在 QPN 支持的宽度上
-        // （t >= 2）交给下面的 nvfp4_linear_swiglu_dispatch → Volta QPN 融合内核。
-        && !(nvfp4_weight && detail::nvfp4_linear_swiglu_volta_qpn_supported(gate_up_weight.k, t))
+        // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 gate_up 在 QPN 拆分支持的宽度上
+        // （t = 1..32）交给下面的 nvfp4_linear_swiglu_dispatch → Volta QPN 拆分路线。
+        && !(nvfp4_weight &&
+             detail::nvfp4_linear_swiglu_qpn_split_supported(gate_up_weight.k, t))
 #endif
     ) {
         auto scope            = ws.scope();
