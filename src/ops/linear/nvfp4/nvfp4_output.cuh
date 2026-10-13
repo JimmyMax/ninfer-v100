@@ -49,4 +49,16 @@ struct Nvfp4ResidualOutput {
     }
 };
 
+// 本仓库 V100 增量（docs/v100/PLAN.md）：FP32 直出（不做 BF16 舍入），
+// 供拆分式 SwiGLU 的 gate 道使用（up 道再从该 FP32 平面读取并做激活）。
+struct Nvfp4Fp32ContiguousOutput {
+    float* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        data[static_cast<std::int64_t>(token) * rows + parent_row] = value;
+    }
+};
+
 } // namespace ninfer::ops::detail

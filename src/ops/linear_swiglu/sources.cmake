@@ -12,6 +12,9 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_a4.cu"
+  # 本仓库 V100 增量（docs/v100/PLAN.md）：Volta QPN 融合 SwiGLU
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_qpn_split.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan_unified.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_decode.cu"

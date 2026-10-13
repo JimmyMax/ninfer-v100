@@ -4,6 +4,11 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
+#if defined(NINFER_SM70)
+// 本仓库 V100 增量（docs/v100/PLAN.md）：Volta QPN 的 residual 输出与激活暂存。
+#    include "ops/linear/nvfp4/nvfp4_launch.h"
+#    include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -60,6 +65,15 @@ static std::size_t nvfp4_linear_add_workspace_capacity_bytes_own(std::int32_t ou
         throw std::invalid_argument("nvfp4 linear_add workspace: invalid token interval");
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
+#if defined(NINFER_SM70)
+    // 本仓库 V100 增量：解码宽度上的 NVFP4 down 投影走 QPN 的 residual 路径，
+    // 需要一块 fp16 激活暂存（k * tokens * 2 字节，256 字节对齐）。
+    if (max_tokens <= kNvfp4VoltaQpnMaxTokens &&
+        nvfp4_volta_qpn_supported(output_rows, input_rows, max_tokens)) {
+        return static_cast<std::size_t>(input_rows) * static_cast<std::size_t>(max_tokens) * 2 +
+               256;
+    }
+#endif
     return resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearAddRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
                : 0;
@@ -84,6 +98,25 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：解码/校验宽度上的 NVFP4 down 投影
+    // （5120 x 17408，每层 89 M 参数）。先做一次 fp16 激活暂存，再用 QPN 的
+    // residual 输出策略一次性完成 out += x·wᵀ（无临时投影、无单独 residual_add）。
+    if (x.ne[1] <= kNvfp4VoltaQpnMaxTokens &&
+        nvfp4_volta_qpn_supported(weight.n, weight.k, x.ne[1])) {
+        const std::size_t stage_bytes =
+            static_cast<std::size_t>(x.ne[0]) * static_cast<std::size_t>(x.ne[1]) * 2;
+        const std::size_t aligned_used = (workspace.used() + 255) / 256 * 256;
+        if (workspace.capacity() >= aligned_used &&
+            workspace.capacity() - aligned_used >= stage_bytes) {
+            auto stage_scope       = workspace.scope();
+            const DeviceSpan stage = workspace.alloc_bytes(stage_bytes, 256);
+            nvfp4_volta_stage_bf16_fp16_sm70(x, stage.data, stream);
+            launch_nvfp4_volta_qpn_fp16_residual(x, stage.data, weight, residual, stream);
+            return;
+        }
+    }
+#endif
     if (fused_route_table("unified/nvfp4_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_linear_add_dispatch(x, weight, residual, unified_policy(policy), workspace,
                                            stream);

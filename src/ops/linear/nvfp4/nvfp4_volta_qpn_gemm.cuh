@@ -46,6 +46,7 @@
 // output.
 
 #include "core/device.h"
+#include "core/weight.h" // Weight（上游把 Weight 放在 core/weight.h，fork 放在 core/tensor.h）
 #include "ops/common/volta_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 

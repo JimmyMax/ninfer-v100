@@ -24,6 +24,9 @@ namespace ninfer::ops::detail {
 
 // 单个 destination 的 QPN 投影（out = x · wᵀ，contiguous BF16 输出）。
 void nvfp4_volta_project(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+
+// BF16 → FP16 的激活暂存（QPN 的 fp16 激活变体与 residual 输出策略需要）。
+void nvfp4_volta_stage_bf16_fp16_sm70(const Tensor& x, void* fp16_out, cudaStream_t stream);
 #endif
 
 } // namespace ninfer::ops::detail

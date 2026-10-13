@@ -176,3 +176,40 @@ prepack（"single card 5120x17408 T=4: 96.0 → 88.4 µs"），留到下一步�
    （对应 5.70 G / 64 层）；
 3. 之后再上加载时 prepack（`VoltaQpnPrepacked`，按上游 `panel` 的先例走 binder demand → materializer），
    把 154.6 µs 推向 fork 的 ~90 µs。
+
+## 9. 第 1b 阶段结果：融合路径接通（2026-10-13）
+
+### 算子级
+
+| 融合算子（NVFP4，t=2/4） | 移植前 | 移植后 | 提升 |
+|---|---:|---:|---:|
+| `linear_swiglu` 34816×5120（≈89 MB 权重） | 1144.8 µs / 87.6 GB/s | **443.4 µs / 226.3 GB/s** | **2.58×** |
+| `linear_add` 5120×17408（≈44.6 MB 权重） | 518.1 µs / 96.9 GB/s | **181.2 µs / 277.0 GB/s** | **2.86×** |
+
+swiglu 的 226 GB/s 与 fork 源码注释里自记的 225.4 / 232.0 GB/s 一致 → 该算子已达 fork 同级。
+纯 QPN（17408×5120）随宽度：T=1 155.6 µs → T=8 167.9 µs，DRAM 34–36%。
+
+### 端到端（同 artifact、同参数）
+
+| 上下文 | 移植前 | 移植后 | fork |
+|---|---:|---:|---:|
+| 短（76 tok） | 15.9 tok/s | **28.1 tok/s** | 62.1 |
+| 42K | 17.2 tok/s | **28.6 tok/s** | 72.0 |
+
+**1.77×**，但**低于本轮预估的 ~42 tok/s**（见 §10 的偏差说明），距 fork 仍有 2.2×。
+
+### 踩到的第二个同类坑
+
+与 §8 的 `sm70_route` 同源：两个 wrapper 在 NVFP4 分发**之前**都有
+`if (detail::sm70::covers(w, t)) { … sm70 路线 … return; }`，把 NVFP4 截走了。
+修法是在 `linear_swiglu.cpp` / `linear_add.cpp` 的该条件上加 QPN 排除项，
+并把 `linear_add_workspace_capacity_bytes` 的最大值抬到含 fp16 激活暂存。
+
+### 还差的部分（按实测大小排序）
+
+| 杠杆 | 实测依据 | 预计收益 |
+|---|---|---|
+| **加载时 prepack** | 本实现 T=4 为 161.8 µs / 311 GB/s，fork 记录同矩阵 88.4 µs（504 GB/s）＝**1.83×** | NVFP4 算子 40 ms/轮 → ~22 ms |
+| **prefill 宽 T** | prefill 371 tok/s，fork 960（2026-10-13 复测 622–960 随上下文） | prefill/TTFT |
+| **fp8 路径** | fp8 算子 143.4 µs（622 GB/s），共 9.76 G 参数 ≈ 16 ms/轮 | 数 ms/轮 |
+| 注意力/prompt 调优 | v2 已在；fork 另有 v3 + prompt retune | +5% 量级 |

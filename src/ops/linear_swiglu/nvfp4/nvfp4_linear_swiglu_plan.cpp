@@ -158,6 +158,16 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：解码/校验宽度上的 NVFP4 gate_up
+    // （34816 x 5120，每层 178 M 参数，占模型 NVFP4 质量的三分之二）直接走 fork 的
+    // QPN 融合内核，绕过上游的 A16 路线（同形状实测只有 85 GB/s / DRAM 9.5%）。
+    if (x.ne[1] <= kNvfp4VoltaQpnMaxTokens &&
+        nvfp4_linear_swiglu_volta_qpn_supported(weight.k, x.ne[1])) {
+        nvfp4_linear_swiglu_volta_qpn_launch(x, weight, out, stream);
+        return;
+    }
+#endif
     if (fused_route_table("unified/nvfp4_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_linear_swiglu_dispatch(x, weight, out, unified_policy(policy), workspace,
                                               stream);

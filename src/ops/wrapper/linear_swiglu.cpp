@@ -201,7 +201,13 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
 
-    if (detail::sm70::covers(gate_up_weight, t)) {
+    if (detail::sm70::covers(gate_up_weight, t)
+#if defined(NINFER_SM70)
+        // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 gate_up 在 QPN 支持的宽度上
+        // （t >= 2）交给下面的 nvfp4_linear_swiglu_dispatch → Volta QPN 融合内核。
+        && !(nvfp4_weight && detail::nvfp4_linear_swiglu_volta_qpn_supported(gate_up_weight.k, t))
+#endif
+    ) {
         auto scope            = ws.scope();
         const auto activation = detail::sm70::prepare_for(
             x, gate_up_weight.n, ws, stream,
