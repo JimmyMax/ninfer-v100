@@ -87,6 +87,12 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 // The sm_70 routes take every dense format; without an arena, the widths that need none.
 bool sm70_route(const Tensor& x, const Weight& w, const Tensor& out,
                 const WorkspaceArena* workspace) {
+#if defined(NINFER_SM70)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 在解码宽度上交由 QPN 内核
+    // （dispatch_linear 的 NVFP4 分支），不要被这里的 sm70 small-T 路线截走 ——
+    // 那条路线用 Nvfp4Decoder，实测只有 85 GB/s（DRAM 9.5%）。
+    if (detail::nvfp4_volta_takes(w, x.ne[1])) { return false; }
+#endif
     return out.dtype == DType::BF16 && detail::sm70::covers(w, x.ne[1]) &&
            (workspace != nullptr || detail::sm70::direct_tokens(x.ne[1]));
 }

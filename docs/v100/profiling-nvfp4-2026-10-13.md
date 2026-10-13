@@ -139,3 +139,40 @@ docker exec ninfer-sm70-build bash -c 'cd /build && ./bench/ninfer_benches ninfe
 关键设计选择：**第 1 阶段不依赖 prepack** —— fork 的 QPN 内核自带 `prepacked=false` 分支，
 可直接消费 artifact 原样的 `BlockScaleK16M128x4` 布局，因此不必先改 artifact 层。
 `VoltaQpnPrepacked` 与 `nvfp4_prepack_sm70.cu` 已就位，留作第 2 阶段（prepack 还能再省一截索引开销）。
+
+## 8. 第 1 阶段结果：钩子生效，但挂错了入口（2026-10-13）
+
+### 算子级：3.8×
+
+| `ninfer_linear_bench --qtype nvfp4 --n 17408 --k 5120` | median | 有效带宽 | DRAM |
+|---|---:|---:|---:|
+| 移植前 | 589.8 µs | 85.1 GB/s | 9.5 % |
+| **移植后（QPN，未 prepack）** | **154.6 µs** | **324.5 GB/s** | **36.1 %** |
+
+即 **3.8×**、DRAM 占用从 9.5% 抬到 36.1%。门上到 50%+/90 µs 还差一截，那一段正是 fork 记录的
+prepack（"single card 5120x17408 T=4: 96.0 → 88.4 µs"），留到下一步。
+
+**踩到的坑**：第一版钩子挂在 `dispatch_linear` 的 `switch (w.qtype)` 里，但 `linear()` 在 switch
+**之前**先试 `sm70_route()`，NVFP4 在 small-T 上被它截走（用 `Nvfp4Decoder`）。
+修法是让 `sm70_route()` 对 QPN 权重返回 false。这个修正只改了 `linear.cpp`，重链后算子级提升立刻出现。
+
+### 端到端：0%（入口挂错）
+
+移植后跑真实模型（同 artifact、同参数）：短上下文 17.3 tok/s、42K 16.5 tok/s —— 与移植前
+（15.9 / 17.2）持平。原因已定位，且是结构性的：
+
+| NVFP4 张量形状 | 数量 | 参数量 | 走的分发器 |
+|---|---:|---:|---|
+| `(34816, 5120)` | 64 | **11.41 G** | `linear_swiglu`（gate+up 融合） |
+| `(5120, 17408)` | 64 | **5.70 G** | `linear_add`（down + residual） |
+
+**模型的 17.11 G NVFP4 参数 100% 落在两个融合投影上，没有一个走纯 `linear`。**
+
+### 第 1b 阶段（下一步，范围已确定）
+
+1. `linear_swiglu/nvfp4`：移植 fork 的 `nvfp4_linear_swiglu_volta_qpn.cuh`（239 行）并挂接
+   （对应 11.41 G / 64 层）；
+2. `linear_add/nvfp4`：挂接已移植的 `launch_nvfp4_volta_qpn_fp16_residual`
+   （对应 5.70 G / 64 层）；
+3. 之后再上加载时 prepack（`VoltaQpnPrepacked`，按上游 `panel` 的先例走 binder demand → materializer），
+   把 154.6 µs 推向 fork 的 ~90 µs。
