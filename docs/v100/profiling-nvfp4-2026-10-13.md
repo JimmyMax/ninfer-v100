@@ -76,3 +76,46 @@ docker exec ninfer-sm70-build bash -c 'cd /build && ./bench/ninfer_benches ninfe
 2. 每步用 `ninfer_linear_bench --qtype nvfp4 --n 17408 --k 5120 --sweep 1:2:1` 做算子级对照，
    目标：589.8 µs → ~90 µs（T=1/T=2），并让 `DRAM_%` 从 9.5% 抬到 50%+。
 3. 端到端验收用 `bench/v100/compare_lines.py`（同一 artifact，fork 线 62.1 tok/s 作为参照）。
+
+## 6. 两线完整对照与"能否追上"的量化预测（2026-10-13 补测）
+
+同一 artifact、同一 GPU、同一参数（int8 KV、MTP 4 drafts、prefill-chunk 2048、`temperature=0`），
+两线各测三个上下文。prompt 字符数相同（130k / 570k 字符），因两侧分词/文档拼接略有差异，
+服务端计数分别为 42,518 与 38,084（42K 档）。
+
+| 上下文 | 引擎 | prefill | decode | TTFT | MTP 接受率 |
+|---|---|---:|---:|---:|---:|
+| 短（76 tok） | 上游 gemma 线 | — | 15.9 tok/s | — | 39.4% |
+| 短（76 tok） | **fork（master 线）** | — | **62.1 tok/s** | — | 32.8% |
+| 42K | 上游 gemma 线（V2=1） | 360.5 tok/s | 17.2 tok/s | 1m 58s | 49.4% |
+| 42K | **fork** | **960.3 tok/s** | **72.0 tok/s** | **39.7s** | 50.6% |
+| 152K | 上游 gemma 线（V2=1） | 268.9 tok/s | 17.1 tok/s | 9m 28s | 51.2% |
+| 152K | **fork** | **622.1 tok/s** | **52.4 tok/s** | **4m 06s** | 47.7% |
+
+差距：decode 短上下文 3.9×、42K 4.2×、152K 3.1×；prefill 42K 2.7×、152K 2.3×；TTFT 3.0× / 2.3×。
+
+### 按"每轮耗时"拆解（tokens/轮 = 1 + drafts × 接受率）
+
+| | 短上下文 | 42K |
+|---|---:|---:|
+| 上游 轮耗时 | 162 ms | 173 ms |
+| fork 轮耗时 | 37 ms | 42 ms |
+
+上游的 NVFP4 权重读取（8.6 GB @ 85 GB/s）≈ **101 ms**，与上下文无关 → 它占了上游每轮的约 2/3。
+把它提到 fork 水平（同一矩阵 88.4 µs @T=4 ⇒ ~17 ms）：
+
+* **只做 NVFP4**：上游短上下文轮耗时 162 → ~61 ms ⇒ **≈42 tok/s**（15.9 的 2.6×，
+  约为 fork 62.1 的 **68%**）；42K 约 33–35 tok/s（fork 的 ~47%）。
+* prefill 侧收益更大：NVFP4 在 T=2048 只有 22.9 GB/s（6207 µs/矩阵），修好后 prefill
+  有机会从 360 提到 700–900 tok/s，接近 fork 的 960。
+* **要完全追平**还差 ~24 ms/轮，来源是 fp8 路线（上游 143.4 µs vs fork 的 QPN）与 fork
+  在 v1.4.0 记的那批 decode 侧改动（fp16 激活暂存、NVFP4 residual 融入 QPN epilogue、
+  更宽的 small-T split reduce，合计 −7~−11% 轮耗时）。也就是需要把**量化投影那一整套**
+  （~30 文件）搬过来，而不只是 NVFP4 的 8–12 个。
+
+### 结论
+
+* NVFP4 QPN 是**收益最大、范围最小**的第一步，值得先做；算子级门禁：
+  `589.8 µs → ~90 µs`、`DRAM_% 9.5% → 50%+`（decode），以及 T=2048 从 6207 µs 显著下降。
+* 它能把这条线从"慢 3.9×"拉到"慢 1.5×"（decode），prefill 基本追平。
+* 完全追平需要第二步：fp8 QPN + v1.4.0 那批 decode 侧端口。
