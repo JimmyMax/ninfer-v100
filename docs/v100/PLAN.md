@@ -132,6 +132,17 @@ NVFP4 阶段（见 [profiling-nvfp4-2026-10-13.md](profiling-nvfp4-2026-10-13.md
 * 生产：`docker-compose.nvfp.yml` 已切到 `ninfer:v100-fp8`（制品同时从 v2 换成同目录的 v3 文件，
   上游代码只支持 v3 制式）。
 
+### S0.7 解码注意力线侦察 + 长上下文 split 修复 ◐（2026-10-14）
+
+* [x] 定位：只看 t=1，本线 vs fork 只差 1.26×；t=5 投机验证遍差 2.06×（42K prefill 本线已反超 951 vs 622）
+* [x] 发现 v100 的 `attn_i8_small/*` 路由键为空是**设计如此**（sm_70 走自己的解码注意力路由，
+      `route_catalog.cpp` 明写只标定 GDN prefill），不是缺配置
+* [x] 移植 fork `c58a92ba`：Volta `SmallTMaximumSplits` 85 → 560 + `small_t.cuh` 的 256 折叠
+      （62K/113K/140K token 上 +0.6%/+1.1%/+1.4%，接受数一致 → 数值无变化）
+* [x] 可用绕行落地：`--adaptive-mtp` 避开定宽 t=5 异常，短 **28.5 → 40.9**、42K **33.1 → 48.0** tok/s
+* ☐ 下一步：t=5 验证遍异常需要 kernel 级剖析（ncu）定位；t=1 还余 1.26×
+* 详见 [attention-2026-10-14.md](attention-2026-10-14.md)。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
