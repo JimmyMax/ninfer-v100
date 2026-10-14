@@ -84,3 +84,39 @@ KV 工作串行进每个 CTA"。上游这条线仍是 85。移植两部分：
 2. **t=1 的 1.26×**：投影已追平，剩下的是每轮固定开销与小的 kernel 启动/调度。
 3. 路线图其余项（Gemma 4 的 S1–S5）本身仍以 Gemma 为对象；对 Swift/Qwen 这条线，上面两项才是
    继续收窄与 fork 差距的地方。
+
+## 6. t=5 异常的排除清单（2026-10-14 续）
+
+按"排除法"逐项实测，全部在 V100 上、同 prompt、定宽 `--draft-tokens`：
+
+| 嫌疑 | 实测 | 结论 |
+|---|---|---|
+| 注意力算子本身 | `ninfer_causal_softmax_attention_bench --kv-dtype int8 --context 16384 --tokens 1..8`：121.9 / 120.8 / 144.4 / 154.6 / **146.4** / 239.6 / 283.7 / 290.8 µs | **W=5 不是尖峰**（比 W=4 还便宜）✗ |
+| 注意力内核实现 | `NINFER_SM70_ATTN_V2=1`、`NINFER_SMALLT_PV_F16=1` 对 t=5 轮次零影响 | 排除 ✗ |
+| CUDA Graph 重放 | `--no-cuda-graph`：d=4 28.4 vs 图模式 28.5；d=2 44.8 | 排除 ✗ |
+| 投影算子 | `ninfer_fp8_linear_add_bench`（k=6144/17408）T=1..8 **75.8 µs 平坦**；`ninfer_nvfp4_linear_swiglu_bench` 286→308 µs（+7%，无悬崖） | 排除 ✗ |
+| GDN 卷积 / KV 追加 | `ninfer_causal_conv1d_silu_bench` 6–16 µs、`ninfer_kv_cache_append_bench` 单节点 | 量级不对 ✗ |
+| 注意力路由 | q_heads=24 + int8 在 width ≤ 8 一律 SmallT，无分界 | 排除 ✗ |
+| MTP round 内核 | 与 fork 只差参数改名（上游更新），无按宽度分支 | 排除 ✗ |
+
+**正面线索**：`src/models/qwen3_5/program/planning/graph_profiles.cpp` 的 `mtp_graph_profiles`
+里对 `verify_window` 专门分支，其中
+
+```cpp
+// Target verify and MTP batch both have T=V+1 and W=E+V+1. Preserve one concrete INT8
+// implementation per range at the T=4/5/6 launch boundaries.
+} else if (verify_window == 5) {
+    for (const std::uint32_t visible_end : {128U, 160U, 2054U, 8198U}) { ... }
+}
+```
+
+即上游**知道** T=5 会选到与 T=4/T=6 不同的 INT8 实现（所以要在 128/160/2054/8198 处切边界），
+并且 graph 画像的签名里带着 `launch_shape(attention, storage, verify_window + 1U, ...)`。
+量级上，t=5 轮次约 77.6 ms ≈ 69 GB 等效流量 ≈ **权重被读了两遍**（t=1 轮次 37.2 ms ≈ 33 GB ≈ 一遍），
+所以更像是"某个算子在 5 列时被拆成两次执行/两遍读权重"，而不是某个算子变慢。
+
+**下一步（留给下一次）**：把 `launch_shape` 在 5 列时的取值打出来，定位它对应的具体 INT8 实现，
+再对照 4/6 列的实现看差在哪（`mtp_graph_profiles` 的边界正是为它而设）。
+kernel 级归因需要 `ncu`，而本机驱动限制了性能计数器权限（`ERR_NVGPUCTRPERM`，
+需 `NVreg_RestrictProfilingToAdminUsers=0` 并重载 nvidia 模块——生产在跑，未动）；
+替代做法是把 `launch_shape`/profile 选择打成日志，或按宽度二分各算子。
