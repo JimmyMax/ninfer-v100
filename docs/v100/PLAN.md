@@ -116,6 +116,22 @@ git push -u origin gemma
   与 fork 的输出在贪心解码下逐 token 一致；用 `bench/v100/compare_lines.py` 记录前后对照。
 * 预估：3–7 天。**这一步是整条路线的前提，验证通过才继续投 S2/S3。**
 
+### S0.6 FP8 投影的 Volta QPN + 加载时 prepack ☑（2026-10-14）
+
+NVFP4 阶段（见 [profiling-nvfp4-2026-10-13.md](profiling-nvfp4-2026-10-13.md)）做完后，账本里剩下的最大
+单项是 fp8（130 张量 / 9.76 GiB，含每层的注意力输入投影与输出投影）。把 fork 的 FP8 QPN + CUTLASS
+路径按"QPN 拥有全部宽度"的结构搬过来，并让权重在加载时就重排成 QPN8 的 fragment 序。
+
+* [x] QPN 直读 BF16 激活、零 workspace（保 workspace 的"峰值 == 容量"契约）
+* [x] 宽 T 走 CUTLASS（attn_input / linear_add / gdn_input / plain linear；swiglu 回上游阶梯）
+* [x] hook 放在 route 查表之前，只截 A16 政策族；容量绕过 route table
+* [x] 加载时 prepack（`artifact/permute_fp8_qpn.cu`）+ 256 MiB 宽 T 上限
+* 验收：43/43 oracle 通过；端到端 42K prefill **407.8 → 951.2 tok/s**、TTFT **40.2 → 17.4 s**，
+  decode 31.0 → 31.1（短）/ 32.9（42K）；42K 输出逐字相同。详见
+  [fp8-qpn-2026-10-14.md](fp8-qpn-2026-10-14.md)。
+* 生产：`docker-compose.nvfp.yml` 已切到 `ninfer:v100-fp8`（制品同时从 v2 换成同目录的 v3 文件，
+  上游代码只支持 v3 制式）。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
