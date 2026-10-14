@@ -45,7 +45,16 @@ void require_policy(LinearPolicy policy, const char* operation) {
 }
 
 Fp8GdnConvPlan b1_a16_plan(std::int32_t width) {
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：上游把 W=4..6 交给物化路线（5..6 落到
+    // fp8_a16_ksplit_mma），这在 sm_70 上是灾难——ksplit 每次只跑出 ~10% 带宽
+    // （ninfer_gdn_input_proj_conv_snapshot_bench record：T=5 909 us / T=6 913 us，
+    // 而融合核 T=7 396 us、物化 SIMT T=4 334 us）。W=5..6 改走融合核，W=4 仍留在物化
+    // 路线（那里的 SIMT 比融合核更快）。
+#if defined(NINFER_SM70)
+    const bool fused = width <= 3 || (width >= 5 && width <= 10);
+#else
     const bool fused = width <= 3 || (width >= 7 && width <= 10);
+#endif
     return {fused ? Fp8GdnConvScheduleId::FusedA16 : Fp8GdnConvScheduleId::MaterializedA16};
 }
 

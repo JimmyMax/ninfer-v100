@@ -140,8 +140,23 @@ NVFP4 阶段（见 [profiling-nvfp4-2026-10-13.md](profiling-nvfp4-2026-10-13.md
 * [x] 移植 fork `c58a92ba`：Volta `SmallTMaximumSplits` 85 → 560 + `small_t.cuh` 的 256 折叠
       （62K/113K/140K token 上 +0.6%/+1.1%/+1.4%，接受数一致 → 数值无变化）
 * [x] 可用绕行落地：`--adaptive-mtp` 避开定宽 t=5 异常，短 **28.5 → 40.9**、42K **33.1 → 48.0** tok/s
-* ☐ 下一步：t=5 验证遍异常需要 kernel 级剖析（ncu）定位；t=1 还余 1.26×
+* ☑ 真因已定位（S0.8）：**不在注意力**，是 FP8 GDN 输入投影（16384×5120）在 W=5/6 落到
+  sm_70 上只有 10% 带宽的 `fp8_a16_ksplit_mma` → 48 层 × 0.89 ms = 42.8 ms/轮（占 77 ms 轮的 56%）
+* ☐ 下一步：t=1 还余 1.26×（需要新的 kernel 级归因，见 S0.8 的方法学）
 * 详见 [attention-2026-10-14.md](attention-2026-10-14.md)。
+
+### S0.8 nsys 归因 + FP8 GDN 投影 W=5/6 改走融合核 ☑（2026-10-14）
+
+用 nsys（侧车容器 `cuda-nsight-systems-12-8` + `--cuda-graph-trace=node`）对一轮 decode 做
+kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
+
+* [x] nsys 侧车剖析跑通（ncu 因 `ERR_NVGPUCTRPERM` 不可用；图内子 kernel 必须 `--cuda-graph-trace=node`）
+* [x] 归因：`fp8_a16_ksplit_mma_kernel` 48 次/轮、**42.8 ms/轮**（0.89 ms/次 vs 融合核 0.40 ms）
+* [x] 修复：`b1_a16_plan` 在 `NINFER_SM70` 下把 W=5..6 并入融合区间（W=4 仍走 SIMT）
+* 验收：oracle `ctest -R gdn_input` 12/12；短上下文固定 d=4 **28.5 → 44.1** tok/s（+55%）、
+  `--adaptive-mtp` 40.9 → 44.4、27.2K 上下文 49.2 → 52.8；prefill 不变；宽度曲线变平
+* 生产：`ninfer:v100-fusedgdn`
+* 详见 [gdn-fused-5-6-2026-10-14.md](gdn-fused-5-6-2026-10-14.md)。
 
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
