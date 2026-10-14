@@ -30,4 +30,13 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream);
 
+// 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 的 QPN 残差路线；fp16 变体要求激活已按
+// [k, t] 暂存为 FP16。
+#if defined(NINFER_SM70)
+void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                               cudaStream_t stream);
+void fp8_linear_add_qpn_fp16_launch(const Tensor& x, const void* x_fp16, const Weight& weight,
+                                    Tensor& residual, cudaStream_t stream);
+#endif
+
 } // namespace ninfer::ops::detail

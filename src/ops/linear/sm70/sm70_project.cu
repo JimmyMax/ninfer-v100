@@ -111,7 +111,14 @@ void swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& o
 bool covered_format(QType format, std::int32_t k) {
     // The small-T route's chunks: one T2 G128 group, 64 values of the other formats.
     const std::int32_t chunk = format == QType::T2_G128_FP16 ? 128 : 64;
-    return dequantizable_format(format) && k % chunk == 0;
+    if (!dequantizable_format(format) || k % chunk != 0) { return false; }
+#if defined(NINFER_SM70)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 支持的 FP8 形状由 QPN/CUTLASS 内核拥有全部宽度
+    // （与 fork 一致），sm_70 的 SIMT 反量化路线不再认领——否则加载时重排
+    // （VoltaQpnPrepacked）的权重会被按行主序误读。
+    if (format == QType::FP8_E4M3FN_ROW_BF16 && k % 128 == 0 && k / 128 >= 8) { return false; }
+#endif
+    return true;
 }
 
 bool covers(const Weight& w, std::int32_t tokens) {

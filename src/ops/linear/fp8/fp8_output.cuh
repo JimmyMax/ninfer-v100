@@ -30,4 +30,27 @@ struct Fp8ContiguousOutput {
     }
 };
 
+// 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 内核的残差输出策略——把投影结果加进 residual。
+struct Fp8ResidualOutput {
+    __nv_bfloat16* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        const std::int64_t index = static_cast<std::int64_t>(token) * rows + parent_row;
+        data[index] = __float2bfloat16_rn(value + __bfloat162float(data[index]));
+    }
+};
+
+// 拆分式 SwiGLU 把两个投影结果以 FP32 暂存，融合的 SiLU/乘 epilogue 只做一次 BF16 舍入。
+struct Fp8Fp32ContiguousOutput {
+    float* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
+                                          float value) const {
+        data[static_cast<std::int64_t>(token) * rows + parent_row] = value;
+    }
+};
+
 } // namespace ninfer::ops::detail

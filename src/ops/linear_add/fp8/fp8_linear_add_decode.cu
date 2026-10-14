@@ -6,6 +6,9 @@
 #include "ops/linear/fp8/fp8_gemv.cuh"
 #include "ops/linear/fp8/fp8_output.cuh"
 #include "ops/linear_add/fp8/fp8_linear_add_epilogue.cuh"
+#if defined(NINFER_SM70)
+#    include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh" // 本仓库 V100 增量
+#endif
 
 #include <cuda_bf16.h>
 
@@ -48,5 +51,22 @@ void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor&
     }
     throw std::invalid_argument("fp8 linear_add: unsupported problem");
 }
+
+#if defined(NINFER_SM70)
+// 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 内核 + 残差 epilogue（投影结果直接加进 residual）。
+void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                               cudaStream_t stream) {
+    launch_fp8_volta_qpn_with_output(
+        x, weight,
+        Fp8ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n, stream);
+}
+
+void fp8_linear_add_qpn_fp16_launch(const Tensor& x, const void* x_fp16, const Weight& weight,
+                                    Tensor& residual, cudaStream_t stream) {
+    launch_fp8_volta_qpn_with_fp16_activation(
+        x, weight, static_cast<const half*>(x_fp16),
+        Fp8ResidualOutput{static_cast<__nv_bfloat16*>(residual.data), weight.n}, weight.n, stream);
+}
+#endif
 
 } // namespace ninfer::ops::detail
