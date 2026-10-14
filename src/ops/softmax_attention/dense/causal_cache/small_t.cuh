@@ -185,26 +185,40 @@ __device__ __forceinline__ float
 causal_merge_split_statistics(const float* partial_m, const float* partial_l, int q_head, int token,
                               int tokens, int splits, float* weights, float* warp_sums,
                               float* scalars) {
-    static_assert(Geometry::SmallTMaximumSplits <= 256);
+    static_assert(Geometry::SmallTMaximumSplits <= 1200);
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const auto index   = causal_partial_stat_index<Geometry>(q_head, token, tid, tokens);
-    const float m      = tid < splits ? partial_m[index] : -CUDART_INF_F;
-    const float warp_m = warp_max(m);
+    // The long-context small-T policy asks for roughly one split per 480 cached tokens, so a Volta
+    // build runs past blockDim.x well before its 262,144-token context limit (the fold is the
+    // V100 fork's "restore long-context attention scaling" change).
+    float maximum = -CUDART_INF_F;
+    for (int split = tid; split < splits; split += 256) {
+        maximum = fmaxf(maximum, partial_m[causal_partial_stat_index<Geometry>(q_head, token, split,
+                                                                              tokens)]);
+    }
+    const float warp_m = warp_max(maximum);
     if (lane == 0) warp_sums[warp] = warp_m;
     __syncthreads();
     if (warp == 0) {
-        const float maximum = warp_max(tid < 8 ? warp_sums[tid] : -CUDART_INF_F);
-        if (tid == 0) scalars[0] = maximum;
+        const float highest = warp_max(tid < 8 ? warp_sums[tid] : -CUDART_INF_F);
+        if (tid == 0) scalars[0] = highest;
     }
     __syncthreads();
-    const float maximum     = scalars[0];
-    const float l           = tid < splits ? partial_l[index] : 0.0f;
-    const float weight      = l > 0.0f && maximum > -CUDART_INF_F ? expf(m - maximum) : 0.0f;
-    const float denominator = block_reduce_sum<256>(l * weight, warp_sums);
+    maximum = scalars[0];
+    float partial_denominator = 0.0f;
+    for (int split = tid; split < splits; split += 256) {
+        const auto index = causal_partial_stat_index<Geometry>(q_head, token, split, tokens);
+        const float l    = partial_l[index];
+        const float weight = l > 0.0f && maximum > -CUDART_INF_F ? expf(partial_m[index] - maximum) : 0.0f;
+        weights[split] = weight;
+        partial_denominator += l * weight;
+    }
+    const float denominator = block_reduce_sum<256>(partial_denominator, warp_sums);
     if (tid == 0) scalars[1] = denominator;
     __syncthreads();
     const float total = scalars[1];
-    if (tid < splits) weights[tid] = total > 0.0f ? weight : 0.0f;
+    if (total <= 0.0f) {
+        for (int split = tid; split < splits; split += 256) { weights[split] = 0.0f; }
+    }
     __syncthreads();
     return total;
 }

@@ -17,6 +17,7 @@
 #include "quantized_weight.cuh"
 #if defined(NINFER_SM70)
 // 本仓库 V100 增量（docs/v100/PLAN.md）：--prepack 用实测加载时 QPN prepack 的收益。
+#    include "ops/linear/fp8/fp8_prepack_sm70.h"   // 本仓库 V100 增量
 #    include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
 #endif
 
@@ -45,8 +46,9 @@ using ninfer::ops::LinearPolicy;
 namespace {
 
 #if defined(NINFER_SM70)
-// 本仓库 V100 增量：NVFP4 权重是否在 bench 里跑一次加载时 prepack（--prepack）。
+// 本仓库 V100 增量：权重是否在 bench 里跑一次加载时 prepack（--prepack），NVFP4 与 FP8 各一份。
 bool g_prepack_nvfp4 = false;
+bool g_prepack_fp8   = false;
 #endif
 
 // Hardware ceilings come from bench::device_specs(), which derives the DRAM spec from the device
@@ -393,6 +395,7 @@ Options parse_args(int argc, char** argv) {
 #if defined(NINFER_SM70)
         } else if (arg == "--prepack") {
             g_prepack_nvfp4 = true;
+            g_prepack_fp8   = true;
 #endif
         } else if (arg == "--suite") {
             opt.suite      = lower(next("suite"));
@@ -554,6 +557,11 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
     if (qtype == QType::FP8_E4M3FN_ROW_BF16) {
         bench::PackedQuantizedWeight packed = bench::make_fp8_weight(n, k);
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
+#if defined(NINFER_SM70)
+        if (g_prepack_fp8 && (n % 32) == 0 && (k % 128) == 0 && (k / 128) >= 8) {
+            ops::detail::fp8_prepack_qpn_sm70(packed.weight);
+        }
+#endif
         return {std::move(packed.storage), packed.weight, model_bytes};
     }
     const std::uint64_t padded_k_u64 = align_up(static_cast<std::uint64_t>(k), 128);
