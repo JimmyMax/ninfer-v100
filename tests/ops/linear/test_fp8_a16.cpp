@@ -82,17 +82,12 @@ int run_fp8_a16() {
             const std::size_t capacity = ops::linear_workspace_capacity_bytes(
                 QType::FP8_E4M3FN_ROW_BF16, 248320, 5120, policy, 1, 2048);
 #if defined(NINFER_SM70)
-            // 本仓库 V100 增量：FP8 的 QPN 支持形状由 QPN（t<=32，读 BF16 激活，零暂存）与
-            // CUTLASS（t>32，自带暂存）拥有全部宽度；本查询的宽度区间含宽 T，容量来自 CUTLASS。
-            WorkspaceLayoutBuilder layout;
-            (void)layout.alloc(DType::BF16, {248320, 2048});
-            // AllowA8/AllowA4 归上游自己的张量核路线（容量 0：本形状没有 A8 分段），A16 家族
-            // 才由 QPN/CUTLASS 接管。
-            const std::size_t expected =
-                (policy == ops::LinearPolicy::AllowA8 || policy == ops::LinearPolicy::AllowA4)
-                    ? 0
-                    : layout.peak_bytes(1) + ops::detail::fp8_cutlass_sm70_workspace_bytes(
-                                                 248320, 5120, 2048);
+            // 本仓库 V100 增量：输出头（1.27 GB）的反量化暂存会主导 arena，所以它走分块的
+            // QPN（零暂存）：t <= 32 时一次调用，更宽时每 32 列重读一遍权重——而 lm_head 在
+            // prefill 里只算最后几行（见 models/qwen3_5/execution/text.cpp），宽 T 只出现在
+            // 这个测试里。A8/A4 策略同样归零（本形状没有 A8 分段，且 Volta 路线只在 A16 家族
+            // 策略下接管）。
+            const std::size_t expected = 0;
 #else
             // sm_70's wide route is the one A16 route that holds workspace (ops/linear/sm70).
             const std::size_t expected =

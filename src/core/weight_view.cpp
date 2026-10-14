@@ -145,7 +145,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.code_bytes_per_row = mul(k / block.elements, block.bytes);
         out.code_bytes         = mul(n, out.code_bytes_per_row);
         out.scale_offset       = out.code_bytes;
-    } else if (layout == QuantLayout::RowScale) {
+    } else if (layout == QuantLayout::RowScale || is_volta_qpn_prepacked_fp8(format, layout)) {
         if (format != QType::FP8_E4M3FN_ROW_BF16) {
             throw std::invalid_argument("RowScale requires row-scaled FP8");
         }
@@ -317,7 +317,8 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
     const auto planes = weight_row_planes(region);
-    if ((g.layout == QuantLayout::RowScale || is_block_scale_nvfp4(g.layout)) &&
+    if ((g.layout == QuantLayout::RowScale || is_volta_qpn_prepacked_fp8(g.format, g.layout) ||
+         is_block_scale_nvfp4(g.layout)) &&
         !is_complete_weight(view)) {
         throw std::invalid_argument(
             "this native Weight input requires a complete FP8/NVFP4 parent");
@@ -337,7 +338,8 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_nb[0] = 2;
         out.scale_nb[1] = static_cast<std::int64_t>(g.scale_bytes_per_row);
         out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.n;
-    } else if (g.layout == QuantLayout::RowScale) {
+    } else if (g.layout == QuantLayout::RowScale ||
+               is_volta_qpn_prepacked_fp8(g.format, g.layout)) {
         out.scale_dtype = DType::BF16;
         out.scale_ne[0] = out.n;
         out.scale_nb[0] = 2;

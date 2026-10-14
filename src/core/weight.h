@@ -113,6 +113,19 @@ static_assert((1 << kRowSplitPanelShift) == kRowSplitPanelRows,
 // 本仓库 V100 增量（docs/v100/PLAN.md）：VoltaQpnPrepacked 是 BlockScaleK16M128x4 的字节级置换，
 // 两个布局的平面几何、尺度坐标、divisor 平面完全一致，只有码字/尺度的读取顺序不同。凡是问
 // “这个 NVFP4 权重的平面在哪里”都应问这里，而不是和 BlockScaleK16M128x4 直接比较。
+// 本仓库 V100 增量（docs/v100/PLAN.md）：QuantLayout::VoltaQpnPrepacked 是源布局码字平面的
+// 尺寸不变置换，NVFP4（BlockScaleK16M128x4）与 FP8（RowScale）共用同一个枚举值，所以按格式
+// 区分的两个判据各写一份；尺度平面与全部元数据都保持源布局的形状。
+[[nodiscard]] constexpr bool is_volta_qpn_prepacked_fp8(QType format,
+                                                        QuantLayout layout) noexcept {
+    return layout == QuantLayout::VoltaQpnPrepacked && format == QType::FP8_E4M3FN_ROW_BF16;
+}
+
+[[nodiscard]] constexpr bool is_volta_qpn_prepacked_nvfp4(QType format,
+                                                          QuantLayout layout) noexcept {
+    return layout == QuantLayout::VoltaQpnPrepacked && format == QType::NVFP4;
+}
+
 [[nodiscard]] constexpr bool is_block_scale_nvfp4(QuantLayout layout) {
     return layout == QuantLayout::BlockScaleK16M128x4 ||
            layout == QuantLayout::VoltaQpnPrepacked;

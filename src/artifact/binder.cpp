@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 
 #include "artifact/framing.h"
+#include "artifact/permute_fp8_qpn.h"
 #include "artifact/permute_nvfp4_qpn.h"
 #include "artifact/permute_row_split.h"
 #include "artifact/transcode.h"
@@ -138,7 +139,9 @@ void Binder::qpn_prepack_device(ObjectHandle object) {
     if (!demand.device) {
         throw ArtifactError(tensor.id + ": the QPN prepack requires a device placement");
     }
-    if (!nvfp4_qpn_prepack_supported(reader_.geometry(object))) {
+    // 本仓库 V100 增量：NVFP4（MLP 投影）与 FP8（注意力/GDN 投影）各有一个片段序。
+    if (!nvfp4_qpn_prepack_supported(reader_.geometry(object)) &&
+        !fp8_qpn_prepack_supported(reader_.geometry(object))) {
         throw ArtifactError(tensor.id + ": object cannot take the QPN prepack");
     }
     demand.qpn_prepack = true;

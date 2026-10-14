@@ -16,6 +16,18 @@
 
 namespace ninfer::ops::detail {
 namespace {
+#if defined(NINFER_SM70)
+// 本仓库 V100 增量（docs/v100/PLAN.md）：宽 T 的 CUTLASS 路线要把权重整块反量化成 FP16
+// （n*k*2 字节）。当这块暂存会主导 arena 时（1.27 GB 的输出头会变成 2.54 GB，而引擎按最宽
+// 上下文预留它），改用分块 QPN：t <= 32 时它本来就只读一遍权重，而输出头在 prefill 里只算
+// 最后几行。阈值只决定暂存从哪儿来，两条路线都认预打包布局。
+constexpr std::uint64_t kFp8CutlassWeightLimitBytes = 256ULL << 20;
+
+[[nodiscard]] bool fp8_wide_uses_cutlass(std::int32_t n, std::int32_t k) noexcept {
+    return static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k) * 2U <=
+           kFp8CutlassWeightLimitBytes;
+}
+#endif
 const std::array kShapes{&kFp8N14336K5120, &kFp8N16384K5120, &kFp8N34816K5120,
                          &kFp8N5120K6144,  &kFp8N5120K17408, &kFp8N248320K5120};
 const std::array kUnifiedShapes{&unified::kFp8N14336K5120, &unified::kFp8N16384K5120,
@@ -36,11 +48,11 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
     if (min_tokens <= 0 || max_tokens < min_tokens)
         throw std::invalid_argument("fp8 linear workspace: invalid token interval");
 #if defined(NINFER_SM70)
-    // 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 支持的 FP8 形状在 sm_70 上由 QPN（t<=32，零
-    // 暂存）与 CUTLASS（t>32，自带暂存）拥有全部宽度。容量必须来自同一决策而不是 route
-    // table——测试会强制 unified 表，而钩子不受表影响。
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 支持的 FP8 形状在 sm_70 上由 QPN（t<=32，
+    // 零暂存）与 CUTLASS（t>32，自带暂存；暂存过大的形状仍走分块 QPN）拥有全部宽度。容量
+    // 必须来自同一决策而不是 route table——测试会强制 unified 表，而钩子不受表影响。
     if (fp8_volta_qpn_takes(policy, n, k, std::min(max_tokens, kFp8VoltaQpnMaxTokens))) {
-        if (max_tokens <= kFp8VoltaQpnMaxTokens) { return 0; }
+        if (max_tokens <= kFp8VoltaQpnMaxTokens || !fp8_wide_uses_cutlass(n, k)) { return 0; }
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::BF16, {n, max_tokens});
         return layout.peak_bytes(1) + fp8_cutlass_sm70_workspace_bytes(n, k, max_tokens);
@@ -67,8 +79,22 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     // tensor-core GEMM）。必须在 route-table 检查之前拦截。
     if (fp8_volta_qpn_takes(policy, weight.n, weight.k,
                                 std::min(x.ne[1], kFp8VoltaQpnMaxTokens))) {
-        if (x.ne[1] <= kFp8VoltaQpnMaxTokens) {
-            launch_fp8_volta_qpn(x, weight, out, stream);
+        if (x.ne[1] <= kFp8VoltaQpnMaxTokens || !fp8_wide_uses_cutlass(weight.n, weight.k)) {
+            // QPN 直接写进 out，按 32 列分块（t <= 32 时只有一块，等价于解码宽度的那一次）。
+            for (std::int32_t token_begin = 0; token_begin < x.ne[1];
+                 token_begin += kFp8VoltaQpnMaxTokens) {
+                const std::int32_t active =
+                    std::min(kFp8VoltaQpnMaxTokens, x.ne[1] - token_begin);
+                auto* input = static_cast<std::uint8_t*>(x.data) +
+                              static_cast<std::int64_t>(token_begin) * weight.k *
+                                  sizeof(std::uint16_t);
+                auto* output = static_cast<std::uint8_t*>(out.data) +
+                               static_cast<std::int64_t>(token_begin) * weight.n *
+                                   sizeof(std::uint16_t);
+                Tensor input_chunk(input, DType::BF16, {weight.k, active});
+                Tensor output_chunk(output, DType::BF16, {weight.n, active});
+                launch_fp8_volta_qpn(input_chunk, weight, output_chunk, stream);
+            }
             return;
         }
         if (workspace == nullptr) {

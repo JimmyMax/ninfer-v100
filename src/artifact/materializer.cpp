@@ -1,6 +1,7 @@
 #include "artifact/materializer.h"
 
 #include "artifact/framing.h"
+#include "artifact/permute_fp8_qpn.h"
 #include "artifact/permute_nvfp4_qpn.h"
 #include "artifact/permute_row_split.h"
 #include "artifact/transcode.h"
@@ -328,8 +329,13 @@ UploadTotals upload_device_objects(const Reader& reader,
     for (const auto& placement : placements) {
         if (!placement.qpn_prepack) { continue; }
         const ScopedRank bound(device, placement.rank);
-        permute_nvfp4_to_qpn(placement_geometry(reader, placement),
-                             bases[placement.rank] + placement.offset, nullptr);
+        const WeightGeometry geometry = placement_geometry(reader, placement);
+        std::byte* const base         = bases[placement.rank] + placement.offset;
+        if (geometry.format == QType::FP8_E4M3FN_ROW_BF16) {
+            permute_fp8_to_qpn(geometry, base, nullptr);
+        } else {
+            permute_nvfp4_to_qpn(geometry, base, nullptr);
+        }
         permuted_rank[placement.rank] = true;
     }
     for (std::size_t rank = 0; rank < permuted_rank.size(); ++rank) {
@@ -514,9 +520,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             geometry.layout = QuantLayout::RowSplitPanel;
         }
         if (placement.qpn_prepack) {
-            // 本仓库 V100 增量：QPN 的片段序要求 NVFP4 的 BlockScaleK16M128x4 几何。
-            if (geometry.format != QType::NVFP4 ||
-                geometry.layout != QuantLayout::BlockScaleK16M128x4) {
+            // 本仓库 V100 增量：QPN 的片段序要求 NVFP4 的 BlockScaleK16M128x4 几何或 FP8 的
+            // RowScale 几何（两者的码字平面各自有一个尺寸不变的片段置换）。
+            const bool nvfp4_layout = geometry.format == QType::NVFP4 &&
+                                      geometry.layout == QuantLayout::BlockScaleK16M128x4;
+            const bool fp8_layout = geometry.format == QType::FP8_E4M3FN_ROW_BF16 &&
+                                    geometry.layout == QuantLayout::RowScale;
+            if (!nvfp4_layout && !fp8_layout) {
                 throw ArtifactError("a QPN prepack placement names an object without the layout");
             }
             geometry.layout = QuantLayout::VoltaQpnPrepacked;

@@ -66,7 +66,7 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
         weight.qdata == nullptr || weight.scales == nullptr || weight.qhigh != nullptr ||
         weight.high_plane_bytes != 0 || weight.payload_bytes < geometry.required_payload_bytes ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
-        throw std::invalid_argument(std::string(operation) + ": invalid FP8 weight");
+throw std::invalid_argument(std::string(operation) + ": invalid FP8 weight");
     }
 
     const auto* payload = static_cast<const std::byte*>(weight.payload);

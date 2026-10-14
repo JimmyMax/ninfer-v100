@@ -1,5 +1,6 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/permute_fp8_qpn.h"    // 本仓库 V100 增量：FP8 QPN 加载时重排
 #include "artifact/permute_nvfp4_qpn.h" // 本仓库 V100 增量：NVFP4 QPN 加载时重排
 #include "artifact/permute_row_split.h"
 
@@ -131,6 +132,25 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
                   (geometry.shape[1] == 6144 || geometry.shape[1] == 17408)));
             if (geometry.format == QType::NVFP4 && mlp_shape &&
                 artifact::nvfp4_qpn_prepack_supported(geometry)) {
+                bindings.binder.qpn_prepack_device(part.object);
+            }
+            // 本仓库 V100 增量：FP8 的投影同理在 sm_70 上由 QPN（t <= 32）与 CUTLASS（更宽）
+            // 拥有全部宽度：注意力的融合输入投影（14336x5120）、输出投影（5120x6144）、GDN
+            // 输入投影（16384x5120）与残差形状（5120x17408，走 linear_add）。
+            //
+            // 不在名单里的：FP8 的 SwiGLU gate_up（34816x5120）—— 它的宽 T 交回上游阶梯（那条
+            // 路线要求激活之前是 FP32，且按行主序读），词汇表/嵌入同理（嵌入是按行 gather，而
+            // 输出头虽然安全却与嵌入同形状，无法用形状区分，收益也只有一轮 2.3 ms 里的一点）。
+            // GDN 的 16384x5120 不在名单里：这个模型里它的消费者是 fused 的
+            // fp8_gdn_input_proj_conv_record（按行主序读，会明确拒绝预打包布局）。
+            const bool fp8_projection =
+                geometry.shape.size() == 2 &&
+                ((geometry.shape[0] == 14336 && geometry.shape[1] == 5120) ||
+                 (geometry.shape[0] == 5120 &&
+                  (geometry.shape[1] == 6144 || geometry.shape[1] == 17408)));
+            if (geometry.format == QType::FP8_E4M3FN_ROW_BF16 && fp8_projection &&
+                only_projections.at(part.object.index) &&
+                artifact::fp8_qpn_prepack_supported(geometry)) {
                 bindings.binder.qpn_prepack_device(part.object);
             }
         }
