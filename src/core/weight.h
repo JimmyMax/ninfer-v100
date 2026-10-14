@@ -110,6 +110,14 @@ inline constexpr int kRowSplitPanelShift = 2;
 static_assert((1 << kRowSplitPanelShift) == kRowSplitPanelRows,
               "the panel row count is addressed by shifting, so it must be a power of two");
 
+// 本仓库 V100 增量（docs/v100/PLAN.md）：VoltaQpnPrepacked 是 BlockScaleK16M128x4 的字节级置换，
+// 两个布局的平面几何、尺度坐标、divisor 平面完全一致，只有码字/尺度的读取顺序不同。凡是问
+// “这个 NVFP4 权重的平面在哪里”都应问这里，而不是和 BlockScaleK16M128x4 直接比较。
+[[nodiscard]] constexpr bool is_block_scale_nvfp4(QuantLayout layout) {
+    return layout == QuantLayout::BlockScaleK16M128x4 ||
+           layout == QuantLayout::VoltaQpnPrepacked;
+}
+
 // Kernels address both layouts with one expression, where a shift of zero collapses the panel form
 // to the row-major one. Nothing but this decides which a kernel reads.
 [[nodiscard]] constexpr int row_split_panel_shift(QuantLayout layout) {

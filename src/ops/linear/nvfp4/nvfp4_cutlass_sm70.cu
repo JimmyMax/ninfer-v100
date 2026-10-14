@@ -42,6 +42,27 @@ __device__ __forceinline__ void decode_e2m1_word_exact(std::uint32_t packed, flo
     }
 }
 
+// 把预打包片段的 4 字节（8 个 k 值）精确解码为 8 个 fp16。
+//
+// 片段里的字节不是按 k 顺序排的：加载时重排把每个 16-k 组切成两个 4 字节半组，半组内相邻的 k
+// 对交错存放 —— byte0 存 (k+0, k+2)、byte1 存 (k+4, k+6)、byte2 存 (k+1, k+3)、
+// byte3 存 (k+5, k+7)（见 artifact/permute_nvfp4_qpn.cu 的 order[]）。fork 的移位技巧恰好
+// 还原了这个顺序（v0 = (byte0 低位, byte2 低位) = (k+0, k+1)…），所以它不需要 unshuffle；
+// 顺序读字节则会把 k 读成置换后的次序，权重全错。
+__device__ __forceinline__ void decode_qpn_e2m1_word_exact(std::uint32_t packed,
+                                                           float coefficient, half (&out)[8]) {
+    constexpr int qpn_byte[8]  = {0, 2, 0, 2, 1, 3, 1, 3};
+    constexpr bool qpn_high[8] = {false, false, true, true, false, false, true, true};
+#pragma unroll
+    for (int index = 0; index < 8; ++index) {
+        __nv_fp4x2_e2m1 pair;
+        pair.__x = static_cast<std::uint8_t>((packed >> (8 * qpn_byte[index])) & 0xffu);
+        const float2 decoded = static_cast<float2>(pair);
+        const float value    = qpn_high[index] ? decoded.y : decoded.x;
+        out[index]           = __float2half(value * coefficient);
+    }
+}
+
 // The artifact stores adjacent E2M1 values in each code byte and one E4M3 scale per K16 group.
 // Scales use the BlockScaleK16M128x4 swizzle. Materializing once is intentionally a wide-T
 // strategy: CUTLASS can reuse the resulting FP16 matrix across every token tile instead of
@@ -105,7 +126,7 @@ __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes
     const float coefficient =
         decode_e4m3_scale_exact(scales[tuple]) * inverse_weight_divisor;
     half values[8];
-    decode_e2m1_word_exact(packed_word, coefficient, values);
+    decode_qpn_e2m1_word_exact(packed_word, coefficient, values);
     auto* destination = reinterpret_cast<uint4*>(
         out + static_cast<std::int64_t>(row) * k + segment * 8);
     *destination = *reinterpret_cast<const uint4*>(values);

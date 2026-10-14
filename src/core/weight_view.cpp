@@ -167,7 +167,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes         = mul(n, 2);
         out.bytes               = mul(n, out.row_stride_bytes);
         return out;
-    } else if (layout == QuantLayout::BlockScaleK16M128x4) {
+    } else if (is_block_scale_nvfp4(layout)) {
         if (format != QType::NVFP4 || n % 128 || k % 64) {
             throw std::invalid_argument("NVFP4 BlockScale requires N%128=0 and K%64=0");
         }
@@ -233,7 +233,7 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
         group >= geometry.padded_columns / geometry.group_size) {
         throw std::invalid_argument("weight scale coordinate exceeds its parent");
     }
-    if (geometry.layout == QuantLayout::BlockScaleK16M128x4) {
+    if (is_block_scale_nvfp4(geometry.layout)) {
         const auto inner = row % 128;
         return geometry.scale_offset + (row / 128 * (geometry.shape[1] / 64) + group / 4) * 512 +
                inner % 32 * 16 + inner / 32 * 4 + group % 4;
@@ -271,7 +271,7 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     if (g.high_bytes) {
         out.high = parent.data + g.high_offset + out.row_begin * out.high_row_bytes;
     }
-    out.swizzled_scales = g.layout == QuantLayout::BlockScaleK16M128x4;
+    out.swizzled_scales = is_block_scale_nvfp4(g.layout);
     if (g.scale_bytes) {
         out.scales = parent.data + g.scale_offset +
                      (out.swizzled_scales ? 0 : out.row_begin * out.scale_row_bytes);
@@ -317,7 +317,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
     }
     const auto planes = weight_row_planes(region);
-    if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4) &&
+    if ((g.layout == QuantLayout::RowScale || is_block_scale_nvfp4(g.layout)) &&
         !is_complete_weight(view)) {
         throw std::invalid_argument(
             "this native Weight input requires a complete FP8/NVFP4 parent");
@@ -347,7 +347,7 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_ne[0] = out.n;
         out.scale_nb[0] = static_cast<std::int64_t>(g.row_stride_bytes);
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[0] * out.n;
-    } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
+    } else if (is_block_scale_nvfp4(g.layout)) {
         out.scale_dtype         = DType::FP8_E4M3FN;
         out.weight_divisors     = region.parent->data + g.divisor_offset;
         out.weight_divisor_rows = dimension(g.shape[0] / g.divisor_count);

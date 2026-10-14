@@ -58,7 +58,10 @@ Nvfp4WeightGeometry validate_nvfp4_weight(const Weight& weight, const char* oper
                     sizeof(float), operation),
         operation);
 
-    if (weight.qtype != QType::NVFP4 || weight.layout != QuantLayout::BlockScaleK16M128x4 ||
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：加载时重排成 QPN 片段序的权重仍是同一块载荷，
+    // 只是码字/尺度的顺序不同，几何与尺寸都不变，所以同样合法。
+    const bool layout = is_block_scale_nvfp4(weight.layout);
+    if (weight.qtype != QType::NVFP4 || !layout ||
         weight.scale_dtype != DType::FP8_E4M3FN || weight.group_size != 16 || weight.group != 16 ||
         weight.ndim != 2 || weight.shape[0] != weight.n || weight.shape[1] != weight.k ||
         weight.padded_shape[0] != weight.n || weight.padded_shape[1] != weight.k ||
