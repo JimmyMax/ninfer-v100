@@ -21,6 +21,26 @@ __global__ void fp8_stage_bf16_activation_kernel(const __nv_bfloat16* __restrict
 }
 } // namespace
 
+// 本仓库 V100 增量：GDN 输入投影（16384x5120）的 QPN 激活暂存区。固定 320 KiB（k x 32 的
+// FP16），在模型加载时预留一次，运行期只读指针（见 fp8_launch.h 的契约说明）。
+namespace {
+// GDN 输入投影是 16384x5120 的固定形状，激活暂存区按 k x 32 的 FP16 计（320 KiB）。
+constexpr std::size_t kGdnQpnStageBytes = 5120ull * 32ull * 2ull;
+void* g_gdn_qpn_stage = nullptr;
+} // namespace
+
+void* fp8_gdn_qpn_stage_reserve() {
+    if (g_gdn_qpn_stage == nullptr) {
+        if (cudaMalloc(&g_gdn_qpn_stage, kGdnQpnStageBytes) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_gdn_qpn_stage = nullptr;
+        }
+    }
+    return g_gdn_qpn_stage;
+}
+
+void* fp8_gdn_qpn_stage_buffer() { return g_gdn_qpn_stage; }
+
 void fp8_stage_bf16_activation_sm70(const Tensor& x, void* fp16_out, cudaStream_t stream) {
     const std::int64_t count = x.numel();
     fp8_stage_bf16_activation_kernel<<<static_cast<int>((count + 255) / 256), 256, 0, stream>>>(

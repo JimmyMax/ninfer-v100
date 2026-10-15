@@ -10,6 +10,7 @@
 #endif
 
 #include <cstdint>
+#include <cuda_fp16.h>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -67,6 +68,25 @@ std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int
 
 void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：预打包过的权重只能由布局感知的路线消费。
+    // GDN 输入投影（16384x5120）在解码/验证宽度上走 QPN：上游把 W=4..6 交给物化路线，
+    // 其中 5..6 落到只有 ~10% 带宽的 fp8_a16_ksplit_mma（48 层 x 0.89 ms = 42.8 ms/轮，
+    // 占满 77 ms 轮的 56%），QPN 只要 ~0.30 ms。更宽由上层 CUTLASS / 旧阶梯接管。
+    if (is_volta_qpn_prepacked_fp8(weight.qtype, weight.layout) &&
+        x.ne[1] <= kFp8VoltaQpnMaxTokens) {
+        // 加载时预留的 FP16 激活暂存区（见 fp8_launch.h）：同形状同布局实测 548 -> 768 GB/s。
+        // 暂存区缺失（未预留）时退回 bf16 直读路径，不影响正确性。
+        if (fp8_gdn_qpn_stage_buffer() != nullptr) {
+            void* const stage = fp8_gdn_qpn_stage_buffer();
+            fp8_stage_bf16_activation_sm70(x, stage, stream);
+            launch_fp8_gdn_input_volta_qpn(x, weight, qkv, z, stage, stream);
+            return;
+        }
+        launch_fp8_gdn_input_volta_qpn(x, weight, qkv, z, nullptr, stream);
+        return;
+    }
+#endif
     if (x.ne[1] == 1) {
         fp8_gdn_input_decode_launch(x, weight, qkv, z, stream);
     } else {
@@ -93,6 +113,13 @@ void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, 
                 throw std::invalid_argument("fp8 Volta GDN prefill requires workspace");
             }
             fp8_gdn_input_cutlass_sm70_launch(x, weight, qkv, z, *workspace, stream);
+            return;
+        }
+        // 与 a16 dispatch 一致：用加载时预留的固定暂存区把激活暂存成 FP16。
+        if (fp8_gdn_qpn_stage_buffer() != nullptr) {
+            void* const stage = fp8_gdn_qpn_stage_buffer();
+            fp8_stage_bf16_activation_sm70(x, stage, stream);
+            launch_fp8_gdn_input_volta_qpn(x, weight, qkv, z, stage, stream);
             return;
         }
         launch_fp8_gdn_input_volta_qpn(x, weight, qkv, z, nullptr, stream);

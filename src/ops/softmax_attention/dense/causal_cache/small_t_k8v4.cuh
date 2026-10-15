@@ -630,7 +630,10 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     }
     const int active_splits =
         causal_small_t_quantized_active_splits<Geometry>(window, split_count, tokens);
-    __shared__ float weights[256], warp_sums[8], scalars[2];
+    // 本仓库 V100 增量：折叠合并写到 weights[splits-1]，而 splits 在 Volta 上可到
+    // Geometry::SmallTMaximumSplits（560 x SmallTSplitScale）；原来写死 256，
+    // splits > 256（例：d256-h16-kv2 在 65536 keys 下 273）时越界写，数值崩坏。
+    __shared__ float weights[Geometry::SmallTMaximumSplits], warp_sums[8], scalars[2];
     __shared__ float normalized[256];
     const float head_l = causal_merge_split_statistics<Geometry>(
         partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);

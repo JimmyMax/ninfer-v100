@@ -39,14 +39,21 @@ __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, 
     const std::uint16_t packed = *reinterpret_cast<const std::uint16_t*>(source);
     const float2 weight = decode_fp8_e4m3x2(packed);
     cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
-    out_row[pair_idx * 2]     = cutlass::half_t(weight.x);
-    out_row[pair_idx * 2 + 1] = cutlass::half_t(weight.y);
+    // 本仓库 V100 增量：两个值一次 __float22half2_rn，与逐元素转换同为 RN，数值一致。
+    *reinterpret_cast<half2*>(out_row + pair_idx * 2) = __float22half2_rn(weight);
 }
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
                                     cutlass::half_t* __restrict__ out, std::int64_t count) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
+    // 本仓库 V100 增量：一对一次，减半转换指令（bf16->fp32 精确，fp32->fp16 RN）。
+    const std::int64_t pair = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t i    = pair * 2;
+    if (i + 1 < count) {
+        const float2 widened = make_float2(__bfloat162float(in[i]), __bfloat162float(in[i + 1]));
+        *reinterpret_cast<half2*>(out + i) = __float22half2_rn(widened);
+    } else if (i < count) {
+        out[i] = cutlass::half_t(__bfloat162float(in[i]));
+    }
 }
 
 __global__ void scale_rows_kernel(__nv_bfloat16* __restrict__ data,
@@ -122,7 +129,7 @@ void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Work
         w.layout == QuantLayout::VoltaQpnPrepacked, weight);
     CUDA_CHECK(cudaGetLastError());
     const std::int64_t input_count = static_cast<std::int64_t>(t) * k;
-    bf16_to_fp16_kernel<<<static_cast<int>((input_count + 255) / 256), 256, 0, stream>>>(
+    bf16_to_fp16_kernel<<<static_cast<int>(((input_count + 1) / 2 + 255) / 256), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), input, input_count);
     CUDA_CHECK(cudaGetLastError());
 

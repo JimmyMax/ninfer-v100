@@ -3,6 +3,10 @@
 #include "artifact/permute_fp8_qpn.h"    // 本仓库 V100 增量：FP8 QPN 加载时重排
 #include "artifact/permute_nvfp4_qpn.h" // 本仓库 V100 增量：NVFP4 QPN 加载时重排
 #include "artifact/permute_row_split.h"
+#if defined(NINFER_SM70)
+// 本仓库 V100 增量：加载时预留 GDN 输入投影的 FP16 激活暂存区（图捕获之前）。
+#    include "ops/linear/fp8/fp8_launch.h"
+#endif
 
 #include <stdexcept>
 #include <unordered_map>
@@ -60,6 +64,11 @@ void apply_storage_trades(Bindings& bindings, const Config& config, const ModelW
 
 void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
 #if defined(NINFER_SM70)
+    // 本仓库 V100 增量：GDN 输入投影的 QPN 路线需要一块固定 FP16 激活暂存区（320 KiB）。
+    // 它不向 arena 记账，所以在**这里**（模型加载、任何 CUDA graph 捕获之前）预留一次，
+    // 运行期只读指针；捕获中绝不 cudaMalloc（否则捕获被 cudaErrorStreamCaptureInvalidated
+    // 打断）。实测同形状同布局下 bf16 激活 548 GB/s vs 暂存 fp16 768 GB/s。
+    (void)ops::detail::fp8_gdn_qpn_stage_reserve();
     // sm_70's projection routes (ops/linear/sm70) read row-split codes in the panel layout, where
     // one 128-byte line holds a k-group's records of four rows: row-major records cost the decode
     // reads 10 to 40% of the card's bandwidth. The text layers' attention, GDN and dense MLP
@@ -100,6 +109,11 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
         take(weights.mtp->input_projection);
         ffn(weights.mtp->layer);
     }
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：输出头（248320x5120 FP8，每轮一次）也纳入——
+    // sm_70 上 QPN 读预打包片段序比行主序快 ~1.5x（实测 1.61 ms vs 2.5 ms 一次），master
+    // 也是这么做的。词表嵌入虽然同形状，但不在 projections 名单里（它按行 gather），所以
+    // 不会被重排；这也是“同形状不可区分”的正确解法：按权重角色而不是按形状过滤。
+    take(weights.text.output_head);
     std::unordered_map<std::size_t, bool> only_projections;
     for (std::size_t i = 0; i < bindings.weights.size(); ++i) {
         for (const auto& part : bindings.weights[i].reference.binding.parts) {
@@ -139,13 +153,17 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
             // 输入投影（16384x5120）与残差形状（5120x17408，走 linear_add）。
             //
             // 不在名单里的：FP8 的 SwiGLU gate_up（34816x5120）—— 它的宽 T 交回上游阶梯（那条
-            // 路线要求激活之前是 FP32，且按行主序读），词汇表/嵌入同理（嵌入是按行 gather，而
-            // 输出头虽然安全却与嵌入同形状，无法用形状区分，收益也只有一轮 2.3 ms 里的一点）。
-            // GDN 的 16384x5120 不在名单里：这个模型里它的消费者是 fused 的
-            // fp8_gdn_input_proj_conv_record（按行主序读，会明确拒绝预打包布局）。
+            // 路线要求激活之前是 FP32，且按行主序读）。词表嵌入同理（按行 gather）；输出头则
+            // 通过 projections 名单加入（它是 FP8、每轮一次、QPN 预打包序比行主序快 1.5x）。
+            // GDN 的 16384x5120 与注意力并列为两大投影之一（每层 1 个、共 48 个 GDN 层），
+            // 也在名单里：它的解码宽度（W=5/6 等）此前落在只有 ~10% 带宽的 ksplit 小 MMA 上，
+            // 是每轮最大的一笔开销。纳入 prepack 后由布局感知的路线独占：t<=32 走 QPN，
+            // t>=33 走 CUTLASS，行主序的阶梯（SIMT/ksplit/gemm）不再被选中。
             const bool fp8_projection =
                 geometry.shape.size() == 2 &&
                 ((geometry.shape[0] == 14336 && geometry.shape[1] == 5120) ||
+                 (geometry.shape[0] == 16384 && geometry.shape[1] == 5120) ||
+                 (geometry.shape[0] == 248320 && geometry.shape[1] == 5120) ||
                  (geometry.shape[0] == 5120 &&
                   (geometry.shape[1] == 6144 || geometry.shape[1] == 17408)));
             if (geometry.format == QType::FP8_E4M3FN_ROW_BF16 && fp8_projection &&

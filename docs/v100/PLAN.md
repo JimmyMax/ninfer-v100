@@ -158,6 +158,28 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
 * 生产：`ninfer:v100-fusedgdn`
 * 详见 [gdn-fused-5-6-2026-10-14.md](gdn-fused-5-6-2026-10-14.md)。
 
+### S0.9 与 master 的差距收敛：解码追平 + prefill 残差定位 ☑/◐（2026-10-15）
+
+以 `ninfer:v1.5.0`（仓库 `master` 分支的构建）为基准，逐算子定位并消除差距。
+
+* [x] **FP8 GDN 输入投影走上 QPN**：`fp8_gdn_input_a16_dispatch` 对预打包权重且 `t<=32` 走 QPN，
+      `b1_a16_plan` 在 sm_70 上一律物化，加载时把 16384×5120 纳入 prepack。
+      收益：T=5 每层 909 → 295 µs，固定 d=4 端到端 **28.5 → 44.1 tok/s（+55%）**。
+* [x] **输出头（248320×5120）纳入 prepack**（按权重角色而非形状过滤）：约 1 ms/轮。
+* [x] **FP8 QPN 的 FP16 激活暂存**（attn 输入、plain linear 用 arena；GDN 输入用加载期预留的
+      320 KiB 固定缓冲，图捕获中绝不 malloc）：同形状同布局 548 → 768 GB/s。
+* [x] **小 T 分裂折叠越界修复**（正确性）：三处 reduce 的 `weights` 缓冲按几何上限分配，
+      修掉 `d256-h16-kv2` 在 65536 keys（273 分裂）下的数值崩坏。
+* 验收（干净单实例对照）：解码每遍成本四个配置全部持平（短/27K × 无投机/MTP4，差 0.2–2.2%）；
+  生产配置（MTP4）短上下文 **87.0 vs 62.9 tok/s（+38%）**，27K 每轮持平（41.30 vs 41.21 ms）。
+* ☐ **prefill 残差 5–14%**：本线 876 vs master 1020 tok/s（27K）。已排除 chunk 粒度
+  （1024/2048/4096/8192）、prompt 开关（pack_gqa/pv_f16/prompt_fast）、prompt 内核选择
+  （master 的 `prompt_volta` 是 quadratic，移植后 87.8 tok/s）、反量化向量化（±2% 噪声内）、
+  `--prefill-cublas`（+3%）、`--fast-prefill-kernel`（+2.5%）。已构建 `master` 分支参考二进制
+  以便做 prefill 逐算子对账。
+* 生产：`ninfer:v100-deq`
+* 详见 [gap-closure-2026-10-15.md](gap-closure-2026-10-15.md)。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。

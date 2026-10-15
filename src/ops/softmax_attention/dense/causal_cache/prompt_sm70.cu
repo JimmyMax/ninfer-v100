@@ -13,6 +13,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -429,6 +430,10 @@ void launch(const Tensor& q, const Tensor& positions, const std::int32_t* valid_
 bool causal_attention_prompt_sm70_applies(KvCacheStorage storage, std::int32_t batch) {
 #if defined(NINFER_SM70)
     (void)storage; // every KV storage has a coding here
+    // 实验开关：NINFER_PROMPT_SM70_OFF=1 时交回通用 prompt 路径，用于量化本内核的收益。
+    if (const char* off = std::getenv("NINFER_PROMPT_SM70_OFF"); off != nullptr && off[0] == '1') {
+        return false;
+    }
     return batch == 1;
 #else
     (void)storage;

@@ -35,10 +35,12 @@ __device__ __forceinline__ void decode_e2m1_word_exact(std::uint32_t packed, flo
 #pragma unroll
     for (int byte = 0; byte < 4; ++byte) {
         __nv_fp4x2_e2m1 pair;
-        pair.__x              = static_cast<std::uint8_t>((packed >> (8 * byte)) & 0xffu);
-        const float2 decoded  = static_cast<float2>(pair);
-        out[2 * byte + 0]     = __float2half(decoded.x * coefficient);
-        out[2 * byte + 1]     = __float2half(decoded.y * coefficient);
+        pair.__x             = static_cast<std::uint8_t>((packed >> (8 * byte)) & 0xffu);
+        const float2 decoded = static_cast<float2>(pair);
+        // 本仓库 V100 增量：两个值一次 __float22half2_rn——与逐元素 __float2half 同为
+        // round-to-nearest，数值完全一致，但少一半 cvt 指令（prefill 的反量化是权重受限的）。
+        const float2 scaled = make_float2(decoded.x * coefficient, decoded.y * coefficient);
+        *reinterpret_cast<half2*>(out + 2 * byte) = __float22half2_rn(scaled);
     }
 }
 
@@ -134,8 +136,16 @@ __global__ void dequant_nvfp4_qpn_to_fp16(const std::uint8_t* __restrict__ codes
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,
                                     cutlass::half_t* __restrict__ out, std::int64_t count) {
-    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < count) { out[i] = cutlass::half_t(__bfloat162float(in[i])); }
+    // 本仓库 V100 增量：一对一次，减半转换指令（bf16->fp32 精确，fp32->fp16 RN）。
+    const std::int64_t pair = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t i    = pair * 2;
+    if (i + 1 < count) {
+        const float2 widened = make_float2(__bfloat162float(in[i]), __bfloat162float(in[i + 1]));
+        auto* destination    = reinterpret_cast<half2*>(out + i);
+        *destination         = __float22half2_rn(widened);
+    } else if (i < count) {
+        out[i] = cutlass::half_t(__bfloat162float(in[i]));
+    }
 }
 
 using ElementAccumulator     = float;
@@ -229,7 +239,8 @@ void nvfp4_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Wo
     CUDA_CHECK(cudaGetLastError());
 
     const std::int64_t x_count = static_cast<std::int64_t>(cols) * k;
-    const int x_blocks         = static_cast<int>((x_count + 255) / 256);
+    // 每个线程处理一对（半分元素），所以块数是元素对数的一半向上取整。
+    const int x_blocks         = static_cast<int>(((x_count + 1) / 2 + 255) / 256);
     bf16_to_fp16_kernel<<<x_blocks, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
                                                       x_fp16, x_count);
     CUDA_CHECK(cudaGetLastError());

@@ -52,10 +52,17 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
     // 零暂存）与 CUTLASS（t>32，自带暂存；暂存过大的形状仍走分块 QPN）拥有全部宽度。容量
     // 必须来自同一决策而不是 route table——测试会强制 unified 表，而钩子不受表影响。
     if (fp8_volta_qpn_takes(policy, n, k, std::min(max_tokens, kFp8VoltaQpnMaxTokens))) {
-        if (max_tokens <= kFp8VoltaQpnMaxTokens || !fp8_wide_uses_cutlass(n, k)) { return 0; }
+        // 本仓库 V100 增量：QPN 读暂存 FP16 激活比内核内转换快（实测 5120x17408 T=5:
+        // 502 -> 759 GB/s）。词汇表形状（n>=100000）是例外——它的 A 矩阵只有几行、已经
+        // 带宽饱和，实测无收益，故不暂存。
+        const std::size_t stage = n >= 100000
+                                      ? 0
+                                      : fp8_qpn_stage_bytes(
+                                            k, std::min(max_tokens, kFp8VoltaQpnMaxTokens));
+        if (max_tokens <= kFp8VoltaQpnMaxTokens || !fp8_wide_uses_cutlass(n, k)) { return stage; }
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::BF16, {n, max_tokens});
-        return layout.peak_bytes(1) + fp8_cutlass_sm70_workspace_bytes(n, k, max_tokens);
+        return layout.peak_bytes(1) + fp8_cutlass_sm70_workspace_bytes(n, k, max_tokens) + stage;
     }
 #endif
     return capacity_by_table(
@@ -81,6 +88,21 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
                                 std::min(x.ne[1], kFp8VoltaQpnMaxTokens))) {
         if (x.ne[1] <= kFp8VoltaQpnMaxTokens || !fp8_wide_uses_cutlass(weight.n, weight.k)) {
             // QPN 直接写进 out，按 32 列分块（t <= 32 时只有一块，等价于解码宽度的那一次）。
+            // 本仓库 V100 增量：非词汇表形状先把整块激活暂存为 FP16，QPN 就能走直接读路径
+            // （同形状同预打包布局实测 +30~50% 带宽）；词汇表形状不暂存（无收益）。
+            const void* staged = nullptr;
+            if (weight.n < 100000 && workspace != nullptr &&
+                is_volta_qpn_prepacked_fp8(weight.qtype, weight.layout)) {
+                const std::size_t bytes = fp8_qpn_stage_bytes(weight.k, x.ne[1]);
+                const std::size_t aligned_used = (workspace->used() + 255) / 256 * 256;
+                if (workspace->capacity() >= aligned_used &&
+                    workspace->capacity() - aligned_used >= bytes) {
+                    auto stage_scope       = workspace->scope();
+                    const DeviceSpan stage = workspace->alloc_bytes(bytes, 256);
+                    fp8_stage_bf16_activation_sm70(x, stage.data, stream);
+                    staged = stage.data;
+                }
+            }
             for (std::int32_t token_begin = 0; token_begin < x.ne[1];
                  token_begin += kFp8VoltaQpnMaxTokens) {
                 const std::int32_t active =
@@ -93,7 +115,13 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
                                    sizeof(std::uint16_t);
                 Tensor input_chunk(input, DType::BF16, {weight.k, active});
                 Tensor output_chunk(output, DType::BF16, {weight.n, active});
-                launch_fp8_volta_qpn(input_chunk, weight, output_chunk, stream);
+                if (staged != nullptr) {
+                    const auto* chunk = static_cast<const std::uint8_t*>(staged) +
+                                        static_cast<std::int64_t>(token_begin) * weight.k * 2;
+                    launch_fp8_volta_qpn_fp16(input_chunk, weight, chunk, output_chunk, stream);
+                } else {
+                    launch_fp8_volta_qpn(input_chunk, weight, output_chunk, stream);
+                }
             }
             return;
         }

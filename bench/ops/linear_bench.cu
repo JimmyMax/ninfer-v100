@@ -19,6 +19,10 @@
 // 本仓库 V100 增量（docs/v100/PLAN.md）：--prepack 用实测加载时 QPN prepack 的收益。
 #    include "ops/linear/fp8/fp8_prepack_sm70.h"   // 本仓库 V100 增量
 #    include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+// 本仓库 V100 增量：--fp16-act 隔离“激活类型”变量（bf16 内联转换 vs 先暂存 fp16）。
+#    include "ops/linear/fp8/fp8_launch.h"
+#    include "ops/linear/fp8/fp8_output.cuh"
+#    include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh"
 #endif
 
 #include <cuda_bf16.h>
@@ -49,6 +53,7 @@ namespace {
 // 本仓库 V100 增量：权重是否在 bench 里跑一次加载时 prepack（--prepack），NVFP4 与 FP8 各一份。
 bool g_prepack_nvfp4 = false;
 bool g_prepack_fp8   = false;
+bool g_fp16_act      = false;
 #endif
 
 // Hardware ceilings come from bench::device_specs(), which derives the DRAM spec from the device
@@ -396,6 +401,8 @@ Options parse_args(int argc, char** argv) {
         } else if (arg == "--prepack") {
             g_prepack_nvfp4 = true;
             g_prepack_fp8   = true;
+        } else if (arg == "--fp16-act") {
+            g_fp16_act = true;
 #endif
         } else if (arg == "--suite") {
             opt.suite      = lower(next("suite"));
@@ -698,6 +705,18 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
     LinearBenchWeight weight = make_weight(group.qtype, group.n, group.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
+#if defined(NINFER_SM70)
+    // 本仓库 V100 增量：--fp16-act 的暂存区（k x max_t 的 fp16）。
+    DeviceBuffer stage(g_fp16_act ? checked_mul(checked_mul(static_cast<std::uint64_t>(group.k),
+                                                           max_t, "stage elements"),
+                                               2, "stage bytes")
+                                 : 0);
+    const bool staged = g_fp16_act && group.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+                        (group.n % 32) == 0 && (group.k % 128) == 0 && (group.k / 128) >= 8 &&
+                        weight.weight.layout == QuantLayout::VoltaQpnPrepacked;
+#else
+    const bool staged = false;
+#endif
     const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(
         group.qtype, group.n, group.k, group.policy, min_t, max_t);
     DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
@@ -714,6 +733,17 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
         Tensor activation(x.p, DType::BF16, {group.k, point.t});
         Tensor output(out.p, DType::BF16, {group.n, point.t});
         const auto launch = [&](cudaStream_t launch_stream) {
+#if defined(NINFER_SM70)
+            if (staged) {
+                ops::detail::fp8_stage_bf16_activation_sm70(activation, stage.p, launch_stream);
+                ops::detail::launch_fp8_volta_qpn_with_fp16_activation(
+                    activation, weight.weight, static_cast<const half*>(stage.p),
+                    ops::detail::Fp8ContiguousOutput{
+                        static_cast<__nv_bfloat16*>(output.data), group.n},
+                    group.n, launch_stream);
+                return;
+            }
+#endif
             ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream);
         };
         bench::TimedGraph graph;

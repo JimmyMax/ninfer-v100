@@ -284,7 +284,10 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     const int active_split_count =
         causal_small_t_active_splits<Geometry, Int8>(window, split_count, tokens, wave_splits);
 
-    __shared__ float weights[256], warp_sums[8], scalars[2];
+    // 本仓库 V100 增量：折叠合并会写到 weights[splits-1]，而 splits 在 Volta 上可到
+    // Geometry::SmallTMaximumSplits（560 x SmallTSplitScale），所以缓冲必须按几何上限分配
+    // （原来写死 256，splits > 256 时越界写，数值崩坏；master 的写法就是按几何上限）。
+    __shared__ float weights[Geometry::SmallTMaximumSplits], warp_sums[8], scalars[2];
     const float head_l =
         causal_merge_split_statistics<Geometry>(partial_m, partial_l, q_head, token, tokens,
                                                 active_split_count, weights, warp_sums, scalars);

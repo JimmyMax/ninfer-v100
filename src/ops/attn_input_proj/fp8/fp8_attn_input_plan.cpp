@@ -65,9 +65,13 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
     // 表影响。
     if (fp8_volta_qpn_takes(policy, Fp8N14336K5120::kOutputRows, Fp8N14336K5120::kInputRows,
                                 std::min(max_tokens, kFp8VoltaQpnMaxTokens))) {
+        // 本仓库 V100 增量：t<=32 的 QPN 现在要一块 k x t 的 FP16 激活暂存区（见
+        // fp8_qpn_stage_bytes 的实测收益）；更宽走 CUTLASS，它是自带暂存的，两者取大。
+        const std::size_t stage = fp8_qpn_stage_bytes(
+            Fp8N14336K5120::kInputRows, std::min(max_tokens, kFp8VoltaQpnMaxTokens));
         return max_tokens <= kFp8VoltaQpnMaxTokens
-                   ? 0
-                   : fp8_attn_input_cutlass_workspace_bytes(max_tokens);
+                   ? stage
+                   : std::max(fp8_attn_input_cutlass_workspace_bytes(max_tokens), stage);
     }
 #endif
     return capacity_by_table(
@@ -94,6 +98,16 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
                 throw std::invalid_argument("fp8 Volta attention prefill requires workspace");
             }
             fp8_attn_input_cutlass_sm70_launch(x, weight, q, gate, k, v, *workspace, stream);
+            return;
+        }
+        // 本仓库 V100 增量：激活一次性暂存为 FP16 再交给 QPN——同形状同预打包布局下实测
+        // 545 -> 741 GB/s（T=5），内核里的逐元素 bf16->fp16 转换就是那 1.4x 的来源。
+        if (workspace != nullptr) {
+            auto stage_scope       = workspace->scope();
+            const DeviceSpan stage = workspace->alloc_bytes(
+                fp8_qpn_stage_bytes(weight.k, x.ne[1]), 256);
+            fp8_stage_bf16_activation_sm70(x, stage.data, stream);
+            launch_fp8_attn_input_volta_qpn(x, weight, q, stage.data, gate, k, v, stream);
             return;
         }
         launch_fp8_attn_input_volta_qpn(x, weight, q, nullptr, gate, k, v, stream);
