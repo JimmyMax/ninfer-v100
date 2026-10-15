@@ -180,6 +180,27 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
 * 生产：`ninfer:v100-deq`
 * 详见 [gap-closure-2026-10-15.md](gap-closure-2026-10-15.md)。
 
+### S0.10 prefill 残差归因到具体内核 + GDN 路由修复 ☑/◐（2026-10-15）
+
+首次拿到 **master 参考二进制与本线在同一 27K 请求下的 kernel 级剖析**（此前 nsys 一直采不到事件，
+原因是收尾时用 `pgrep -f ninfer-serve` 会先匹配到 nsys 自身，把 nsys 杀掉既不写报告又留下占显存的
+孤儿进程；正确做法是 `pkill -x <精确进程名>`）。
+
+* [x] **sm_70 的 GDN prefill 改走 recurrent 单内核**（上游 sm_70 就是 `T_full = 0`）：
+      `ninfer_gated_delta_net_bench` T=1024..8192 上 **2.90–3.32×**（T=2048 7750 → 2436 µs）；
+      oracle `ctest -R "gated_delta_net|gdn"` **22/22 通过**；27K prefill GPU busy 里 GDN
+      **3.75 → 2.18 s**，e2e prefill **873.9 → 903.9 tok/s（+3.4%）**。`NINFER_GDN_RECURRENT=0` 可回退。
+* [x] **残差定位到单一内核**：27K prefill GPU busy master 28.60s vs 本线 31.93s，其中 CUTLASS 持平
+      （16.14 vs 16.32s）、GDN 本线更快（2.82 vs 2.18s）、**prefill 注意力 master 3.93s vs 本线
+      7.28s（每 token 1.85×）**。master 用 vendored llama.cpp 的 `flash_attn_ext_f16<256,256,32,2>`
+      经 `volta_flash` 路线（paged int8 KV → gather 成 FP16 → 逐 Q-block flash），本线**没有**该路线，
+      走自研 `prompt_kernel`。
+* ☐ **移植 `volta_flash` prefill 注意力路线**（唯一剩下的主要项，预计 3.3s GPU busy → 追平 1010 tok/s）。
+      依赖在本线齐全（`CausalD256H24Kv4/16Kv2`、`PagedKVBatchLayerView`、`Int8Group64`、paged KV 地址
+      helper；缺的只是 `round_up_keys` 之类小 helper）。
+* 生产：`ninfer:v100-gdnrec`
+* 详见 [gdn-recurrent-and-prefill-gap-2026-10-15.md](gdn-recurrent-and-prefill-gap-2026-10-15.md)。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。

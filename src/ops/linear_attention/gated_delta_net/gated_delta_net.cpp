@@ -337,6 +337,24 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
+#if defined(NINFER_SM70)
+    // Volta: the chunked and two-stage prefill pipelines both lose to the width-wide recurrent
+    // kernel on sm_70 for the same geometry (ninfer_gated_delta_net_bench, cold L2, T=2048:
+    // 7.7 ms vs 2.8 ms; T=4096: 15.9 ms vs 5.5 ms). Routing the whole width through
+    // launch_recurrent_inout is also what the upstream sm_70 build does -- it forces T_full = 0 so
+    // the recurrent tail path covers the entire prompt. That kernel keeps the state in registers,
+    // normalizes q/k in-kernel, needs no workspace, and is the very kernel decode already runs, so
+    // no arithmetic contract changes. NINFER_GDN_RECURRENT=0 restores the older pipelines for A/B.
+    static const bool recurrent_route = [] {
+        const char* value = std::getenv("NINFER_GDN_RECURRENT");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (recurrent_route) {
+        detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
+                                                        ssm_state_in, ssm_state_out, out, stream);
+        return;
+    }
+#endif
     if (two_stage_route(v.ne[1], q.ne[2])) {
         run_two_stage(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state_in, ssm_state_out, out,
                       stream);
