@@ -201,6 +201,22 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
 * 生产：`ninfer:v100-gdnrec`
 * 详见 [gdn-recurrent-and-prefill-gap-2026-10-15.md](gdn-recurrent-and-prefill-gap-2026-10-15.md)。
 
+### S0.11 Volta flash-attention prefill 路线移植 ☑/◐（2026-10-15）
+
+把上游参考构建的 prefill 注意力（vendored llama.cpp `flash_attn_ext_f16`，tensor cores）接到本线：
+`src/ops/launcher/gqa_attention_volta_flash.cu` + `causal_softmax_attention.cpp` 的分派与容量。
+
+* [x] **BFloat16 KV 下可用**：27K prefill **903 → 1150 tok/s（+27%）**、TTFT 30.2 → 23.8s，
+      比上游参考构建（1010 tok/s）**快 14%**；代价是 BF16 KV 的解码带宽（decode 75.0 → 65.8 tok/s，
+      属 KV 类型本身的成本）。
+* [x] 门控：宽度 ≥ 128、单序列、可见 key ≤ 32768（gather 平面每 key 每 kv head 512 B），
+      `NINFER_ATTN_VOLTA_FLASH=0` 可关；int8 存储**默认关闭**。
+* ☐ **INT8 分支未完成**：产出错误结果（Q 旋转两种假设都排除、寻址/反量化与 codec 逐行一致、
+      BF16 分支正确 → 问题局限在 int8 gather/dequant）。需要的下一步：同一缓存上 prompt 路线 vs
+      flash 路线的逐元素 op 级对照测试。修好后 int8 可同时拿到 flash 的 prefill 与 int8 的解码。
+* 回归门：`ctest -R ninfer_softmax_attention_int8_prompt_test` 通过。
+* 详见 [volta-flash-prefill-2026-10-15.md](volta-flash-prefill-2026-10-15.md)。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。

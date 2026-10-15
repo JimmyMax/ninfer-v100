@@ -7,6 +7,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/causal_conv1d.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/embed_gather.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gdn_gating.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/gqa_attention_volta_flash.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gelu.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/hadamard_transform.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/l2norm.cu"

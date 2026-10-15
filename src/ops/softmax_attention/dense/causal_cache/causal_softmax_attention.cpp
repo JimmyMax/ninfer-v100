@@ -8,6 +8,7 @@
 #include "core/paged_kv_storage.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
+#include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
@@ -324,6 +325,47 @@ SmallTTileWorkspace allocate_small_t_tile_workspace(Allocator& workspace, std::i
     Tensor rows  = workspace.alloc(DType::I32, {tiles});
     return {partial, valid, rows};
 }
+
+#if defined(NINFER_SM70)
+// Volta flash-attention prefill staging (see ops/launcher/gqa_attention_volta_flash.cu): the two
+// gathered FP16 planes, one Q-block's causal mask and FP32 Q/out pair, and the bridge's
+// stream-K partials.
+struct VoltaFlashWorkspace {
+    Tensor k_gathered;
+    Tensor v_gathered;
+    Tensor mask;
+    Tensor q_f32;
+    Tensor out_f32;
+    void* stream_partials = nullptr;
+};
+
+std::int32_t volta_flash_kv_heads(std::int32_t q_heads) {
+    return q_heads == CausalD256H24Kv4::QHeads ? CausalD256H24Kv4::KVHeads
+                                               : CausalD256H16Kv2::KVHeads;
+}
+
+template <class Allocator>
+VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::int32_t q_heads,
+                                                   std::int64_t max_visible_keys) {
+    const std::int32_t block = detail::causal_attention_volta_flash_q_block_tokens();
+    const std::int32_t keys  = std::min<std::int32_t>(
+        detail::causal_attention_volta_flash_maximum_visible_keys(),
+        static_cast<std::int32_t>(std::max<std::int64_t>(256, max_visible_keys)));
+    const std::int32_t kv_heads = volta_flash_kv_heads(q_heads);
+    VoltaFlashWorkspace out{};
+    out.k_gathered = workspace.alloc(DType::FP16, {kHeadDim, keys, kv_heads, 1});
+    out.v_gathered = workspace.alloc(DType::FP16, {kHeadDim, keys, kv_heads, 1});
+    out.mask       = workspace.alloc(DType::FP16, {keys, block + 8, 1, 1});
+    out.q_f32      = workspace.alloc(DType::FP32, {kHeadDim, q_heads, block, 1});
+    out.out_f32    = workspace.alloc(DType::FP32, {kHeadDim, q_heads, block, 1});
+    out.stream_partials =
+        workspace
+            .alloc_bytes(detail::causal_attention_volta_flash_stream_elements(q_heads) *
+                         sizeof(float2))
+            .data;
+    return out;
+}
+#endif
 
 template <typename Launch>
 void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
@@ -676,6 +718,15 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
                 maximum, detail::rotated_fast_prompt_split_bytes(q_heads, width, plan.splits));
         }
     }
+#if defined(NINFER_SM70)
+    if (min_width <= detail::causal_attention_volta_flash_q_block_tokens() &&
+        detail::causal_attention_volta_flash_applies(q_heads, max_width, batch_size, cache_storage,
+                                                     kHeadDim, envelope.max_visible_keys)) {
+        WorkspaceLayoutBuilder layout;
+        (void)allocate_volta_flash_workspace(layout, q_heads, envelope.max_visible_keys);
+        maximum = std::max(maximum, layout.peak_bytes(1));
+    }
+#endif
     return maximum;
 }
 
@@ -744,6 +795,23 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         detail::causal_attention_prompt_nvfp4_fast_launch(
             q, positions, valid_columns.data == nullptr ? nullptr : &valid_columns,
             &kv_table_rows, scale, cache, envelope.max_visible_keys, workspace, out, stream);
+        if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
+        return;
+    }
+#endif
+#if defined(NINFER_SM70)
+    if (detail::causal_attention_volta_flash_applies(q.ne[1], width, batch, cache.storage, kHeadDim,
+                                                    envelope.max_visible_keys)) {
+        detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                             stream);
+        VoltaFlashWorkspace flash =
+            allocate_volta_flash_workspace(workspace, q.ne[1], envelope.max_visible_keys);
+        detail::causal_attention_volta_flash_launch(
+            q, positions, valid_columns, kv_table_rows, scale, envelope.max_visible_keys, cache,
+            out, flash.k_gathered, flash.v_gathered, flash.mask, flash.q_f32, flash.out_f32,
+            flash.stream_partials,
+            detail::causal_attention_volta_flash_stream_elements(q.ne[1]) * sizeof(float2),
+            stream);
         if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
         return;
     }

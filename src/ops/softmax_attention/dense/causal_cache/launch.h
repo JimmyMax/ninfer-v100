@@ -9,6 +9,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -121,6 +122,34 @@ void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& 
                                                  Tensor& partial_acc, Tensor& partial_m,
                                                  Tensor& partial_l, Tensor& out,
                                                  cudaStream_t stream);
+
+// Volta (sm_70) flash-attention prefill route: paged cache -> contiguous FP16 gather, then the
+// vendored llama.cpp tensor-core flash kernel (ops/launcher/gqa_attention_volta_flash.cu). The int8
+// prompt route evaluates the same work on CUDA cores; this one uses the tensor cores. K/V are
+// appended by the caller, like the sm_70 prompt route.
+[[nodiscard]] bool causal_attention_volta_flash_applies(std::int32_t q_heads, std::int32_t width,
+                                                        std::int32_t batch_size,
+                                                        KvCacheStorage storage,
+                                                        std::int32_t head_dim,
+                                                        std::int64_t max_visible_keys);
+[[nodiscard]] std::int32_t causal_attention_volta_flash_q_block_tokens();
+// Past this visible key count the gathered FP16 planes stop fitting the reserved budget.
+[[nodiscard]] std::int32_t causal_attention_volta_flash_maximum_visible_keys();
+// Elements of the two FP16 gathered planes ([kv_heads][round_up(keys)][256]).
+[[nodiscard]] std::size_t causal_attention_volta_flash_gather_elements(
+    std::int32_t q_heads, std::int64_t max_visible_keys);
+// Elements of one Q-block's mask plus its FP32 Q/out pair.
+[[nodiscard]] std::size_t causal_attention_volta_flash_block_elements(
+    std::int32_t q_heads, std::int64_t max_visible_keys);
+// float2 elements the bridge's stream-K partials need for one Q-block.
+[[nodiscard]] std::size_t causal_attention_volta_flash_stream_elements(std::int32_t q_heads);
+void causal_attention_volta_flash_launch(const Tensor& q, const Tensor& positions,
+                                         const Tensor& valid_columns, const Tensor& table_rows,
+                                         float scale, std::int64_t visible_keys,
+                                         const PagedKVBatchLayerView& cache, Tensor& out,
+                                         Tensor& k_gathered, Tensor& v_gathered, Tensor& mask,
+                                         Tensor& q_f32, Tensor& out_f32, void* flash_workspace,
+                                         std::size_t flash_workspace_bytes, cudaStream_t stream);
 
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& positions, const Tensor& valid_columns,
