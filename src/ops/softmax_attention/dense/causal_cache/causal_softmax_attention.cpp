@@ -865,6 +865,20 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         return;
     }
 #endif
+#if defined(NINFER_SM70)
+    if (detail::causal_attention_volta_flash_applies(q.ne[1], q.ne[2], 1, cache.storage, kHeadDim,
+                                                    envelope.max_visible_keys)) {
+        VoltaFlashWorkspace flash =
+            allocate_volta_flash_workspace(workspace, q.ne[1], envelope.max_visible_keys);
+        detail::causal_attention_volta_flash_launch(
+            q, positions, Tensor{}, Tensor{}, scale, envelope.max_visible_keys,
+            single_row_paged_kv_batch_view(cache), out, flash.k_gathered, flash.v_gathered,
+            flash.mask, flash.q_f32, flash.out_f32, flash.stream_partials,
+            detail::causal_attention_volta_flash_stream_elements(q.ne[1]) * sizeof(float2),
+            stream);
+        return;
+    }
+#endif
     if (detail::causal_attention_prompt_sm70_applies(cache.storage, 1)) {
         detail::causal_attention_prompt_sm70_launch(q, positions, scale, cache, out, stream);
         return;

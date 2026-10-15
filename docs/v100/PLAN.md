@@ -204,17 +204,20 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
 ### S0.11 Volta flash-attention prefill 路线移植 ☑/◐（2026-10-15）
 
 把上游参考构建的 prefill 注意力（vendored llama.cpp `flash_attn_ext_f16`，tensor cores）接到本线：
-`src/ops/launcher/gqa_attention_volta_flash.cu` + `causal_softmax_attention.cpp` 的分派与容量。
+`src/ops/launcher/gqa_attention_volta_flash.cu` + 两个入口（growing/cached）的分派与容量。
 
-* [x] **BFloat16 KV 下可用**：27K prefill **903 → 1150 tok/s（+27%）**、TTFT 30.2 → 23.8s，
-      比上游参考构建（1010 tok/s）**快 14%**；代价是 BF16 KV 的解码带宽（decode 75.0 → 65.8 tok/s，
-      属 KV 类型本身的成本）。
-* [x] 门控：宽度 ≥ 128、单序列、可见 key ≤ 32768（gather 平面每 key 每 kv head 512 B），
-      `NINFER_ATTN_VOLTA_FLASH=0` 可关；int8 存储**默认关闭**。
-* ☐ **INT8 分支未完成**：产出错误结果（Q 旋转两种假设都排除、寻址/反量化与 codec 逐行一致、
-      BF16 分支正确 → 问题局限在 int8 gather/dequant）。需要的下一步：同一缓存上 prompt 路线 vs
-      flash 路线的逐元素 op 级对照测试。修好后 int8 可同时拿到 flash 的 prefill 与 int8 的解码。
-* 回归门：`ctest -R ninfer_softmax_attention_int8_prompt_test` 通过。
+* [x] **数值正确**：`ctest` 注意力全存储 **PASS**；`--int8-prompt-only` 默认 PASS，
+      `NINFER_ATTN_VOLTA_FLASH_INT8=1` 强制走该路线也 **PASS**（int8 与 bf16 都过 FP64 oracle）。
+* [x] 用 oracle harness 修掉三个真 bug：容量门控（`min_width<=128` → `max_width>=128`）、
+      分配未按 256 取整（统一到 `causal_attention_volta_flash_key_extent()`）、
+      **每 Q-block 的 key 上界漏掉前缀**（主因，`round_up(base+begin+tokens)`）。
+* [x] 性能结论（更正）：**正确版本在本引擎的分块 prefill 下还不划算** —— 27K 上 int8 默认（prompt 路线）
+      **30.1s / 906 tok/s**，int8+flash 33.9s / 807 tok/s，bf16+flash 33.4s。原因是每次调用都要 staging
+      整个可见前缀，而 prefill 被分成 14 次调用 → 重复付费；上游引擎把整段 prompt 一次交给注意力算子。
+      早先记录的 "bf16 flash 1150 tok/s/+27%" 是 *截断 key 范围* 的错误版本，已作废。
+* 因此路线**默认关闭**（`NINFER_ATTN_VOLTA_FLASH[_INT8]=1` 才启用），生产行为不变。
+* 下一步：staging 前缀跨 chunk 复用 / 更轻的 launch（本线桥走 ggml stream-k launcher，上游是简单 grid）/
+  按 block 传 `kv_max` 收敛 key 上界。
 * 详见 [volta-flash-prefill-2026-10-15.md](volta-flash-prefill-2026-10-15.md)。
 
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐

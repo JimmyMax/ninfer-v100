@@ -9,9 +9,15 @@
 // caller appends K/V to the pages first, exactly like the sm_70 prompt route does.
 //
 // Why it exists: the int8 prompt route evaluates QK^T/PV on CUDA cores (DP4A), the flash kernel on
-// tensor cores. Measured at 27K prefill the prompt route spends 7.28 s in attention against the
-// upstream reference build's 3.93 s of flash attention for the same work, which is the whole
-// remaining gap (docs/v100/gdn-recurrent-and-prefill-gap-2026-10-15.md).
+// tensor cores. At 27K prefill the upstream reference build spends 3.93 s in flash attention
+// against this line's 7.28 s of prompt attention, and this route is what closes that gap when it is
+// affordable.
+//
+// It is OPT-IN (NINFER_ATTN_VOLTA_FLASH=1, and NINFER_ATTN_VOLTA_FLASH_INT8=1 for the int8 cache)
+// because at the shapes this engine actually calls it is not yet a win: prefill is chunked, and
+// every call has to stage its whole visible prefix, so the staging and mask traffic repeat per
+// chunk instead of once per layer. Correctness is not in question -- the int8 and bf16 prompt
+// oracles both pass with the route forced on.
 //
 // Cost: the gathered planes are `2 * round_up(keys) * kv_heads * 256 * 2` bytes, so the route only
 // applies while the visible key range stays inside kFlashMaximumVisibleKeys; past that the prompt
@@ -32,7 +38,6 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -62,14 +67,28 @@ constexpr int round_up_keys(int n) { return ((n + kKeyPad - 1) / kKeyPad) * kKey
 bool volta_flash_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_ATTN_VOLTA_FLASH");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] != '0';
     }();
     return enabled;
 }
 
+// The INT8 cache is correct (the int8 prompt oracle passes) but slower than this line's int8 prompt
+// route at prefill widths: staging the paged int8 planes into contiguous FP16 plus the shared flash
+// launcher costs more than the prompt kernel's direct DP4A read of the pages (42.2 ms vs 41.3 ms at
+// W=2048/ctx=16384, 807 vs 906 tok/s end to end). It stays opt-in until the launcher is leaner.
+bool volta_flash_int8_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_ATTN_VOLTA_FLASH_INT8");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+// `table_rows` is null for the single-sequence entry, where the first (only) table row is used.
 __device__ __forceinline__ const std::int32_t* select_block_table(
         const std::int32_t* block_tables, const std::int32_t* table_rows, int logical_pages) {
-    return block_tables + static_cast<std::int64_t>(table_rows[0]) * logical_pages;
+    const std::int32_t row = table_rows == nullptr ? 0 : table_rows[0];
+    return block_tables + static_cast<std::int64_t>(row) * logical_pages;
 }
 
 // Paged cache -> contiguous FP16 in the layout the bridge wants: element (d, key, head) at
@@ -245,7 +264,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& positions,
     }
     CUDA_CHECK(cudaGetLastError());
 
-    const bool rotated  = cache.storage == KvCacheStorage::Int8Group64; // only BFloat16 reaches here today
+    const bool rotated  = cache.storage == KvCacheStorage::Int8Group64;
     auto* q_f32_ptr     = static_cast<float*>(q_f32.data);
     auto* out_f32_ptr   = static_cast<float*>(out_f32.data);
     auto* mask_ptr      = static_cast<half*>(mask.data);
@@ -253,9 +272,13 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& positions,
                               ? nullptr
                               : static_cast<const std::int32_t*>(valid_columns.data);
 
+    // The keys already in the cache before this call: the called rows are the tail of the
+    // sequence, so the first row's position is `visible_keys - width`. Every Q-block has to be
+    // given a key extent that includes that prefix, otherwise the block cannot see it.
+    const std::int32_t prefix = std::max<std::int32_t>(0, static_cast<std::int32_t>(visible_keys) - width);
     for (std::int32_t begin = 0; begin < width; begin += kFlashQBlockTokens) {
         const std::int32_t tokens = std::min<std::int32_t>(kFlashQBlockTokens, width - begin);
-        const std::int32_t n_kv   = round_up_keys(begin + tokens);
+        const std::int32_t n_kv   = round_up_keys(prefix + begin + tokens);
         const std::int32_t rows_padded =
             ((tokens + kFlashMaskRowPad - 1) / kFlashMaskRowPad) * kFlashMaskRowPad;
 
@@ -329,14 +352,13 @@ bool causal_attention_volta_flash_applies(std::int32_t q_heads, std::int32_t wid
     std::int32_t kv_heads = 0;
     if (!volta_flash_kv_heads(q_heads, kv_heads)) { return false; }
     if (batch_size != 1) { return false; }
-    // Only the BFloat16 cache is enabled: the INT8 branch mis-decodes (the
-    // gathered planes do not reproduce the INT8 route's attention), so it stays on the
-    // prompt route until that is root-caused. See the note in
-    // docs/v100/volta-flash-prefill-2026-10-15.md.
-    // Only the BFloat16 cache is enabled: the INT8 branch mis-decodes (the zero-Q case below shows
-    // the gathered V rows are not the ones the INT8 route sees), so it stays on the prompt route
-    // until that is root-caused. See docs/v100/volta-flash-prefill-2026-10-15.md.
-    if (storage != KvCacheStorage::BFloat16) { return false; }
+    // BFloat16 by default; the INT8 cache is correct but slower here, so it is opt-in. Both still
+    // go through the width and visible-key gates below.
+    if (storage == KvCacheStorage::Int8Group64) {
+        if (!volta_flash_int8_enabled()) { return false; }
+    } else if (storage != KvCacheStorage::BFloat16) {
+        return false;
+    }
     if (max_visible_keys > kFlashMaximumVisibleKeys) { return false; }
     return width >= kFlashQBlockTokens;
 }
