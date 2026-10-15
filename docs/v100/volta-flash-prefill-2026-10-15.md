@@ -31,6 +31,26 @@ tensor-core flash 内核（27K prefill 里 3.93s），本线走自研 int8 `prom
 * **INT8 KV：该路线默认不启用**（见下），行为与之前逐字节一致：27K prefill 903 tok/s、decode 75.0 ✓。
 * 回归门：`ctest -R ninfer_softmax_attention_int8_prompt_test` **通过**（36.8s）。
 
+## INT8 分支：oracle harness 已经能跑（2026-10-15 补充）
+
+关键结论：**不需要新写测试**。`tests/ops/softmax_attention/causal_cache.cpp` 的
+`run_int8_prompt_cases` 里本来就有宽度 300/600/1100/1500 的 int8 用例（≥ 本路线的 128 门槛），
+而且 harness 用 `causal_softmax_attention_workspace_capacity_bytes` 自动开 arena、用独立 FP64 oracle
+逐元素比对、失败即打印 `actual/reference`。把 int8 暂时放开后单轮迭代约 1–2 分钟。
+
+用这个 harness 已经拿到：
+
+* **两个真 bug（已修）**：
+  1. 容量门控写成了 `min_width <= 128`，而调用方会用 `min_width = max_width = width`（如 300）→
+     容量算成 0 → 运行时按需分配 `std::bad_alloc`；改成 `max_width >= 128`。
+  2. 分配器用 `max(256, max_visible_keys)` **没有按 256 上取整**，而 gather/容量用
+     `round_up_keys(...)` → 分配小于实际写入，越界写坏相邻缓冲；现在统一走
+     `causal_attention_volta_flash_key_extent()` 这一个来源。
+* **失败点收敛到 V**：新增 `zero_q` 用例（Q=0 ⇒ 输出 = 可见 key 的 V 均值，与 K 无关）后仍然失败
+  （`actual=0.0757` vs `reference=-0.0513`，符号都不同）⇒ 问题在 V（或可见集合），不在 K 旋转。
+  已排除：Q 旋转（开/关都错）、codec 寻址（与 `kv_cache_int8_quant_code_index/_scale_index`、
+  `key_codes8` 直读、`code × scale` 逐行一致）、16× 归一化因子（更差）。
+
 ## INT8 分支的状态（已知未完成）
 
 int8 缓存下该路线产出错误结果（引擎侧 "target returned a token outside the public token domain"），

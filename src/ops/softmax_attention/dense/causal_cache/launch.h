@@ -133,6 +133,9 @@ void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& 
                                                         std::int32_t head_dim,
                                                         std::int64_t max_visible_keys);
 [[nodiscard]] std::int32_t causal_attention_volta_flash_q_block_tokens();
+// The gathered key extent: round_up(max_visible_keys, 256), capped at the route's budget. Both the
+// launcher's gather and the workspace reservation must use this one value.
+[[nodiscard]] std::int32_t causal_attention_volta_flash_key_extent(std::int64_t max_visible_keys);
 // Past this visible key count the gathered FP16 planes stop fitting the reserved budget.
 [[nodiscard]] std::int32_t causal_attention_volta_flash_maximum_visible_keys();
 // Elements of the two FP16 gathered planes ([kv_heads][round_up(keys)][256]).

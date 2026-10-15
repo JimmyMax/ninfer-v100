@@ -245,7 +245,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& positions,
     }
     CUDA_CHECK(cudaGetLastError());
 
-    const bool rotated  = cache.storage == KvCacheStorage::Int8Group64;
+    const bool rotated  = cache.storage == KvCacheStorage::Int8Group64; // only BFloat16 reaches here today
     auto* q_f32_ptr     = static_cast<float*>(q_f32.data);
     auto* out_f32_ptr   = static_cast<float*>(out_f32.data);
     auto* mask_ptr      = static_cast<half*>(mask.data);
@@ -333,18 +333,25 @@ bool causal_attention_volta_flash_applies(std::int32_t q_heads, std::int32_t wid
     // gathered planes do not reproduce the INT8 route's attention), so it stays on the
     // prompt route until that is root-caused. See the note in
     // docs/v100/volta-flash-prefill-2026-10-15.md.
+    // Only the BFloat16 cache is enabled: the INT8 branch mis-decodes (the zero-Q case below shows
+    // the gathered V rows are not the ones the INT8 route sees), so it stays on the prompt route
+    // until that is root-caused. See docs/v100/volta-flash-prefill-2026-10-15.md.
     if (storage != KvCacheStorage::BFloat16) { return false; }
     if (max_visible_keys > kFlashMaximumVisibleKeys) { return false; }
     return width >= kFlashQBlockTokens;
+}
+
+std::int32_t causal_attention_volta_flash_key_extent(std::int64_t max_visible_keys) {
+    const std::int32_t keys = static_cast<std::int32_t>(std::max<std::int64_t>(kKeyPad, max_visible_keys));
+    const std::int32_t rounded = round_up_keys(keys);
+    return rounded < kFlashMaximumVisibleKeys ? rounded : kFlashMaximumVisibleKeys;
 }
 
 std::size_t causal_attention_volta_flash_gather_elements(std::int32_t q_heads,
                                                          std::int64_t max_visible_keys) {
     std::int32_t kv_heads = 0;
     if (!volta_flash_kv_heads(q_heads, kv_heads)) { return 0; }
-    const std::int64_t keys = std::min<std::int64_t>(
-        kFlashMaximumVisibleKeys,
-        std::max<std::int64_t>(kKeyPad, round_up_keys(static_cast<int>(max_visible_keys))));
+    const std::int64_t keys = causal_attention_volta_flash_key_extent(max_visible_keys);
     return static_cast<std::size_t>(2) * static_cast<std::size_t>(keys) *
            static_cast<std::size_t>(kv_heads) * kHeadDim;
 }
@@ -353,9 +360,7 @@ std::size_t causal_attention_volta_flash_block_elements(std::int32_t q_heads,
                                                         std::int64_t max_visible_keys) {
     std::int32_t kv_heads = 0;
     if (!volta_flash_kv_heads(q_heads, kv_heads)) { return 0; }
-    const std::int64_t keys = std::min<std::int64_t>(
-        kFlashMaximumVisibleKeys,
-        std::max<std::int64_t>(kKeyPad, round_up_keys(static_cast<int>(max_visible_keys))));
+    const std::int64_t keys = causal_attention_volta_flash_key_extent(max_visible_keys);
     const std::int64_t mask = keys * (kFlashQBlockTokens + kFlashMaskRowPad);
     const std::int64_t f32 =
         static_cast<std::int64_t>(2) * q_heads * kHeadDim * kFlashQBlockTokens;

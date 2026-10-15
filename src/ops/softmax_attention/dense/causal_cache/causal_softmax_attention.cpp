@@ -348,9 +348,10 @@ template <class Allocator>
 VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::int32_t q_heads,
                                                    std::int64_t max_visible_keys) {
     const std::int32_t block = detail::causal_attention_volta_flash_q_block_tokens();
-    const std::int32_t keys  = std::min<std::int32_t>(
-        detail::causal_attention_volta_flash_maximum_visible_keys(),
-        static_cast<std::int32_t>(std::max<std::int64_t>(256, max_visible_keys)));
+    // Must match the extent the launcher gathers with (round_up to the 256-key kernel tile),
+    // otherwise the gathered planes overrun the allocation.
+    const std::int32_t keys =
+        detail::causal_attention_volta_flash_key_extent(max_visible_keys);
     const std::int32_t kv_heads = volta_flash_kv_heads(q_heads);
     VoltaFlashWorkspace out{};
     out.k_gathered = workspace.alloc(DType::FP16, {kHeadDim, keys, kv_heads, 1});
@@ -719,7 +720,10 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         }
     }
 #if defined(NINFER_SM70)
-    if (min_width <= detail::causal_attention_volta_flash_q_block_tokens() &&
+    // Any width in [min_width, max_width] at or past the flash route's first Q-block can select
+    // it, so the reservation has to be accounted whenever the range reaches that width -- the
+    // gather planes do not depend on the width, so one reservation covers the whole range.
+    if (max_width >= detail::causal_attention_volta_flash_q_block_tokens() &&
         detail::causal_attention_volta_flash_applies(q_heads, max_width, batch_size, cache_storage,
                                                      kHeadDim, envelope.max_visible_keys)) {
         WorkspaceLayoutBuilder layout;

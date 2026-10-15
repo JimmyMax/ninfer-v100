@@ -3633,6 +3633,10 @@ int run_int8_prompt_cases(bool fast) {
                             MappingPattern::Identity);
     failures += run_a1_case(h24, storage, with({600, 300, 900, 910u, false, true}),
                             MappingPattern::Identity);
+    // Flash-route probe: with Q = 0 the result is the mean of the visible V rows, so a failure
+    // here is a V (or mask) defect and a pass points at K.
+    failures += run_a1_case(h24, storage, with({300, 700, 1000, 911u, true}),
+                            MappingPattern::Identity);
     return failures;
 }
 
