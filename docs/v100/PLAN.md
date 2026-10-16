@@ -355,6 +355,25 @@ GGUF 转制制品）。
   两族、两个容器版本都支持。
 * 结论已写进默认分支 README 的 "Two artifact families" 一节。
 
+### S0.20 Gemma 4 宽行内核：dense 31B（hidden 5376）跑通 ☑（2026-10-16）
+
+用户提供了 `Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced` 的 GGUF + MTP + mmproj 三件套，按
+`--recipe gemma4_gguf --components text,mtp,vision` 转成 v3 制品（18.74 GB）后引擎拒绝加载：
+`gemma4 row kernels: hidden must be whole float4s, at most 4096` —— 三个行内核每线程一个 float4，
+一行要装进一个 block，dense 31B 的 5376（1344 个 float4）超过 1024 线程上限 ✗。
+
+* **改动**：新增三个宽行内核（512 线程 + 按 `blockDim.x` 步进 ✓，只在 `hidden/4 > 1024` 分派），
+  既有内核与窄行路径**逐字未改** ✓ → 对其他制品零影响 ✓。
+* **踩到的真 bug**：宽行版本要靠"重算中间值"跨趟传递，第一版把 `a.h` 的写回放在提前的一趟 ✗，
+  后续重算读到已写回的 h → **残差加两次** → 复读乱码 ✗。差分测试（把 26B 强制走宽行）复现 ✗，
+  按位探针（`NINFER_PROBE_WIDE`）缩到 `attn_residual` + `ffn_combine` ✓；修法是把写回推到最后一趟 ✓。
+* **制品已验证**：F32 norms + Q4_K/Q6_K 矩阵（含融合 gate_up 的两半）+ 注意力 q/k/v/o **9/9 逐字节等于
+  GGUF** ✓（乱码的责任在引擎侧，不在转换 ✓）。
+* **验收**：新增 oracle `ninfer_gemma4_wide_rows_test`（2816 窄行 + 5376 宽行 vs FP64 ✓）；`ctest -R
+  gemma4` **8/8** ✓；26B 在探针强制宽行下输出与窄行逐字一致 ✓；31B 端到端 **decode 29.3 tok/s
+  （无 MTP）/ 41.8 tok/s（assistant，4 drafts，接受率 24.1%）** ✓，回答正确 ✓。
+* 详见 [gemma4-wide-rows-2026-10-16.md](gemma4-wide-rows-2026-10-16.md)。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
