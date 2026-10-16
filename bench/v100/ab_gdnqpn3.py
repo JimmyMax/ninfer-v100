@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from wait_ready import wait_ready_ip  # noqa: E402
 
 MODEL = "/workspace/models/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer"
 BASE = ["--host", "0.0.0.0", "--port", "8000", "--api-key", "sk-itzy", "--model-id", "qwen",
@@ -43,6 +44,7 @@ def run_arm(tag, image, case, port, timeout_s=900):
         ip = subprocess.run(["docker", "inspect", "-f",
                              "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name],
                             capture_output=True, text=True).stdout.strip()
+        wait_ready_ip(ip)  # /health 就绪探针：日志行可能来自上次启动
         body = {"model": "qwen", "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens, "temperature": 0}
         out_path = f"/tmp/v{port}.json"

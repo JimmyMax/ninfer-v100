@@ -122,11 +122,25 @@ def parse_records(text: str, limit: int) -> list[dict]:
     return out[-limit:] if limit else out
 
 
-def wait_ready(name: str, timeout: float) -> bool:
+def wait_ready(name: str, timeout: float, port: int = 0) -> bool:
+    """Wait for the engine to serve.
+
+    The log line alone is not a readiness signal when the container is started rather than
+    created (the history keeps a previous launch's line), so the port-published /health is
+    polled whenever a port is known: it answers 503 while loading and 200 once ready.
+    """
     deadline = time.time() + timeout
+    saw_listening = False
     while time.time() < deadline:
-        text = logs(name)
-        if "listening on" in text:
+        if not saw_listening and "listening on" in logs(name):
+            saw_listening = True
+        healthy = True
+        if port:
+            healthy = subprocess.run(
+                ["curl", "-s", "--noproxy", "*", "-m", "10", "-o", "/dev/null", "-w",
+                 "%{http_code}", f"http://127.0.0.1:{port}/health"],
+                capture_output=True, text=True).stdout.strip() == "200"
+        if saw_listening and healthy:
             return True
         if status(name) in ("exited", "dead"):
             return False
@@ -182,7 +196,7 @@ def run_one(args: argparse.Namespace, image: str, index: int, extra: str) -> Run
     if proc.returncode != 0:
         return Run(image=image, label=label, error=proc.stderr.strip()[:400])
 
-    if not wait_ready(name, args.startup_timeout):
+    if not wait_ready(name, args.startup_timeout, args.port):
         err = "\n".join(
             line for line in logs(name).splitlines()
             if re.search(r"ERROR|FATAL|error|failed", line)
