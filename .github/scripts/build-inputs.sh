@@ -6,7 +6,7 @@
 # The base:
 #   pull request   the branch it merges into: the first parent of the merge commit checked out
 #                  (actions/checkout with fetch-depth 2).
-#   master         the commit the published image was built from (its revision label). A push
+#   main           the commit the published image was built from (its revision label). A push
 #                  cancels the run of the push before it, so comparing with that push would lose
 #                  its changes; comparing with the image cannot.
 #   anything else  none: a ci/** branch runs the whole workflow.
@@ -35,7 +35,7 @@ base=""
 case "$GITHUB_EVENT_NAME:$GITHUB_REF" in
   pull_request:*)
     base="$(git rev-parse --verify --quiet 'HEAD^1')" || base="" ;;
-  push:refs/heads/master)
+  push:refs/heads/main)
     base="$(docker buildx imagetools inspect "ghcr.io/${GITHUB_REPOSITORY,,}:latest" \
       --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}')" || base="" ;;
 esac
