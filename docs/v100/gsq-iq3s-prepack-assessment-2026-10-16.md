@@ -99,28 +99,29 @@ GSQ 比 SWIFT 少 7 GiB 权重，正好换来约 150K 额外上下文（400K vs 
 * GSQ 制品作为**长上下文/省显存**选项保留：牺牲约 10–12% 速度，换 ~150K 额外上下文与 7 GiB 显存
 * 若只是"想跑 GSQ 但嫌慢"，先确认用途：如果上下文需求 ≤ 254K，直接用 nvfp4 制品即可，无需任何改动
 
-## 7. 复现命令（只读，不加载模型）
+## 7. 复现清单分析（只读文件头，不加载模型）
 
-```bash
-python3 - <<'PY'
+```python
 import json, math, collections
 p = "/mnt/data/dockerdata/llama-cpp/models/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer"
-buf = open(p, "rb").read(192 << 20)                 # 头部 + manifest
-s = buf.index(b"{", 8)
-d = 0; ins = False; esc = False; e = None
-for i in range(s, len(buf)):
+buf = open(p, "rb").read(192 << 20)                 # 头部 + manifest（约 375 KB）
+start = buf.index(b"{", 8)                          # magic "NINFER\x00\x03" + 二进制头
+depth = 0; in_str = False; esc = False; end = None  # 花括号配对找 JSON 结尾
+for i in range(start, len(buf)):
     c = buf[i]
-    if ins:
-        esc = (c == 0x5c) if not esc else False
-        if c == 0x22 and not esc: ins = False
+    if in_str:
+        if esc: esc = False
+        elif c == 0x5c: esc = True
+        elif c == 0x22: in_str = False
         continue
-    if c == 0x22: ins = True
-    elif c == 0x7b: d += 1
+    if c == 0x22: in_str = True
+    elif c == 0x7b: depth += 1
     elif c == 0x7d:
-        d -= 1
-        if d == 0: e = i + 1; break
-man = json.loads(buf[s:e])
-print("平均 bit/weight:", sum(o["bytes"] for o in man["objects"] if o["kind"]=="tensor") * 8
-      / sum(math.prod(o["shape"]) for o in man["objects"] if o["kind"]=="tensor"))
-PY
+        depth -= 1
+        if depth == 0: end = i + 1; break
+man = json.loads(buf[start:end])
+tensors = [o for o in man["objects"] if o["kind"] == "tensor"]
+b = sum(o["bytes"] for o in tensors); el = sum(math.prod(o["shape"]) for o in tensors)
+print(f"{len(tensors)} 个张量, {b/2**30:.2f} GiB, 平均 {b*8/el:.2f} bit/weight")
+print(collections.Counter(o["format"] for o in tensors).most_common(5))
 ```
