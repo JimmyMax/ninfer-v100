@@ -72,7 +72,8 @@ jobs:
             cuda-nvcc-${{ env.CUDA_APT_VERSION }} \
             cuda-cudart-dev-${{ env.CUDA_APT_VERSION }} \
             cuda-nvtx-${{ env.CUDA_APT_VERSION }} \
-            cuda-driver-dev-${{ env.CUDA_APT_VERSION }}
+            cuda-driver-dev-${{ env.CUDA_APT_VERSION }} \
+            cuda-cublas-dev-${{ env.CUDA_APT_VERSION }}
           echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
           "$CUDA_HOME/bin/nvcc" --version
 
