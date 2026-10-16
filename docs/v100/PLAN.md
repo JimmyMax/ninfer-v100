@@ -331,6 +331,30 @@ nsys 逐内核对比后，55.05s vs 28.78s 的 GPU busy 差**只来自一个内�
 * **纯加载期**：v3 的 `parse_directory`/binder/materializer/所有算子逐字未动，**不影响性能**。
 * 详见 [v2-direct-read-2026-10-16.md](v2-direct-read-2026-10-16.md)。
 
+### S0.19 制品家族：原生配方 vs GGUF 转制（性能差异的真正来源）☑ 只调查、不改代码（2026-10-16）
+
+用同一份清单解析器把所有在用 `.ninfer` 过了一遍，并做了判决实验（拿存档参考线的二进制去读
+GGUF 转制制品）。
+
+* **两族制品**：
+  * **原生 NInfer 配方**（`weights_id: nvfp4`）：`nvfp4`（块缩放 k16×m128×4）、
+    `fp8_e4m3fn_row_bf16`（每权重一个 FP8 码 + 每输出行一个 BF16 scale）、`q4_g64_fp16` /
+    `q5_g64_fp16` / `q6_g64_fp16` / `q8_g32_fp16`（分组 + FP16 scale）、`bf16` / `fp32` / `int32`。
+    来源是 HF safetensors / compressed-tensors / block-FP8，由 NInfer 自己的 converter 量化。
+  * **GGUF 转制**（`gguf_blocks_v1` 布局 + 19 种 `gguf_*` 格式）：Gemma4-26B-A4B（`gguf_q4_k` /
+    `q8_0` / `q5_0` / `q6_k` / `q4_0`）与 GSQ IQ3_S（`gguf_iq3_s` / `iq4_xs` / `iq3_xxs` / `q4_k` /
+    `iq2_s`…，共 17 种）。它们走 ggml bridge（逐张量块反量化 + 对应 MMQ/Vec 内核）。
+* **容器版本不影响性能**：同一份权重的 v2 原件测 998 tok/s、升级后的 v3 测 997 tok/s（同为 27K
+  请求的 prefill），本分支两者都原地直读。
+* **性能差来自配方**：原生 nvfp4/fp8 走 QPN/CUTLASS 快路（prefill 1.00k / decode 76–82）；GGUF
+  混合（18 种格式，IQ3_S 仅 3.39 GiB）在现场反量化，打碎成约两万个小内核 → 885 / 66–74（比原生
+  低约 12%）。
+* **存档参考线只支持原生族**：`archive/fork-master`（`0d24f83e`）的 `src/ops/linear/` 没有 gguf
+  算子、格式注册表里 0 个 `gguf_*`；实测让它读 GSQ 制品直接
+  `FATAL server failed during startup | unknown tensor format: gguf_iq4_xs`（退出码 1）。本分支
+  两族、两个容器版本都支持。
+* 结论已写进默认分支 README 的 "Two artifact families" 一节。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
