@@ -315,6 +315,22 @@ nsys 逐内核对比后，55.05s vs 28.78s 的 GPU busy 差**只来自一个内�
   63.9%）；生产 SWIFT 与 GSQ 逐项不变（1.00k / 78.3、884.7 / 66.6）。
 * 详见 [fp8-swiglu-wide-t-2026-10-16.md](fp8-swiglu-wide-t-2026-10-16.md)。
 
+### S0.18 v2 制品直读（不再需要离线升级）☑（2026-10-16）
+
+引擎现在直接读 v2 原件：**27.3s / 998.5 tok/s**、decode 82.6、MTP 69.2%，与"升级成 v3 后再读"
+（27.3s / 997.6 / 82.7 / 69.2%）**输出逐字一致**，与 master（27.1s / 1.00k / 75.7 / 63.9%）持平；
+生产 v3 制品 SWIFT 同一二进制 **997.1 / 78.3 / 54.3%** 逐项不变，`ctest -R artifact` **4/4**。
+
+* **前提**：v2 与 v3 的差别只在清单——实测同一制品 1184 个张量偏移在升级前后 **1184/1184 相同**，
+  升级只是词汇改名 + 由角色名合成 1513 条 bindings + 由 identity 合成 components/uses/files。
+* **实现**：`reader.cpp` 接受 v2 magic（16 字节头、无 UUID → 用目录文本+文件长度的 128 位 FNV-1a
+  合成 ArtifactId）；新增 `src/artifact/v2_directory.{h,cpp}`，把 `{identity, objects}` 归一化成
+  v3 形态的目录 JSON 再交给同一个 `parse_directory`。规则是 `tools/upgrade_ninfer_v2_to_v3.py`
+  中 `make_directory` 的逐条移植（那个工具即规格与等价性 oracle）；白名单与它相同（5 个官方
+  v2 输入），名单之外仍旧报错并指向离线工具。
+* **纯加载期**：v3 的 `parse_directory`/binder/materializer/所有算子逐字未动，**不影响性能**。
+* 详见 [v2-direct-read-2026-10-16.md](v2-direct-read-2026-10-16.md)。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
