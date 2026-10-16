@@ -10,6 +10,64 @@ NInfer-all continues [NInfer](https://github.com/Neroued/ninfer) through the NIn
 carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits each of them.
 The [documentation map](docs/README.md) lists the guides and references.
 
+## Tesla V100-32GB 单卡（sm_70）优化线
+
+本仓库的主线是**在单张 Tesla V100-PCIE-32GB（sm_70）上把 NInfer 跑快、跑全**：改动集中在算子
+路由与预打包（加载期或首次调用时完成），不改变模型的数值契约；v3 制品路径逐字未动，v2 制品
+在原地直读。下面所有数字都是同一张卡上的 27K 上下文请求（int8 KV、MTP draft 4、贪心）。
+
+*This branch targets single-GPU Tesla V100 32GB (sm_70). The generic documentation for the
+other cards follows below.*
+
+### 支持的制品
+
+| 制品 | 权重 | 上下文 | 27K 请求实测 |
+|---|---:|---:|---|
+| `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3.ninfer`（nvfp4，生产默认） | 19.1 GiB | 254,208 | TTFT **27.2s**、prefill **1.00k tok/s**、decode **76–78 tok/s** |
+| `Swift-1.5-Qwen3.8-27B-OrcaRouter-NVFP4-DFlash2-V2.ninfer`（**v2 原件，直读**） | 22.1 GiB | 200,000 | TTFT **27.3s**、prefill **998 tok/s**、decode **82.7 tok/s** |
+| `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer`（IQ3_S，18 种格式混合） | 11.9 GiB | 400,000 | TTFT **30.8s**、prefill **885 tok/s**、decode **66–74 tok/s** |
+
+短上下文（1K prompt）decode **82.3 tok/s**；27K decode 的 MTP 接受率 69%。
+
+**v2 与 v3 都原生支持**，v2 不需要任何离线转换。格式覆盖 v3 的 `nvfp4`、
+`fp8_e4m3fn_row_bf16`、`q4_g64_fp16` / `q5_g64_fp16` / `q6_g64_fp16` / `q8_g32_fp16`、`bf16`、
+`fp32`，以及 v2 官方词汇的全部组合（`NVFP4`、`Q4G64_F16S`…，包括混合 MLP 的 nvfp4full 风格
+制品）；同目录下的 `Huihui-…-nvfp4`、`orcarouter-…-nvfp4`、`Gemma4-26B-A4B-…` 等 v3 制品同样
+可直接加载。
+
+### 主要原理改动
+
+| 改动 | 收益（实测） |
+|---|---|
+| **Volta QPN**：nvfp4 / fp8 的 quadpair-split-N 预打包 GEMM（`t≤32` 走 QPN，宽 T 走 CUTLASS） | 投影路线 85 → 480–620 GB/s |
+| **GDN prefill 用 recurrent 单内核**（sm_70 上 chunked / two-stage 是负优化） | GDN T=1024…8192 **2.9–3.3×**，27K prefill 中 3.75 → 2.18s |
+| **Flash attention prefill 换核**：paged→连续 staging + sm_70 `mma.sync` 内核 | 同形状 41.1 → 25.1 ms，27K TTFT 30.1 → 27.2s |
+| **Decode 投机配置**：`--ngram-draft-tokens 0`、去掉 `--adaptive-mtp`（默认 15 个 n-gram 草稿会稀释 MTP 接受率） | 27K decode **64.2 → 78.3 tok/s**，贪心输出逐字不变 |
+| **FP8 SwiGLU 宽 T 走 FP32 出口的 CUTLASS**（原先落在每 4 个 token 一块的 SIMT 阶梯） | 混合量化制品 prefill **508 → 998 tok/s** |
+| **v2 制品直读**：清单在内存里归一化成 v3 形态，权重原地读 | v2 原件与升级后逐字一致，省掉离线转换与 24 GB 副本 |
+
+### 快速开始
+
+```bash
+# 单卡（host GPU 1 = V100-32GB），生产 compose 示例在 Docker 仓库的 ai/ninfer-v100/
+docker run -d --gpus device=1 -v /path/to/models:/workspace/models \
+  --entrypoint ninfer-serve ninfer:v100 \
+  /workspace/models/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3.ninfer \
+  --host 0.0.0.0 --port 8000 --api-key sk-xxx --model-id qwen --max-context 200000 \
+  --prefill-chunk 2048 --kv-capacity auto --kv-dtype int8 --max-concurrency 2 \
+  --spec mtp --draft-tokens 4 --lm-head-draft --ngram-draft-tokens 0
+```
+
+构建：`Dockerfile.sm70.local`（CUDA 12.8 + `-DCMAKE_CUDA_ARCHITECTURES=70` 全量）或
+`Dockerfile.sm70-runtime.local`（复用已编好的 `ninfer-serve` 秒级重打包）。
+
+### 验收与文档
+
+每个改动都要同时过上游自带的 FP64 oracle（`ctest`）与 27K 端到端 A/B；两线对照用
+`bench/v100/compare_lines.py`（预热后连测，输出 markdown 表），健康检查用 `GET /health`
+（加载中 503、就绪 200）。设计与实测记录全部在 [`docs/v100/`](docs/v100/)：
+路线图 [PLAN.md](docs/v100/PLAN.md) 加每阶段一篇实测文档。
+
 ## Highlights
 
 ### Ternary Bonsai 2 27B and Qwen3.8-27B
