@@ -70,6 +70,34 @@ __global__ void scale_gate_up_rows_kernel(__nv_bfloat16* __restrict__ data,
     data[i]            = __float2bfloat16(scaled);
 }
 
+// 本仓库 V100 增量（docs/v100/fp8-swiglu-wide-t-*.md）：宽 T 的 FP32 出口路线。上游的 A16 契约
+// 要求 gate/up 在激活之前保持 FP32，而上面的 BF16 平面路线会先舍入一次；把 CUTLASS 的输出元素
+// 型别换成 float、行缩放在 FP32 里做、再把 SwiGLU 融进同一趟读出，就同时满足契约与宽 T 的速度。
+// 实测与 BF16 平面路线在噪声内（见上面 scale_gate_up_rows_kernel 的注释）。
+__global__ void scale_gate_up_rows_f32_kernel(float* __restrict__ data,
+                                              const __nv_bfloat16* __restrict__ row_scales,
+                                              std::int64_t total, int n) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) { return; }
+    const int row = static_cast<int>(i % n);
+    data[i] *= __bfloat162float(row_scales[row]);
+}
+
+// gate 在行 [0, half)，up 在行 [half, n)；输出 out 的存储是 token-major（元素 (r, t) 在
+// t*half + r），与 A16 阶梯里 out 张量 {half, tokens} 的列主序一致。
+__global__ void swiglu_from_f32_kernel(const float* __restrict__ plane,
+                                       __nv_bfloat16* __restrict__ out, int half, int n,
+                                       std::int64_t cols) {
+    const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= cols * half) { return; }
+    const std::int64_t t   = i / half;
+    const int r            = static_cast<int>(i - t * half);
+    const float gate       = plane[t * n + r];
+    const float up         = plane[t * n + half + r];
+    const float silu       = gate / (1.0F + __expf(-gate));
+    out[i]                 = __float2bfloat16(silu * up);
+}
+
 int div_up_i(int a, int b) { return (a + b - 1) / b; }
 
 using ElementAccumulator     = float;
@@ -77,6 +105,7 @@ using ElementComputeEpilogue = ElementAccumulator;
 using ElementInputA = cutlass::half_t;
 using ElementInputB = cutlass::half_t;
 using ElementOutput = cutlass::bfloat16_t;
+using ElementOutputF32 = float;
 
 using LayoutInputA = cutlass::layout::RowMajor;    // X[T,K]: natural bf16->fp16 cast storage
 using LayoutInputB = cutlass::layout::ColumnMajor; // W^T[K,N]: natural row-major-by-n dequant storage
@@ -101,6 +130,17 @@ using Gemm = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, ElementInp
                                          ElementOutput, LayoutOutput, ElementAccumulator, MMAOp,
                                          SmArch, ShapeMMAThreadBlock, ShapeMMAWarp, ShapeMMAOp,
                                          EpilogueOp, SwizzleThreadBlock, kNumStages>;
+
+// 本仓库 V100 增量：同一套 mma 配置，但把累加器直接以 FP32 写进暂存平面（不经过 BF16 舍入）。
+using EpilogueOpF32 = cutlass::epilogue::thread::LinearCombination<
+    ElementOutputF32, 128 / cutlass::sizeof_bits<ElementOutputF32>::value, ElementAccumulator,
+    ElementComputeEpilogue>;
+
+using GemmF32 = cutlass::gemm::device::Gemm<ElementInputA, LayoutInputA, ElementInputB, LayoutInputB,
+                                            ElementOutputF32, LayoutOutput, ElementAccumulator,
+                                            MMAOp, SmArch, ShapeMMAThreadBlock, ShapeMMAWarp,
+                                            ShapeMMAOp, EpilogueOpF32, SwizzleThreadBlock,
+                                            kNumStages>;
 
 template <class Allocator>
 struct CutlassWorkspace {
@@ -202,6 +242,102 @@ void fp8_linear_swiglu_cutlass_sm70_launch(const Tensor& x, const Weight& w, Ten
         scale_gate_up_rows_kernel<<<blocks, threads, 0, stream>>>(
             static_cast<__nv_bfloat16*>(gate_up_out.data), static_cast<const __nv_bfloat16*>(w.scales),
             total, n);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+std::size_t fp8_linear_swiglu_cutlass_f32_workspace_bytes(std::int32_t gate_up_rows,
+                                                         std::int32_t k, std::int32_t cols) {
+    WorkspaceLayoutBuilder layout;
+    cutlass::gemm::GemmCoord problem_size(cols, gate_up_rows, k);
+    typename GemmF32::Arguments arguments{problem_size, {nullptr, k},        {nullptr, k},
+                                          {nullptr, gate_up_rows}, {nullptr, gate_up_rows},
+                                          {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
+    const std::size_t gemm_workspace_bytes = GemmF32::get_workspace_size(arguments);
+    (void)allocate_cutlass_workspace(layout, gate_up_rows, k, cols, gemm_workspace_bytes);
+    (void)layout.alloc(DType::FP32, {gate_up_rows, cols});
+    return layout.peak_bytes(1);
+}
+
+// 本仓库 V100 增量（docs/v100/fp8-swiglu-wide-t-*.md）：宽 T 的 FP8 SwiGLU。除最后一段外与上面
+// 的 BF16 路线共用同一内核（反量化 FP8→FP16、bf16 激活→FP16、sm_70 mma），区别只在 CUTLASS 的
+// 输出平面是 FP32，行缩放在 FP32 里做，SwiGLU 直接读这个平面，整条路径上有且仅有一次舍入
+// （写回 BF16 的 out）——与上游 A16 阶梯“激活前保持 FP32”的契约一致。
+void fp8_linear_swiglu_cutlass_sm70_launch_f32(const Tensor& x, const Weight& w, Tensor& out,
+                                               WorkspaceArena& ws, cudaStream_t stream) {
+    const std::int32_t k    = x.ne[0];
+    const std::int32_t cols = x.ne[1];
+    const std::int32_t n    = w.n;
+    const std::int32_t half = n / 2;
+
+    cutlass::gemm::GemmCoord problem_size(cols, n, k);
+    typename GemmF32::Arguments sizing_arguments{
+        problem_size, {nullptr, k}, {nullptr, k}, {nullptr, n}, {nullptr, n},
+        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)}, 1};
+    const std::size_t gemm_workspace_bytes = GemmF32::get_workspace_size(sizing_arguments);
+
+    auto scratch_scope = ws.scope();
+    CutlassWorkspace<WorkspaceArena> scratch =
+        allocate_cutlass_workspace(ws, n, k, cols, gemm_workspace_bytes);
+    auto* plane = static_cast<float*>(ws.alloc(DType::FP32, {n, cols}).data);
+
+    auto* w_fp16 = static_cast<cutlass::half_t*>(scratch.w_fp16.data);
+    auto* x_fp16 = static_cast<cutlass::half_t*>(scratch.x_fp16.data);
+
+    {
+        const dim3 block(256);
+        const dim3 grid(static_cast<unsigned>(div_up_i(k / 2, 256)), static_cast<unsigned>(n), 1u);
+        dequant_fp8_row_to_fp16<<<grid, block, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), n, k,
+            w.layout == QuantLayout::VoltaQpnPrepacked, w_fp16);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        const std::int64_t count = static_cast<std::int64_t>(cols) * k;
+        const int threads        = 256;
+        const int blocks         = static_cast<int>((count + threads - 1) / threads);
+        bf16_to_fp16_kernel<<<blocks, threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), x_fp16, count);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    GemmF32 gemm_op;
+    typename GemmF32::Arguments arguments{
+        problem_size,
+        {x_fp16, k},
+        {w_fp16, k},
+        {plane, n},
+        {plane, n},
+        {ElementComputeEpilogue(1), ElementComputeEpilogue(0)},
+        1};
+
+    cutlass::Status status = gemm_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        throw std::runtime_error("fp8_linear_swiglu_cutlass_sm70_f32: CUTLASS can_implement failed");
+    }
+    status = gemm_op.initialize(arguments, scratch.gemm_workspace.data, stream);
+    if (status != cutlass::Status::kSuccess) {
+        throw std::runtime_error("fp8_linear_swiglu_cutlass_sm70_f32: CUTLASS initialize failed");
+    }
+    status = gemm_op(stream);
+    if (status != cutlass::Status::kSuccess) {
+        throw std::runtime_error("fp8_linear_swiglu_cutlass_sm70_f32: CUTLASS gemm() failed");
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    const std::int32_t threads = 256;
+    {
+        const std::int64_t total = static_cast<std::int64_t>(cols) * n;
+        const int blocks         = static_cast<int>((total + threads - 1) / threads);
+        scale_gate_up_rows_f32_kernel<<<blocks, threads, 0, stream>>>(
+            plane, static_cast<const __nv_bfloat16*>(w.scales), total, n);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    {
+        const std::int64_t total = static_cast<std::int64_t>(cols) * half;
+        const int blocks         = static_cast<int>((total + threads - 1) / threads);
+        swiglu_from_f32_kernel<<<blocks, threads, 0, stream>>>(
+            plane, static_cast<__nv_bfloat16*>(out.data), half, n, cols);
         CUDA_CHECK(cudaGetLastError());
     }
 }

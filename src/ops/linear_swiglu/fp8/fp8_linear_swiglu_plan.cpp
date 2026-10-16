@@ -7,6 +7,7 @@
 #if defined(NINFER_SM70)
 #    include "core/layout.h"          // 本仓库 V100 增量：WorkspaceLayoutBuilder
 #    include "ops/linear/fp8/fp8_launch.h"
+#    include "ops/linear_swiglu/fp8/fp8_linear_swiglu_cutlass_sm70.h" // 本仓库 V100 增量：宽 T
 #endif
 #include "ops/linear/fp8/fp8_config.h"
 
@@ -74,24 +75,32 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
     // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 上 t<=32 走拆分式 QPN（gate/up 的 FP32 暂存
     // 是真实需求，也正是上游 A16 契约要求的"激活前保持 FP32"）。容量来自同一决策而不是
     // route table——测试会强制 unified 表，而钩子不受表影响。
-    if (min_tokens <= kFp8VoltaQpnMaxTokens &&
-        fp8_volta_qpn_takes(policy, Fp8N34816K5120::kOutputRows, Fp8N34816K5120::kInputRows,
+    if (fp8_volta_qpn_takes(policy, Fp8N34816K5120::kOutputRows, Fp8N34816K5120::kInputRows,
                             std::min(max_tokens, kFp8VoltaQpnMaxTokens))) {
         constexpr std::int32_t kHalf = 17408; // Fp8N34816K5120::kOutputRows / 2
-        const std::int32_t chunk     = std::min(max_tokens, kFp8VoltaQpnMaxTokens);
-        WorkspaceLayoutBuilder split_layout;
-        (void)split_layout.alloc_bytes(static_cast<std::size_t>(kHalf) * chunk * sizeof(float),
-                                       256);
-        (void)split_layout.alloc_bytes(static_cast<std::size_t>(kHalf) * chunk * sizeof(float),
-                                       256);
-        (void)split_layout.alloc_bytes(
-            static_cast<std::size_t>(Fp8N34816K5120::kInputRows) * chunk * sizeof(std::uint16_t),
-            256);
-        // 宽 T（t>=33）交回上游阶梯：本 op 的 A16 契约要求激活之前保持 FP32，而这里的
-        // 拆分路线在 t<=32 用 FP32 平面满足它；单次 CUTLASS 只给出 BF16 的 gate_up 平面，
-        // 过不了上游的判据。上游宽 T 阶梯不需要暂存，所以顶层查询（min_tokens > 32）与
-        // 落入宽区的单 T 查询都返回 0（见上面的 min_tokens 判断）。
-        return split_layout.peak_bytes(1);
+        std::size_t need             = 0;
+        if (min_tokens <= kFp8VoltaQpnMaxTokens) {
+            const std::int32_t chunk = std::min(max_tokens, kFp8VoltaQpnMaxTokens);
+            WorkspaceLayoutBuilder split_layout;
+            (void)split_layout.alloc_bytes(static_cast<std::size_t>(kHalf) * chunk * sizeof(float),
+                                           256);
+            (void)split_layout.alloc_bytes(static_cast<std::size_t>(kHalf) * chunk * sizeof(float),
+                                           256);
+            (void)split_layout.alloc_bytes(static_cast<std::size_t>(Fp8N34816K5120::kInputRows) *
+                                               chunk * sizeof(std::uint16_t),
+                                           256);
+            need = split_layout.peak_bytes(1);
+        }
+        // 本仓库 V100 增量（docs/v100/fp8-swiglu-wide-t-*.md）：宽 T（t>=33）由 FP32 出口的
+        // CUTLASS 拥有（原先交回上游的 small-t 阶梯，在 prefill 上是每 4 个 token 一块的 SIMT，
+        // 实测占 FP8 混合制品近一半的 GPU 时间）。容量必须覆盖它；单个 T 的查询（min==max）
+        // 要求与实际高水位精确相等，所以这里不能多算。
+        if (max_tokens > kFp8VoltaQpnMaxTokens) {
+            need = std::max(need, fp8_linear_swiglu_cutlass_f32_workspace_bytes(
+                                      Fp8N34816K5120::kOutputRows,
+                                      Fp8N34816K5120::kInputRows, max_tokens));
+        }
+        return need;
     }
 #endif
     return capacity_by_table(
@@ -110,11 +119,18 @@ void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& o
                                 cudaStream_t stream) {
 #if defined(NINFER_SM70)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：FP8 SwiGLU 在 sm_70 上 t<=32 走拆分式 QPN
-    // （fork 实测拆分快于融合内核；gate/up 的 FP32 暂存是这条路线的一部分），t>=33 走
-    // CUTLASS 宽 T。必须在 route-table 检查之前拦截。
-    if (weight.n == Fp8N34816K5120::kOutputRows && x.ne[1] <= kFp8VoltaQpnMaxTokens &&
-        fp8_volta_qpn_takes(policy, Fp8N34816K5120::kOutputRows, weight.k, x.ne[1])) {
-        if (x.ne[1] > kFp8VoltaQpnMaxTokens) { return; } // 宽 T 交回上游阶梯（见容量处的说明）
+    // （fork 实测拆分快于融合内核；gate/up 的 FP32 暂存是这条路线的一部分），t>=33 走 FP32
+    // 出口的 CUTLASS（见 fp8_linear_swiglu_cutlass_sm70.cu）。必须在 route-table 检查之前拦截。
+    if (weight.n == Fp8N34816K5120::kOutputRows &&
+        fp8_volta_qpn_takes(policy, Fp8N34816K5120::kOutputRows, weight.k,
+                            std::min(x.ne[1], kFp8VoltaQpnMaxTokens))) {
+        if (x.ne[1] > kFp8VoltaQpnMaxTokens) {
+            // 本仓库 V100 增量：宽 T（t>=33）。原先这里交回上游的 small-t 阶梯，它在 prefill
+            // 上按每 4 个 token 一块跑 SIMT（一维网格、T 在核内串行），实测占 FP8 混合制品
+            // 近一半的 GPU 时间。
+            fp8_linear_swiglu_cutlass_sm70_launch_f32(x, weight, out, workspace, stream);
+            return;
+        }
         constexpr std::int32_t kHalf = Fp8N34816K5120::kOutputRows / 2;
         auto scope                  = workspace.scope();
         const DeviceSpan gate       = workspace.alloc_bytes(
