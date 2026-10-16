@@ -44,52 +44,49 @@ harness `HostCache` 的解码值逐元素对齐），先证明 gather 完全正�
 * `--int8-prompt-only` 默认（走 prompt 路线）**PASS**；
 * `NINFER_ATTN_VOLTA_FLASH_INT8=1 --int8-prompt-only` **PASS**（证明 int8 flash 分支数值正确）。
 
-## 性能：正确版本还不划算（重要更正）
+## 性能：换内核后赢下来了（2026-10-15 晚，更正早先的"不划算"结论）
 
-27,217 token 请求、同参数、GPU 空载（当前生产模型 `...-dflash2-nvfp4-v3.ninfer`）：
+同一型号制品（`...-dflash2-nvfp4-v3.ninfer`）、同一 27,217 token 请求：
 
 | 配置 | TTFT | prefill |
 |---|---|---|
-| int8 默认（prefill 路线 = 本线 prompt 内核） | **30.1s** | **906 tok/s** |
-| int8 + flash（opt-in） | 33.9s | 807 tok/s |
-| bf16 + flash（opt-in） | 33.4s | ~815 tok/s |
+| 本线 prompt 路线（旧默认） | 30.1s | 906 tok/s |
+| **本线 flash 路线（现在的默认）** | **27.3s** | **~1.00k tok/s** |
+| 本线 flash 路线 + bf16 KV | **26.8s** | — |
+| 上游参考构建 | 27.0s | 1.01k tok/s |
 
-bench 同一形状也一致（W=2048/ctx=16384：flash 42.2ms vs prompt 41.3ms）。
+⇒ **27K prefill 已追平上游参考构建（差 1%），比自己原来的路线快 10%**。bench 同形状：41.1ms → **25.1ms**（−39%）。
 
-**原因**：本引擎的 prefill 是分块的（`--prefill-chunk 2048` → 27K 要 14 次调用），而该路线每次调用都要
-把**整个可见前缀** staging 成 FP16 并逐 block 建 mask，于是这部分成本按"每块 × 前缀"重复 14 次；上游
-引擎把整段 prompt 一次交给注意力算子，只付一次。把 `--prefill-chunk` 放大并不能救（8192/16384 时
-TTFT 反而 48–51s，mask 与 per-block 开销随 n_kv 线性增长）。
+### 关键更正：瓶颈是"哪一版 flash 内核"，不是 staging，也不是因果带
 
-**注意**：本文件早先记录的"bf16 flash 1150 tok/s（+27%，比 master 快 14%）"是在 bug #3 未修的
-*截断 key 范围*版本上测到的——快但不正确，已作废。
+早先我归因为"dense tile 多算因果带"（不成立：该调用只做 ~0.42 TFLOP，6.5 TFLOP/s），后来又试过 staging
+复用（也不成立：gather+mask+convert 只占 0.6ms/次 = 1%）。真正的差别在于**桥后面的内核版本**：
 
-## kernel 级证据：瓶颈不是 staging，是 flash 内核本身（更正我先前的判断）
-
-对 int8 的 `--entry append`（W=2048 / ctx=16384）做 nsys（`--cuda-graph-trace=node`），8 次调用：
-
-| 内核 | 合计 | 每次调用 |
+| 同形状 W=2048 / ctx=16384 / int8 | 每 query-key 对 | 每 op 调用 |
 |---|---|---|
-| **`flash_attn_ext_f16`**（每调用 16 个 128 行块） | **514.9 ms** | **64.4 ms** |
-| `flash_attn_stream_k_fixup_general` | 3.5 ms | 0.44 ms |
-| `volta_flash_gather` | 1.7 ms | 0.21 ms |
-| `volta_flash_build_mask` | 1.1 ms | 0.14 ms |
-| convert_q / convert_out | 2.0 ms | 0.25 ms |
+| `gguf::flash_attention`（third_party/ggml-quants 的较新 ggml fattn，含 stream-k 变体） | 1.8 ns | 53.9 ms |
+| **vendored pinned llama.cpp 内核（本次移植）** | **0.75 ns** | **25.1 ms** |
+| 上游参考构建（同一 pinned 内核） | 0.75 ns | 24.7 ms |
 
-即 staging（gather + mask + convert）合计只有 **0.6 ms/调用**，占 1%；**64.4 ms 全在 flash 内核**。
-所以我原本计划的"staging 跨 chunk 复用"不可能解决问题。
+## 移植内容
 
-把 Q-block 从 128 放大到 512（减少 stream-k launch 数）只把每次调用从 64.8 ms 压到 **53.9 ms**，
-仍慢于本线 int8 `prompt_kernel` 的 **42.3 ms**。原因是结构性的：flash 内核按 dense tile + mask 计算
-（因果下界只到每 block 的 key 上界），而本线的 prompt 内核按因果分块，直接把"看不见的那一半"跳过；
-V100 上 int8 DP4A 的因果核在这个形状下比 ggml 的 FP16 tensor-core fattn（含 stream-k/fixup）更快。
-上游之所以在这条路上"赢"，是因为它的 prompt 路线是 naive quadratic 内核（bench 1710 ms），不是这条
-flash 路线本身有多好。
+* `third_party/llama_cpp_fattn/`：从上游参考树原样拷入的 vendored 内核（200 KB，pin 62bf73d25）。
+* `src/ops/launcher/volta_flash_llama.cu`：`launch_fattn` 的 mma_f16 配置 + 直接 grid（含 stream-K
+  fixup），按 d256-h24-kv4 / d256-h16-kv2 两个几何实例化；vendored include 在 CMake 里**只作用于该文件**
+  （仓库约定：vendored 头定义 `CUDA_CHECK`/`WARP_SIZE`，与 `src/ops` 冲突）。
+* K/V 布局必须是 **[key][head][dim]**（内核硬编码 nb11 = DKQ*kv_heads*2、nb12 = DKQ*2）——早先为 ggml 桥
+  改成的 `[head][slot][d]` 已改回。
+* 路线**默认开启**（int8 与 bf16），`NINFER_ATTN_VOLTA_FLASH=0` / `NINFER_ATTN_VOLTA_FLASH_INT8=0` 可关。
 
-## 结论与下一步
+## 验收
 
-* 该路线**保持 opt-in、默认关闭**：它数值正确但在 V100 上对本几何（d256-h24-kv4 / 因果 int8 prefill）
-  不划算，生产继续用 int8 prompt 路线。
-* 若要继续追这 10%：方向应是**让本线 prompt 内核更快**（它已经是两条路线里更快的），例如
-  更激进的因果跳块、把 K/V 反量化与 DP4A 流水重叠、或按 visible key 数选择不同的 split；而不是
-  搬 flash 内核。
+* `--int8-prompt-only`（默认即走 flash）**PASS**（FP64 oracle）；
+* 主注意力测试（全存储）**PASS**；
+* bf16 + flash 端到端输出正确（中文摘要正常）；
+* 关掉路线（`=0`）时行为与旧版本一致（30.1s / 906 tok/s）。
+
+## 仍未追平的部分
+
+* **反量化 +0.49s**：本线刻意选的"精确解码"比上游的移位技巧慢 29%（27K prefill 里占 15% 差距）。
+  这是数值契约的选择，不建议为性能改动。
+* **27K decode −7%**：来自 MTP 接受率差异（49.7% vs 62.5%），与 prefill 无关。

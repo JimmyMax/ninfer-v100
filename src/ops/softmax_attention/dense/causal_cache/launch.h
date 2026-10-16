@@ -7,6 +7,7 @@
 #include "core/tensor.h"
 #include "ninfer/ops/softmax_attention.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -146,6 +147,16 @@ void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& 
     std::int32_t q_heads, std::int64_t max_visible_keys);
 // float2 elements the bridge's stream-K partials need for one Q-block.
 [[nodiscard]] std::size_t causal_attention_volta_flash_stream_elements(std::int32_t q_heads);
+// Direct launch of the vendored llama.cpp flash-attention kernel (ops/launcher/volta_flash_llama.cu)
+// and the float2 elements its stream-K meta needs. Q is FP32, K/V/mask FP16.
+[[nodiscard]] std::size_t volta_flash_llama_meta_elements(std::int32_t q_heads,
+                                                          std::int32_t tokens);
+void volta_flash_llama_launch(const float* q_f32, const half* k_f16, const half* v_f16,
+                              const half* mask, float* out_f32, float2* meta,
+                              std::int32_t q_heads, std::int32_t kv_heads, std::int32_t tokens,
+                              std::int32_t n_kv, std::int32_t mask_stride, float scale,
+                              cudaStream_t stream);
+
 void causal_attention_volta_flash_launch(const Tensor& q, const Tensor& positions,
                                          const Tensor& valid_columns, const Tensor& table_rows,
                                          float scale, std::int64_t visible_keys,

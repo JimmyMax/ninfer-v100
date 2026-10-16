@@ -201,26 +201,21 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
 * 生产：`ninfer:v100-gdnrec`
 * 详见 [gdn-recurrent-and-prefill-gap-2026-10-15.md](gdn-recurrent-and-prefill-gap-2026-10-15.md)。
 
-### S0.11 Volta flash-attention prefill 路线移植 ☑/◐（2026-10-15）
+### S0.11 Volta flash-attention prefill 路线移植 ☑（2026-10-15）
 
-把上游参考构建的 prefill 注意力（vendored llama.cpp `flash_attn_ext_f16`，tensor cores）接到本线：
-`src/ops/launcher/gqa_attention_volta_flash.cu` + 两个入口（growing/cached）的分派与容量。
+把上游参考构建的 prefill 注意力（vendored pinned llama.cpp `flash_attn_ext_f16`，tensor cores）接到本线。
 
-* [x] **数值正确**：`ctest` 注意力全存储 **PASS**；`--int8-prompt-only` 默认 PASS，
-      `NINFER_ATTN_VOLTA_FLASH_INT8=1` 强制走该路线也 **PASS**（int8 与 bf16 都过 FP64 oracle）。
+* [x] **数值正确**：`--int8-prompt-only`（默认即走该路线）**PASS**；主注意力测试（全存储）**PASS**；
+      bf16 + flash 端到端输出正确。
 * [x] 用 oracle harness 修掉三个真 bug：容量门控（`min_width<=128` → `max_width>=128`）、
       分配未按 256 取整（统一到 `causal_attention_volta_flash_key_extent()`）、
-      **每 Q-block 的 key 上界漏掉前缀**（主因，`round_up(base+begin+tokens)`）。
-* [x] 性能结论（更正）：**正确版本在本引擎的分块 prefill 下还不划算** —— 27K 上 int8 默认（prompt 路线）
-      **30.1s / 906 tok/s**，int8+flash 33.9s / 807 tok/s，bf16+flash 33.4s。原因是每次调用都要 staging
-      整个可见前缀，而 prefill 被分成 14 次调用 → 重复付费；上游引擎把整段 prompt 一次交给注意力算子。
-      早先记录的 "bf16 flash 1150 tok/s/+27%" 是 *截断 key 范围* 的错误版本，已作废。
-* 因此路线**默认关闭**（`NINFER_ATTN_VOLTA_FLASH[_INT8]=1` 才启用），生产行为不变。
-* [x] kernel 级证据更正："staging 复用"不是解法 —— nsys 显示 staging（gather+mask+convert）只有
-      **0.6 ms/调用（1%）**，64.4 ms 全在 `flash_attn_ext_f16` 内核里；Q-block 128→512 只把
-      64.8→53.9 ms，仍慢于本线 int8 prompt 内核的 42.3 ms（因果分块跳掉一半计算 vs dense tile+mask）。
-      上游的"优势"来自它的 prompt 路线是 naive quadratic 内核（bench 1710 ms），不是 flash 本身。
-* 下一步方向：让本线 prompt 内核更快（因果跳块 / 反量化与 DP4A 流水重叠 / 按 visible key 选 split）。
+      **每 Q-block 的 key 上界漏掉前缀**（主因）。
+* [x] **决定性发现**：慢的不是 staging（gather+mask+convert 仅 0.6 ms/次 = 1%），而是**桥后面的内核版本**
+      ——`gguf::flash_attention`（较新 ggml fattn）1.8 ns/query-key 对，pinned vendored 内核 0.75 ns。
+      移植 `third_party/llama_cpp_fattn` + `ops/launcher/volta_flash_llama.cu`（直接 grid，无 ggml 桥）后：
+      bench 41.1 → **25.1 ms**；27K e2e TTFT 30.1 → **27.3 s**（上游参考 27.0 s）⇒ **prefill 追平上游**。
+* [x] 路线默认开启（int8/bf16），`NINFER_ATTN_VOLTA_FLASH[_INT8]=0` 可关。
+* 剩余：反量化 +0.49s（本线刻意选的精确解码，不动）；27K decode −7%（MTP 接受率差异，与 prefill 无关）。
 * 详见 [volta-flash-prefill-2026-10-15.md](volta-flash-prefill-2026-10-15.md)。
 
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐

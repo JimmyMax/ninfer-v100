@@ -13,11 +13,12 @@
 // against this line's 7.28 s of prompt attention, and this route is what closes that gap when it is
 // affordable.
 //
-// It is OPT-IN (NINFER_ATTN_VOLTA_FLASH=1, and NINFER_ATTN_VOLTA_FLASH_INT8=1 for the int8 cache)
-// because at the shapes this engine actually calls it is not yet a win: prefill is chunked, and
-// every call has to stage its whole visible prefix, so the staging and mask traffic repeat per
-// chunk instead of once per layer. Correctness is not in question -- the int8 and bf16 prompt
-// oracles both pass with the route forced on.
+// The kernel it launches is the pinned vendored one (ops/launcher/volta_flash_llama.cu), not the
+// newer ggml kernel reachable through ops/linear/gguf/ggml_fattn.cu: measured on the same shape
+// (W=2048/ctx=16384, int8) that one costs 1.8 ns per query-key pair against 0.75 ns here, which is
+// the difference between losing and winning against this line's own int8 prompt kernel (25 ms vs
+// 41 ms) and, end to end at 27K tokens, between trailing the upstream reference build by 10% and
+// matching it. NINFER_ATTN_VOLTA_FLASH[_INT8]=0 turns the route off.
 //
 // Cost: the gathered planes are `2 * round_up(keys) * kv_heads * 256 * 2` bytes, so the route only
 // applies while the visible key range stays inside kFlashMaximumVisibleKeys; past that the prompt
@@ -29,7 +30,6 @@
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
-#include "ops/linear/gguf/ggml_fattn.h"
 #include "ops/softmax_attention/dense/causal_cache/geometry.cuh"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
@@ -67,7 +67,7 @@ constexpr int round_up_keys(int n) { return ((n + kKeyPad - 1) / kKeyPad) * kKey
 bool volta_flash_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_ATTN_VOLTA_FLASH");
-        return value != nullptr && value[0] != '0';
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }
@@ -79,7 +79,7 @@ bool volta_flash_enabled() {
 bool volta_flash_int8_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_ATTN_VOLTA_FLASH_INT8");
-        return value != nullptr && value[0] != '0';
+        return value == nullptr || value[0] != '0';
     }();
     return enabled;
 }
@@ -104,8 +104,10 @@ __global__ void volta_flash_gather_kv_kernel(
     const int d   = threadIdx.x;
     if (key >= n_kv_padded) { return; }
 
+    // [key][head][dim]: the vendored kernel's nb11 = DKQ*kv_heads*2 (key stride) and nb12 =
+    // DKQ*2 (head stride) are hard-coded by ops/launcher/volta_flash_llama.cu.
     const std::int64_t dst =
-        static_cast<std::int64_t>(d) + kHeadDim * (key + static_cast<std::int64_t>(n_kv_padded) * h);
+        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
 
     // Padding rows are written as zero rather than left uninitialised: the mask gives them weight
     // zero, and 0 * NaN would still be NaN.
@@ -136,8 +138,9 @@ __global__ void volta_flash_gather_kv_i8_kernel(
     const int d   = threadIdx.x;
     if (key >= n_kv_padded) { return; }
 
+    // [key][head][dim], see the BF16 variant.
     const std::int64_t dst =
-        static_cast<std::int64_t>(d) + kHeadDim * (key + static_cast<std::int64_t>(n_kv_padded) * h);
+        static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * key);
     if (key >= n_kv) {
         k_out[dst] = __float2half(0.0f);
         v_out[dst] = __float2half(0.0f);
@@ -302,26 +305,11 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& positions,
             static_cast<std::size_t>(tokens) * kQHeads * kHeadDim * sizeof(float);
         CUDA_CHECK(cudaMemsetAsync(out_f32_ptr, 0, out_bytes, stream));
 
-        gguf::FlashAttentionArgs args;
-        args.head_dim        = kHeadDim;
-        args.query_heads     = kQHeads;
-        args.kv_heads        = kKVHeads;
-        args.tokens          = tokens;
-        args.q               = q_f32_ptr;
-        args.q_token_stride  = static_cast<std::int64_t>(kQHeads) * kHeadDim;
-        args.k               = k_gathered.data;
-        args.v               = v_gathered.data;
-        args.row_bytes       = static_cast<std::int64_t>(kHeadDim) * 2;
-        // The gathered planes are laid out for the whole visible range; only the first `slots`
-        // keys of each head are read.
-        args.head_bytes      = static_cast<std::int64_t>(kHeadDim) * n_kv_padded * 2;
-        args.slots           = n_kv;
-        args.mask            = mask_ptr;
-        args.mask_row_halves = n_kv;
-        args.out             = out_f32_ptr;
-        args.scale           = scale;
-        args.kv_max          = nullptr;
-        gguf::flash_attention(args, flash_workspace, flash_workspace_bytes, stream);
+        // Direct launch of the pinned vendored kernel (its grid + stream-K fixup, no ggml bridge).
+        volta_flash_llama_launch(q_f32_ptr, static_cast<const half*>(k_gathered.data),
+                                 static_cast<const half*>(v_gathered.data), mask_ptr, out_f32_ptr,
+                                 static_cast<float2*>(flash_workspace), kQHeads, kKVHeads, tokens,
+                                 n_kv, /*mask_stride=*/n_kv, scale, stream);
 
         const std::int64_t count = static_cast<std::int64_t>(tokens) * kQHeads * kHeadDim;
         const int blocks         = static_cast<int>((count + 255) / 256);
@@ -392,10 +380,9 @@ std::size_t causal_attention_volta_flash_block_elements(std::int32_t q_heads,
 std::size_t causal_attention_volta_flash_stream_elements(std::int32_t q_heads) {
     std::int32_t kv_heads = 0;
     if (!volta_flash_kv_heads(q_heads, kv_heads)) { return 0; }
-    // The stream-K partials are float2, so the bridge's byte count is rounded up to float2 here.
-    const std::size_t bytes = gguf::flash_attention_workspace_bytes(
-        kHeadDim, q_heads, kv_heads, kFlashQBlockTokens);
-    return (bytes + sizeof(float2) - 1) / sizeof(float2);
+    // The vendored launcher's stream-K meta, in float2 elements.
+    (void)kv_heads;
+    return volta_flash_llama_meta_elements(q_heads, kFlashQBlockTokens);
 }
 
 void causal_attention_volta_flash_launch(const Tensor& q, const Tensor& positions,

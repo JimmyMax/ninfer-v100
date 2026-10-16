@@ -26,6 +26,15 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_non_rdc)
 endif()
 
+# The vendored llama.cpp flash-attention tree (third_party/llama_cpp_fattn) defines CUDA_CHECK,
+# WARP_SIZE and a common.cuh that collide with src/ops, so its include directory is scoped to the
+# single translation unit that drives it.
+set_source_files_properties(
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/volta_flash_llama.cu"
+  TARGET_DIRECTORY ninfer_ops
+  PROPERTIES
+    INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
+    COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
 include(basic_sources.cmake)
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
