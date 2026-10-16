@@ -3,12 +3,40 @@
 #include "artifact/file_io.h"
 #include "artifact/formats.h"
 #include "artifact/layouts.h"
+#include "artifact/v2_directory.h" // 本仓库 V100 增量：v2 直读
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <limits>
+#include <string_view>
 
 namespace ninfer::artifact {
+
+namespace {
+// 本仓库 V100 增量：v2 头没有 UUID。用目录文本 + 文件长度做一个稳定的 128 位 FNV-1a 指纹
+// （同一次加载内恒定，不同制品不同；v2 也没有 continuation 文件，指纹不会跨文件比较）。
+[[nodiscard]] ArtifactId derive_v2_artifact_id(std::string_view text,
+                                               std::uint64_t file_bytes) noexcept {
+    constexpr std::uint64_t kOffset = 0xcbf29ce484222325ULL;
+    constexpr std::uint64_t kPrime  = 0x100000001b3ULL;
+    constexpr std::uint64_t kMix    = 0x9e3779b97f4a7c15ULL;
+    std::uint64_t low               = kOffset;
+    std::uint64_t high              = kOffset ^ kMix;
+    const auto absorb               = [&](unsigned byte) {
+        low  = (low ^ byte) * kPrime;
+        high = (high ^ byte) * kPrime + kMix;
+    };
+    for (const char ch : text) { absorb(static_cast<unsigned char>(ch)); }
+    for (unsigned i = 0; i < 8; ++i) { absorb((file_bytes >> (8 * i)) & 0xff); }
+    ArtifactId id{};
+    for (unsigned i = 0; i < 8; ++i) {
+        id[i]     = std::byte{static_cast<unsigned char>((low >> (8 * i)) & 0xff)};
+        id[8 + i] = std::byte{static_cast<unsigned char>((high >> (8 * i)) & 0xff)};
+    }
+    return id;
+}
+} // namespace
 
 struct Reader::Impl {
     std::filesystem::path entry;
@@ -23,28 +51,38 @@ struct Reader::Impl {
         auto file = std::make_unique<InputFile>(entry);
         std::array<std::byte, kHeaderBytes> header{};
         file->read_exact(0, header);
-        if (!std::equal(kEntryMagic.begin(), kEntryMagic.end(), header.begin())) {
-            if (std::equal(kEntryMagic.begin(), kEntryMagic.end() - 1, header.begin()) &&
-                header[kEntryMagic.size() - 1] == std::byte{2}) {
-                throw ArtifactError(
-                    entry.string() +
-                    ": NInfer v2 artifact is not supported. Upgrade to v3 with: "
-                    "python3 tools/upgrade_ninfer_v2_to_v3.py INPUT.ninfer OUTPUT.ninfer");
-            }
-            throw ArtifactError(entry.string() + ": expected NInfer v3 entry magic");
+        // 本仓库 V100 增量（docs/v100/v2-direct-read-2026-10-16.md）：v2 头的 JSON 长度在同一
+        // 位置，但头只有 16 字节、没有 UUID。清单在内存里归一化成 v3 形态后交给同一个
+        // parse_directory，权重字节原地读取（实测同一制品的 1184 个张量偏移升级前后 1:1 相同）。
+        const bool is_v2 =
+            std::equal(kEntryMagicV2.begin(), kEntryMagicV2.end(), header.begin());
+        if (!is_v2 && !std::equal(kEntryMagic.begin(), kEntryMagic.end(), header.begin())) {
+            throw ArtifactError(entry.string() + ": expected NInfer v2 or v3 entry magic");
         }
-        const auto json_bytes = read_u64_le(header.data() + 8);
-        if (!json_bytes || json_bytes > file->bytes() - kHeaderBytes ||
+        const std::uint64_t header_bytes = is_v2 ? kV2HeaderBytes : kHeaderBytes;
+        const auto json_bytes            = read_u64_le(header.data() + 8);
+        if (!json_bytes || json_bytes > file->bytes() - header_bytes ||
             json_bytes > std::numeric_limits<std::size_t>::max()) {
             throw ArtifactError(entry.string() + ": invalid directory length");
         }
-        std::copy_n(header.begin() + 16, id.size(), id.begin());
         std::string text(static_cast<std::size_t>(json_bytes), '\0');
-        file->read_exact(kHeaderBytes, std::as_writable_bytes(std::span(text.data(), text.size())));
-        directory =
-            parse_directory(parse_json(text, "artifact directory"), entry.filename().string());
-        entry_payload_start = align_up(checked_add(kHeaderBytes, json_bytes, "metadata end"),
+        file->read_exact(header_bytes,
+                         std::as_writable_bytes(std::span(text.data(), text.size())));
+        entry_payload_start = align_up(checked_add(header_bytes, json_bytes, "metadata end"),
                                        kPayloadAlignment, "entry payload start");
+        if (is_v2) {
+            // v2 没有 UUID；用目录文本 + 文件长度做一个稳定的 128 位指纹（同一次加载内恒定，
+            // 不同制品不同；v2 也没有 continuation 文件，所以指纹不会跨文件比较）。
+            id        = derive_v2_artifact_id(text, file->bytes());
+            directory = parse_directory(
+                normalize_v2_directory(parse_json(text, "artifact directory"), entry_payload_start,
+                                       file->bytes(), entry.filename().string()),
+                entry.filename().string());
+        } else {
+            std::copy_n(header.begin() + 16, id.size(), id.begin());
+            directory =
+                parse_directory(parse_json(text, "artifact directory"), entry.filename().string());
+        }
         const auto expected =
             checked_add(entry_payload_start, directory.files[0].payload_bytes, "entry length");
         if (expected != file->bytes()) {

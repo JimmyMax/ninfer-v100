@@ -4,6 +4,8 @@ add_library(ninfer_artifact STATIC
   layouts.cpp
   file_io.cpp
   reader.cpp
+  # 本仓库 V100 增量（docs/v100/v2-direct-read-2026-10-16.md）：v2 清单→v3 目录的归一化
+  v2_directory.cpp
   binder.cpp
   materializer.cpp
   transcode.cpp
