@@ -294,6 +294,27 @@ CUTLASS 被打碎成 5.5 倍的碎 GEMM；注意力/GDN 两边完全一致。
 * **方案 C（不改）建议**：生产用 nvfp4 制品；GSQ 作为长上下文选项（+150K 上下文 ≈ 那 7 GiB 权重之差）。
 * 详见 [gsq-iq3s-prepack-assessment-2026-10-16.md](gsq-iq3s-prepack-assessment-2026-10-16.md)。
 
+### S0.17 FP8 SwiGLU 宽 T：混合量化制品 prefill 慢 2× 的真因 ☑（2026-10-16）
+
+用 v2 制品（升级成 v3 后）实测：我们 **TTFT 53.6s / prefill 508 tok/s**，master **27.1s / 1.00k**。
+nsys 逐内核对比后，55.05s vs 28.78s 的 GPU busy 差**只来自一个内核**：
+`fp8_simt_kernel<Fp8Geometry<34816,5120>, …, Fp8SwiGluOutput>` **27.67s × 54520 次、grid=(2176,1,1)**
+（一维网格，T 在核内串行）——FP8 的 MLP gate_up 落到了 SIMT 后备。
+
+* **根因**：`fp8_linear_swiglu_plan.cpp` 的 sm_70 钩子只接管 **t ≤ 32**（QPN 拆分），宽 T 交回上游
+  A16 阶梯（每 4 个 token 一块的 small-t SIMT）；而 `34816×5120` 的 FP16 暂存 **356 MB > 256 MiB**
+  的 CUTLASS 宽 T 上限，于是既不 CUTLASS 也不 QPN。其余 FP8 形状（≤178MB）都在限内，所以只有
+  这一个中招。
+* **不是缺 q4/q5/w8 内核的问题**：两个二进制里那族内核总计只占 0.2–4.5%，移植收益≈0。
+* **修复**：新增 **FP32 出口**的宽 T CUTLASS 路线（`fp8_linear_swiglu_cutlass_sm70_launch_f32`，
+  同一个 sm_70 mma，输出 `float` 平面、行缩放在 FP32 做、SwiGLU 直接读平面），t ≥ 33 走它；
+  并修掉容量函数里 `min_tokens <= 32` 的前置判断（单 T 查询 T≥33 时会算 0）。满足上游 A16
+  "激活前保持 FP32"的判据，不改测试、不动 v3/nvfp4 热路径。
+* **验收**：oracle 7/7 通过（含 A16 的 T=1…1024、非线性精度判据、单 T 容量精确性）；v2 制品
+  **53.6s → 27.3s / 997.6 tok/s**（master 27.1s / 1.00k），decode 82.7、MTP 69.2%（master 75.7 /
+  63.9%）；生产 SWIFT 与 GSQ 逐项不变（1.00k / 78.3、884.7 / 66.6）。
+* 详见 [fp8-swiglu-wide-t-2026-10-16.md](fp8-swiglu-wide-t-2026-10-16.md)。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
