@@ -280,6 +280,20 @@ t=21s 返 200，紧接着的请求即 200）。
   不会陈旧），并在 8 个 A/B 脚本里于解析容器 IP 后插入一行探针；`compare_lines.py` 用其端口映射做同样的事。
 * 记录备用探针语义：`GET /health` 加载中 503 / 就绪 200；`GET /v1/models` 加载中 503、就绪后需鉴权（否则 401）。
 
+### S0.16 GSQ（IQ3_S 混合）制品的 prepack 可行性评估 ☑ 只评估、不改代码（2026-10-16）
+
+同二进制/同请求实测：GSQ 比 nvfp4 制品 **prefill 慢 12%、decode 慢 10%**（且其 MTP 接受率更高 70.8% vs
+62.5%）。kernel 级归因：差在**权重消费路径**——GSQ 是 18 种块量化格式的混合（平均 3.95 bit/weight，
+IQ3_S 只占 3.39 GiB），运行期由约两万个 `gguf::dequantize_rows_kernel`/`VecStore` 小内核现场反量化，
+CUTLASS 被打碎成 5.5 倍的碎 GEMM；注意力/GDN 两边完全一致。
+
+* **方案 A（FP16 常驻 prepack）不可行**：全量 FP16 需 81.5 GiB（现 11.9 GiB），单个格式 +12.4 GiB、
+  单个角色 +11.5 GiB，而运行期空闲只有 3.08 GiB。
+* **方案 B（保持位宽、只重排布局，QPN 思路）可行**：显存 +0.3–0.7 GiB，需为 IQ3_S/IQ4_XS/IQ3_XXS/Q4_K
+  等 4–5 种布局写"一次干净反量化"内核（覆盖 71% 张量字节），预期可追平 nvfp4 制品（约 +10%）。
+* **方案 C（不改）建议**：生产用 nvfp4 制品；GSQ 作为长上下文选项（+150K 上下文 ≈ 那 7 GiB 权重之差）。
+* 详见 [gsq-iq3s-prepack-assessment-2026-10-16.md](gsq-iq3s-prepack-assessment-2026-10-16.md)。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
