@@ -218,6 +218,25 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
 * 剩余：反量化 +0.49s（本线刻意选的精确解码，不动）；27K decode −7%（MTP 接受率差异，与 prefill 无关）。
 * 详见 [volta-flash-prefill-2026-10-15.md](volta-flash-prefill-2026-10-15.md)。
 
+### S0.12 解码投机配置：关掉 n-gram 混合草稿 ☑（2026-10-16）
+
+27K prefill 追平后，decode 仍落后。逐项 A/B（同一 v3 制品、27K prompt、256 输出）：
+
+| 配置 | decode | 接受率 |
+|---|---|---|
+| 原默认（`--ngram-draft-tokens` 默认 15 + `--adaptive-mtp`） | 64.2 tok/s | 混合稀释 |
+| 纯 MTP + adaptive + d4 | 75.2 | 53.8% |
+| **纯 MTP、无 adaptive、d4（新默认）** | **78.3** | 54.3% |
+| 纯 MTP + adaptive + d6 | 60.0 ✗ | 48.9% |
+| 纯 MTP + `--full-draft-head` | 71.8 ✗ | — |
+| 上游参考构建 | 81.7 | ~58% |
+
+* 根因：`--spec` 开启时 `--ngram-draft-tokens` **默认为 15**，引擎因此把 n-gram 拷贝草稿混进 MTP
+  （日志 "mixed speculation"），稀释了接受率。
+* **质量零影响**：贪心输出逐字相同（76 字符完全一致），短上下文 60.9 → 61.9 tok/s 无回退。
+* 生产已改为 `--ngram-draft-tokens 0`、去掉 `--adaptive-mtp`：27K decode **64.2 → 78.3（+22%）**，
+  与上游参考（81.7）差 4%（接受率 54.3% vs ~58%）。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
