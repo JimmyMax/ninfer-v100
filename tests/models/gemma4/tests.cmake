@@ -29,3 +29,9 @@ ninfer_add_test(ninfer_gemma4_kv_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv.cpp"
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_gemma4_kv_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# 本仓库 V100 增量：hidden > 4096 的宽行内核（dense Gemma 4 31B）对 FP64 参考的 oracle。
+ninfer_add_test(ninfer_gemma4_wide_rows_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_rows.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_gemma4_wide_rows_test PROPERTIES SKIP_RETURN_CODE 77)

@@ -1088,6 +1088,200 @@ __global__ void ffn_combine_kernel(FfnCombineArgs a) {
     if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, i < q); }
 }
 
+// 本仓库 V100 增量（docs/v100/gemma4-wide-rows-2026-10-17.md）：hidden > 4096 的宽行内核。
+//
+// 上面三个行内核每线程负责一个 float4，于是 hidden/4 不能超过一个 block 的 1024 线程：一行必须
+// 装进一个 block。Gemma 4 26B-A4B 的 hidden 是 2816（704 个 float4）没问题，但 dense 的 31B 是
+// 5376（1344 个 float4）装不下。宽行版本固定 512 线程（8 的倍数 —— q8_1 的量化组是 8 个连续
+// 线程，且 hidden % 32 == 0 保证每个 32 元素组要么整组在行内、要么整组在外），按 blockDim.x
+// 步进分多轮处理整行；为了逐位复现两遍归约（先 o 再 h），它按需要重算中间值。
+// 宽行只在 hidden / 4 > 1024 时启用，原有内核与窄行路径逐字未动。
+constexpr int kWideRowThreads = 512;
+
+__host__ __device__ __forceinline__ bool wide_row(int hidden) { return hidden / 4 > 1024; }
+
+// 本仓库 V100 增量：调试探针。NINFER_PROBE_WIDE=<bitmask> 可强制某个行内核走宽路径，
+// 用来把 "宽行内核错" 与 "别的 5376/dense 假设错" 分开（默认 0，即只按 wide_row 判断）：
+//   bit0 = rms_norm, bit1 = attn_residual, bit2 = ffn_combine, bit3 = 全部强制
+inline int probe_wide_mask() {
+    static const int mask = [] {
+        const char* e = std::getenv("NINFER_PROBE_WIDE");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return mask;
+}
+inline bool wide_for(int bit, int hidden) {
+    const int mask = probe_wide_mask();
+    return (mask & bit) != 0 || (mask & 8) != 0 || wide_row(hidden);
+}
+
+__global__ void rms_norm_wide_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                     int hidden, float eps, __nv_bfloat16* __restrict__ out,
+                                     Q8Rows q8) {
+    const int q = hidden >> 2, stride = blockDim.x;
+    const float* row       = x + std::int64_t(blockIdx.x) * hidden;
+    const std::int64_t off = std::int64_t(blockIdx.x) * hidden;
+    float ss = 0.0f;
+    for (int base = 0; base < q; base += stride) {
+        const int i = base + threadIdx.x;
+        if (i < q) {
+            const float4 v = ld4(row, i);
+            ss += dot4(v, v);
+        }
+    }
+    const float inv = rsqrtf(block_sum(ss) / float(hidden) + eps);
+    for (int base = 0; base < q; base += stride) {
+        const int i      = base + threadIdx.x;
+        const bool valid = i < q;
+        const float4 v   = valid ? ld4(row, i) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float4 y         = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (valid) {
+            const float4 wv = w != nullptr ? ld4(w, i) : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+            y               = mul4(scale4(v, inv), wv);
+            if (out != nullptr) { store_bf16x4(out + off + 4 * i, y); }
+        }
+        if (q8.qs != nullptr) { store_q8x4(q8, hidden, blockIdx.x, i, y, valid); }
+    }
+}
+
+// h += rms_norm(o) * w_post，然后是新 h 的 FFN 输入（同 AttnResidualArgs 的语义）。
+// 所有车道都调用每个 store_q8x4 / block_sum（前者用全 warp 的 shuffle、后者带跨 warp 归约），
+// 越界车道传零值与 valid=false，与原内核完全同构；归约一律在循环外调用一次。
+__global__ void attn_residual_wide_kernel(AttnResidualArgs a) {
+    const int q = a.hidden >> 2, stride = blockDim.x;
+    const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
+    const float4 zero      = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float ss_o             = 0.0f;
+    for (int base = 0; base < q; base += stride) {
+        const int i     = base + threadIdx.x;
+        const float4 o  = i < q ? load_bf16x4(a.o + row + 4 * i) : zero;
+        ss_o += dot4(o, o);
+    }
+    const float inv_o = rsqrtf(block_sum(ss_o) / float(a.hidden) + a.eps);
+    float ss_h        = 0.0f;
+    for (int base = 0; base < q; base += stride) {
+        const int i      = base + threadIdx.x;
+        const bool valid = i < q;
+        const float4 o   = valid ? load_bf16x4(a.o + row + 4 * i) : zero;
+        const float4 h   = valid ? add4(ld4(a.h + row, i), mul4(scale4(o, inv_o), ld4(a.w_post, i)))
+                                 : zero;
+        // 本仓库 V100 增量：a.h 到这里还不能写（后面几趟要基于原值重算 h，写早了残差会加两次）。
+        ss_h += dot4(h, h);
+    }
+    const float inv = rsqrtf(block_sum(ss_h) / float(a.hidden) + a.eps);
+    for (int base = 0; base < q; base += stride) {
+        const int i      = base + threadIdx.x;
+        const bool valid = i < q;
+        const float4 o   = valid ? load_bf16x4(a.o + row + 4 * i) : zero;
+        const float4 h = valid
+                             ? add4(ld4(a.h + row, i), mul4(scale4(o, inv_o), ld4(a.w_post, i)))
+                             : zero;
+        if (valid) { reinterpret_cast<float4*>(a.h + row)[i] = h; }
+        const float4 n   = scale4(h, inv);
+        const float4 mlp = valid ? mul4(n, ld4(a.ffn_norm, i)) : zero;
+        if (valid && a.mlp_in != nullptr) { store_bf16x4(a.mlp_in + row + 4 * i, mlp); }
+        if (a.mlp_q.qs != nullptr) { store_q8x4(a.mlp_q, a.hidden, blockIdx.x, i, mlp, valid); }
+        if (a.pre_norm != nullptr) {
+            const float4 moe = valid ? mul4(n, ld4(a.pre_norm, i)) : zero;
+            if (valid && a.moe_in != nullptr) { store_bf16x4(a.moe_in + row + 4 * i, moe); }
+            if (a.moe_q.qs != nullptr) { store_q8x4(a.moe_q, a.hidden, blockIdx.x, i, moe, valid); }
+        }
+        if (valid && a.router_x != nullptr) {
+            reinterpret_cast<float4*>(a.router_x + row)[i] =
+                scale4(mul4(n, ld4(a.router_scale, i)), rsqrtf(float(a.hidden)));
+        }
+    }
+}
+
+__global__ void ffn_combine_wide_kernel(FfnCombineArgs a) {
+    const int q = a.hidden >> 2, stride = blockDim.x;
+    const std::int64_t row = std::int64_t(blockIdx.x) * a.hidden;
+    const float hidden     = float(a.hidden);
+    const float4 zero      = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const bool moe         = a.moe_rows != nullptr || a.moe_fixed != nullptr;
+
+    // 该 token 的专家和（无 MoE 时为零）。
+    const auto experts = [&](int i) {
+        float4 m = zero;
+        if (!moe) { return m; }
+        if (a.moe_rows != nullptr) {
+            for (int k = 0; k < a.top_k; ++k) {
+                const std::int64_t pair = std::int64_t(blockIdx.x) * a.top_k + k;
+                m = add4(m, scale4(ld4(a.moe_rows + pair * a.hidden, i), a.moe_weights[pair]));
+            }
+        } else {
+            m = fixed4(a.moe_fixed + row, i);
+        }
+        return m;
+    };
+
+    // 第一遍：dense/expert 两个平方和。
+    float ss_y = 0.0f, ss_m = 0.0f;
+    for (int base = 0; base < q; base += stride) {
+        const int i = base + threadIdx.x;
+        if (i >= q) { continue; }
+        const float4 y = load_bf16x4(a.dense + row + 4 * i);
+        ss_y += dot4(y, y);
+        if (moe) { ss_m += dot4(experts(i), experts(i)); }
+    }
+    float2 ss{0.0f, 0.0f};
+    if (a.w_dense != nullptr || moe) { ss = block_sum2(ss_y, ss_m); }
+
+    // 第二遍：应用两个 norm 得到 y'，并算 y' 的平方和。
+    const auto y_norm = [&](int i) {
+        float4 y = load_bf16x4(a.dense + row + 4 * i);
+        if (a.w_dense != nullptr || moe) {
+            const float4 m = moe ? experts(i) : zero;
+            if (a.w_dense != nullptr) {
+                y = mul4(scale4(y, rsqrtf(ss.x / hidden + a.eps)), ld4(a.w_dense, i));
+            }
+            if (moe) {
+                y = add4(y, mul4(scale4(m, rsqrtf(ss.y / hidden + a.eps)), ld4(a.w_moe, i)));
+            }
+        }
+        return y;
+    };
+    float ss_y2 = 0.0f;
+    for (int base = 0; base < q; base += stride) {
+        const int i = base + threadIdx.x;
+        if (i >= q) { continue; }
+        ss_y2 += dot4(y_norm(i), y_norm(i));
+    }
+    const float inv_y = rsqrtf(block_sum(ss_y2) / hidden + a.eps);
+
+    // 第三遍：h = (h + norm(y') * w_post) * scalar，并算 h 的平方和。
+    const auto h_of = [&](int i) {
+        return scale4(add4(ld4(a.h + row, i), mul4(scale4(y_norm(i), inv_y), ld4(a.w_post, i))),
+                      a.scalar[0]);
+    };
+    float ss_h = 0.0f;
+    for (int base = 0; base < q; base += stride) {
+        const int i = base + threadIdx.x;
+        if (i >= q) { continue; }
+        ss_h += dot4(h_of(i), h_of(i));
+    }
+    const float inv = rsqrtf(block_sum(ss_h) / hidden + a.eps);
+    if (a.next_norm == nullptr) {
+        // 没有下一个块时仍要写回 h（h_of 基于未修改的 a.h 重算）。
+        for (int base = 0; base < q; base += stride) {
+            const int i = base + threadIdx.x;
+            if (i < q) { reinterpret_cast<float4*>(a.h + row)[i] = h_of(i); }
+        }
+        return;
+    }
+
+    // 最后一趟：写回 h（未修改的 a.h 才让上面的重算成立）并输出下一个块的输入。
+    for (int base = 0; base < q; base += stride) {
+        const int i      = base + threadIdx.x;
+        const bool valid = i < q;
+        const float4 h   = valid ? h_of(i) : zero;
+        if (valid) { reinterpret_cast<float4*>(a.h + row)[i] = h; }
+        const float4 nxt = valid ? mul4(scale4(h, inv), ld4(a.next_norm, i)) : zero;
+        if (valid && a.next_out != nullptr) { store_bf16x4(a.next_out + row + 4 * i, nxt); }
+        if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, valid); }
+    }
+}
+
 __global__ void softcap_kernel(const float* x, std::int64_t n, float cap, __nv_bfloat16* out) {
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= n) { return; }
@@ -1140,7 +1334,11 @@ int row_threads(int hidden) {
 
 void rms_norm(const float* x, const float* w, int hidden, int tokens, float eps,
               __nv_bfloat16* out, cudaStream_t stream, Q8Rows q) {
-    rms_norm_kernel<<<tokens, row_threads(hidden), 0, stream>>>(x, w, hidden, eps, out, q);
+    if (wide_for(1, hidden)) {
+        rms_norm_wide_kernel<<<tokens, kWideRowThreads, 0, stream>>>(x, w, hidden, eps, out, q);
+    } else {
+        rms_norm_kernel<<<tokens, row_threads(hidden), 0, stream>>>(x, w, hidden, eps, out, q);
+    }
     check_launch("rms_norm");
 }
 
@@ -1272,7 +1470,11 @@ void decode_attention(const DecodeAttentionArgs& args, cudaStream_t stream) {
 }
 
 void attn_residual(const AttnResidualArgs& args, cudaStream_t stream) {
-    attn_residual_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
+    if (wide_for(2, int(args.hidden))) {
+        attn_residual_wide_kernel<<<args.tokens, kWideRowThreads, 0, stream>>>(args);
+    } else {
+        attn_residual_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
+    }
     check_launch("attn_residual");
 }
 
@@ -1320,7 +1522,11 @@ void geglu_rows(const float* x, int pairs, int width, __nv_bfloat16* out, cudaSt
 }
 
 void ffn_combine(const FfnCombineArgs& args, cudaStream_t stream) {
-    ffn_combine_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
+    if (wide_for(4, int(args.hidden))) {
+        ffn_combine_wide_kernel<<<args.tokens, kWideRowThreads, 0, stream>>>(args);
+    } else {
+        ffn_combine_kernel<<<args.tokens, row_threads(args.hidden), 0, stream>>>(args);
+    }
     check_launch("ffn_combine");
 }
 
