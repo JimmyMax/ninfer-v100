@@ -216,8 +216,11 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
       整个可见前缀，而 prefill 被分成 14 次调用 → 重复付费；上游引擎把整段 prompt 一次交给注意力算子。
       早先记录的 "bf16 flash 1150 tok/s/+27%" 是 *截断 key 范围* 的错误版本，已作废。
 * 因此路线**默认关闭**（`NINFER_ATTN_VOLTA_FLASH[_INT8]=1` 才启用），生产行为不变。
-* 下一步：staging 前缀跨 chunk 复用 / 更轻的 launch（本线桥走 ggml stream-k launcher，上游是简单 grid）/
-  按 block 传 `kv_max` 收敛 key 上界。
+* [x] kernel 级证据更正："staging 复用"不是解法 —— nsys 显示 staging（gather+mask+convert）只有
+      **0.6 ms/调用（1%）**，64.4 ms 全在 `flash_attn_ext_f16` 内核里；Q-block 128→512 只把
+      64.8→53.9 ms，仍慢于本线 int8 prompt 内核的 42.3 ms（因果分块跳掉一半计算 vs dense tile+mask）。
+      上游的"优势"来自它的 prompt 路线是 naive quadratic 内核（bench 1710 ms），不是 flash 本身。
+* 下一步方向：让本线 prompt 内核更快（因果跳块 / 反量化与 DP4A 流水重叠 / 按 visible key 选 split）。
 * 详见 [volta-flash-prefill-2026-10-15.md](volta-flash-prefill-2026-10-15.md)。
 
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐

@@ -64,10 +64,32 @@ TTFT 反而 48–51s，mask 与 per-block 开销随 n_kv 线性增长）。
 **注意**：本文件早先记录的"bf16 flash 1150 tok/s（+27%，比 master 快 14%）"是在 bug #3 未修的
 *截断 key 范围*版本上测到的——快但不正确，已作废。
 
-## 下一步（要真正赢下来）
+## kernel 级证据：瓶颈不是 staging，是 flash 内核本身（更正我先前的判断）
 
-1. 让 staging 只付一次：把 gathered FP16 前缀在 chunk 之间复用（或让引擎把整段 prompt 一次交给该
-   路线，并把 mask 限制为每 block 只覆盖自己需要的 key 区间）；
-2. 或把桥换成更轻的 launch：本线桥走 ggml 的 stream-k launcher（含 fixup pass），上游是直接起
-   `flash_attn_ext_f16` 的简单 grid；
-3. 或对每 block 传入按行收敛的 key 上界（桥已支持 `kv_max`），让早 block 少算。
+对 int8 的 `--entry append`（W=2048 / ctx=16384）做 nsys（`--cuda-graph-trace=node`），8 次调用：
+
+| 内核 | 合计 | 每次调用 |
+|---|---|---|
+| **`flash_attn_ext_f16`**（每调用 16 个 128 行块） | **514.9 ms** | **64.4 ms** |
+| `flash_attn_stream_k_fixup_general` | 3.5 ms | 0.44 ms |
+| `volta_flash_gather` | 1.7 ms | 0.21 ms |
+| `volta_flash_build_mask` | 1.1 ms | 0.14 ms |
+| convert_q / convert_out | 2.0 ms | 0.25 ms |
+
+即 staging（gather + mask + convert）合计只有 **0.6 ms/调用**，占 1%；**64.4 ms 全在 flash 内核**。
+所以我原本计划的"staging 跨 chunk 复用"不可能解决问题。
+
+把 Q-block 从 128 放大到 512（减少 stream-k launch 数）只把每次调用从 64.8 ms 压到 **53.9 ms**，
+仍慢于本线 int8 `prompt_kernel` 的 **42.3 ms**。原因是结构性的：flash 内核按 dense tile + mask 计算
+（因果下界只到每 block 的 key 上界），而本线的 prompt 内核按因果分块，直接把"看不见的那一半"跳过；
+V100 上 int8 DP4A 的因果核在这个形状下比 ggml 的 FP16 tensor-core fattn（含 stream-k/fixup）更快。
+上游之所以在这条路上"赢"，是因为它的 prompt 路线是 naive quadratic 内核（bench 1710 ms），不是这条
+flash 路线本身有多好。
+
+## 结论与下一步
+
+* 该路线**保持 opt-in、默认关闭**：它数值正确但在 V100 上对本几何（d256-h24-kv4 / 因果 int8 prefill）
+  不划算，生产继续用 int8 prompt 路线。
+* 若要继续追这 10%：方向应是**让本线 prompt 内核更快**（它已经是两条路线里更快的），例如
+  更激进的因果跳块、把 K/V 反量化与 DP4A 流水重叠、或按 visible key 数选择不同的 split；而不是
+  搬 flash 内核。
