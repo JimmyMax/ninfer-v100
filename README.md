@@ -27,8 +27,24 @@ drafts, greedy).
 | `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` (GGUF-derived, IQ3_S among 18 block formats) | v3 | 12.9 GiB | 400,000 | TTFT **30.8 s**, prefill **885 tok/s**, decode **66-74 tok/s** |
 
 Short-context decode (1K prompt) is **82.3 tok/s**, and MTP accepts 69% of its drafts on the 27K
-prompt. `Huihui-...-nvfp4` and `orcarouter-...-nvfp4` (v2, the same native family) and
-`Gemma4-26B-A4B-...-MTP` (v3, GGUF-derived) load as well.
+prompt. `Huihui-...-nvfp4` and `orcarouter-...-nvfp4` (v2, the same native family) load as well, and
+so do both Gemma 4 artifacts below.
+
+#### Gemma 4
+
+Both Gemma 4 artifacts are GGUF-derived and run through the ggml bridge, but their shapes differ:
+the 26B-A4B routes 8 of 128 experts per token, while the 31B is **dense** — 60 layers at hidden
+5376, no experts. Both were measured on shorter prompts than the 27K above:
+
+| Artifact | Container | Weights | Measured |
+|---|---|---:|---|
+| `Gemma4-31B-QAT-...-MTP-ninfer-v3.ninfer` (dense, hidden 5376) | v3 | 17.6 GiB | 2K-token prompt, `--kv-dtype int8`: prefill **674 tok/s**; decode **49.7 tok/s** (MTP, 3 drafts, 56.4% acceptance), 48.8 (4 drafts, 43.0%), **27.8 tok/s** without speculation. A 32K context leaves 8.5 GiB free |
+| `gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3.ninfer` (128 experts, 8 per token) | v3 | 13.4 GiB | F16 KV on a 16 GB card: pp2048 **2,997 tok/s**, short-chat decode **226.3 tok/s** (MTP, 2 drafts, 70% acceptance), 164.3 without, 167.0 at an 8K context ([V100 measurements](docs/performance/tesla-v100-2026-10.md#gemma-4-26b-a4b)) |
+
+The dense 31B is weight-bandwidth bound at 4.5 bits: decode tracks how many bytes a step reads
+(17.6 GiB), and the 26B-A4B reads less (13.4 GiB) while spending its compute on eight experts. On
+the 31B three drafts beat four — a wider verification batch costs more weight traffic per accepted
+token than it saves — and 32,768 tokens of int8 KV still leave 8.5 GiB to the runtime.
 
 ### Two artifact families, and why their numbers differ
 
@@ -194,15 +210,17 @@ of the file.
   structured output, images and video, and MTP drafting. On two RTX 5090s the Q2_0 release scores
   93.3% on AIME 2025 and 86.4% on GPQA-Diamond ([Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md)).
 
-- **Gemma 4 26B-A4B.** Google's QAT Q4_0 GGUF release, imported block for block (13.4 GiB), or a
-  mixed-format GGUF of it: the sliding-window and full-attention blocks (the latter caching values
-  only), the dense MLP beside 128 routed experts, every `--kv-dtype` format, up to eight concurrent
-  requests with prefix reuse through host memory and shared system prompts, tool calls and
-  structured output, images and video through the release's vision tower (on the
-  GPU, streamed from pinned memory or on CPU threads), and Google's multi-token-prediction assistant
-  for speculative decoding. On an RTX 3090 it prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215
-  tok/s, 190 after 10,000 tokens, against llama.cpp's 4,697, 169 and 152 on the same GGUF; with two
-  drafts a round chat answers decode at 291 tok/s instead of 209 ([Gemma 4](docs/gemma4.md)).
+- **Gemma 4 26B-A4B and 31B.** Google's QAT GGUF blocks, imported block for block (13.4 GiB for the
+  26B-A4B, 17.6 GiB for the dense 31B), or a mixed-format GGUF of either: the sliding-window and
+  full-attention blocks (the latter caching values only), the dense MLP beside 128 routed experts,
+  every `--kv-dtype` format, up to eight concurrent requests with prefix reuse through host memory
+  and shared system prompts, tool calls and structured output, images and video through the
+  release's vision tower (on the GPU, streamed from pinned memory or on CPU threads), and Google's
+  multi-token-prediction assistant for speculative decoding. The dense 31B is wide: its row kernels
+  cover `hidden` 5376 as well as 2816/3584, so a 60-layer dense artifact runs unchanged. On an RTX
+  3090 the 26B-A4B prefills a 10,000-token prompt at 6,045 tok/s and decodes at 215 tok/s, 190 after
+  10,000 tokens, against llama.cpp's 4,697, 169 and 152 on the same GGUF; with two drafts a round
+  chat answers decode at 291 tok/s instead of 209 ([Gemma 4](docs/gemma4.md)).
 
 **Speculative decoding**
 
@@ -488,6 +506,7 @@ The Bonsai, GSQ-RCO, Flash-Next and Gemma 4 artifacts use formats that only this
 | Qwen3.8-Flash-Next n-gram table | [WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) | 26.92 GiB | unchanged IQ4_NL rows plus an optional broad hot-row profile (`--ngram-table`) |
 | Qwen3.6-35B-A3B NVFP4 | [WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3) | 20.39 GiB | RedHatAI's NVFP4 experts code for code, Q8 projections, Vision, MTP, proposal head; `sm_120a` GPUs only |
 | Gemma 4 26B-A4B it QAT | [WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3) | 14.75 GiB | Google's QAT Q4_0 GGUF blocks byte for byte with the QAT MTP assistant and the vision tower |
+| Gemma 4 31B it QAT, dense | [HauhauCS/Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-MTP](https://huggingface.co/HauhauCS/Gemma4-31B-QAT-Uncensored-HauhauCS-Balanced-MTP) via `tools.convert` | 17.45 GiB | the tune's Q4_K_M, Q6_K and Q4_0 GGUF blocks byte for byte, its MTP assistant and the vision tower; dense, 60 layers, hidden 5376 ([wide rows](docs/v100/gemma4-wide-rows-2026-10-16.md)) |
 
 The official NInfer artifacts (Qwen3.6-27B, Qwen3.6-35B-A3B and Qwen3.8-27B, `groupwise-int` and
 `nvfp4`) load too; the [documentation map](docs/README.md#model-artifacts) links them. Weight
