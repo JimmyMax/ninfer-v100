@@ -25,6 +25,28 @@ extern "C" void ggml_abort(const char* file, int line, const char* fmt, ...) {
     std::abort();
 }
 
+// The vendored headers declare these two host helpers (ggml-cuda/common.cuh) but the vendor ships
+// no common.cu, so the definitions are ours -- the same reason ggml_abort above lives here. A
+// Release build only linked because -O3 dropped the unused inline callers that CUDA_CHECK_GEN and
+// the kernel headers emit; any build that keeps them (Debug, -O0, -lineinfo) failed with
+// "undefined reference" to both. tests/ops/test_vendor_host_helpers.cpp keeps that from returning.
+[[noreturn]] void ggml_cuda_error(const char* stmt, const char* func, const char* file, int line,
+                                  const char* msg) {
+    std::fprintf(stderr, "ggml CUDA error: %s\n  expression: %s\n  in %s at %s:%d\n",
+                 msg ? msg : "unknown CUDA error", stmt ? stmt : "unknown", func ? func : "unknown",
+                 file ? file : "unknown", line);
+    std::abort();
+}
+
+int ggml_cuda_get_device() {
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        std::fputs("ggml CUDA: cudaGetDevice failed\n", stderr);
+        std::abort();
+    }
+    return device;
+}
+
 namespace ninfer::ops::gguf {
 namespace detail {
 

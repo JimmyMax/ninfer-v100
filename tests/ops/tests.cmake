@@ -307,6 +307,12 @@ endforeach()
 ninfer_add_test(ninfer_moe_expert_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_expert_cpu.cpp"
   LIBRARIES ninfer_ops)
-ninfer_add_test(ninfer_gguf_expert_cpu_test
+ninfer_add_op_test(ninfer_gguf_expert_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_expert_cpu.cpp"
+  LIBRARIES ninfer_ops)
+
+# The vendored ggml CUDA headers' two host helpers: the test links them, so a missing definition is
+# a build failure here rather than a Debug-build report from a user (issue #2).
+ninfer_add_op_test(ninfer_vendor_host_helpers_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vendor_host_helpers.cpp"
   LIBRARIES ninfer_ops)
