@@ -50,16 +50,10 @@ Convert it with `python3 -m tools.convert --recipe gemma4_gguf --components text
 three pays on this model because a wider verification batch costs more weight traffic per accepted
 token than it saves.
 
-## Changed: the container image the instructions name
+## Changed: the V100 container image
 
-The README and the docs still pulled `ghcr.io/iamwavecut/ninfer-all` from the upstream tree. The
-published image of this repository is **`ghcr.io/jimmymax/ninfer-v100`** (`latest`,
-`sha-<commit>`, `<version>`), built on CUDA 13.4 for `sm_86` and `sm_120a`.
-
-CUDA 13 cannot compile `sm_70`, so the V100 build is published separately, as
-**`ghcr.io/jimmymax/ninfer-v100:sm70`** and `:<version>-sm70`, from the new `Dockerfile.sm70`
-(CUDA 12.8, Ubuntu 24.04, FFmpeg 6, about 3 GB). The release workflow builds it from the same
-tarball it publishes, in a job of its own so that a registry problem cannot block a release:
+The V100 build is published as **`ghcr.io/jimmymax/ninfer-v100:sm70`** (`:<version>-sm70` pins a
+release), built from the new `Dockerfile.sm70`: CUDA 12.8 on Ubuntu 24.04, about 3 GB.
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
@@ -69,9 +63,7 @@ docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
   --spec mtp --draft-tokens 4 --lm-head-draft --ngram-draft-tokens 0
 ```
 
-`docs/build-linux.md`, `docs/release-archive-{linux,windows}.md`,
-`docs/maintainer/release-process.md`, `compose.yaml` and the probe scripts now name this repository
-and its image as well.
+`latest` stays the `sm_86`/`sm_120a` image, which no V100 can run; on this card use `:sm70`.
 
 ## Assets
 
