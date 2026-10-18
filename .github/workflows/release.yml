@@ -6,6 +6,10 @@
 #
 # Outputs:
 #   - GitHub Release with Linux tarballs (server + CLI + perplexity, sm_70)
+#   - the V100 container image, ghcr.io/<owner>/<repo>:<version>-sm70 and :sm70 (Dockerfile.sm70)
+#
+# The image job is separate from the release job: if the registry refuses the push the tarballs still
+# publish, and re-running this workflow fills the image in.
 #
 # The release body is RELEASE_NOTES_<version>.md from the tagged commit, so the published text and
 # the notes in the tree cannot drift apart. GitHub-hosted runners have no GPU; the build is
@@ -169,6 +173,48 @@ jobs:
           name: linux-tarballs
           path: dist/
           retention-days: 7
+
+  image:
+    name: Publish the V100 container image
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-tarballs
+          path: dist
+
+      # Dockerfile.sm70 copies the binary from its build context, so unpack it into its own.
+      - name: Unpack the server binary
+        run: |
+          mkdir -p image
+          tar xzf dist/ninfer-serve-sm70.tar.gz -C image --strip-components=1
+          ls -l image
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `sm70` moves with each release the way `latest` does for the sm_86/sm_120a image. The pinned
+      # tag drops the leading v, so 1.6.1-sm70 matches the release it came from.
+      - name: Build and push
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="${{ needs.build.outputs.version }}"
+          docker build -f Dockerfile.sm70 \
+            -t "$image:${version#v}-sm70" \
+            -t "$image:sm70" \
+            image
+          docker push "$image:${version#v}-sm70"
+          docker push "$image:sm70"
 
   release:
     name: Publish GitHub Release

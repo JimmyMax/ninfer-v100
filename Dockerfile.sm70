@@ -1,0 +1,56 @@
+# The Tesla V100 (sm_70) runtime image around a prebuilt ninfer-serve.
+#
+# The main Dockerfile builds sm_86 and sm_120a on CUDA 13.4; CUDA 13 no longer compiles sm_70, so the
+# V100 image is assembled here instead, from a CUDA 12.8 binary. Like the main image it starts from
+# plain Ubuntu and installs only the libraries this binary links -- the CUDA runtime and cuBLAS 12,
+# FFmpeg 6 for the media reader, libcurl for the model downloader. A CUDA base image would add every
+# other CUDA library for nothing.
+#
+#   tar xzf ninfer-serve-sm70.tar.gz --strip-components=1 -C image   # or from a local sm_70 build
+#   docker build -f Dockerfile.sm70 -t ninfer:v100-sm70 image
+#
+# The entrypoint is the server itself, so the artifact is the first argument:
+#   docker run --rm --gpus all -p 8000:8000 -v "$PWD/models:/models" ninfer:v100-sm70 \
+#     /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model
+
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION}
+
+ARG UBUNTU_VERSION
+ARG DEBIAN_FRONTEND=noninteractive
+# Build-time only: a mirror or a proxy for the apt step, never baked into the image.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV http_proxy=${HTTP_PROXY} https_proxy=${HTTPS_PROXY}
+
+# Ubuntu 24.04 ships FFmpeg 6, whose libavformat 60 the binary links; 22.04 ships 58.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && curl -fsSLo /tmp/cuda-keyring.deb \
+       "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu$(echo "$UBUNTU_VERSION" | tr -d .)/x86_64/cuda-keyring_1.1-1_all.deb" \
+    && dpkg -i /tmp/cuda-keyring.deb \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        cuda-cudart-12-8 \
+        ffmpeg \
+        libcublas-12-8 \
+        libcurl4 \
+    && find /usr/local -name 'libcublas.so.*' -printf '%h\n' | sort -u > /etc/ld.so.conf.d/ninfer-cuda.conf \
+    && ldconfig \
+    && apt-get purge --yes cuda-keyring \
+    && rm -rf /var/lib/apt/lists/* /tmp/cuda-keyring.deb
+
+COPY --chmod=0755 ninfer-serve /usr/local/bin/ninfer-serve
+
+# The driver library comes from the host through the NVIDIA Container Toolkit; nvidia-smi is how a
+# launch script reads the card.
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NINFER_HOST=0.0.0.0 \
+    NINFER_PORT=8000
+
+WORKDIR /workspace
+EXPOSE 8000
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["ninfer-serve"]
+CMD ["--help"]
