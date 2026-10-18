@@ -21,7 +21,7 @@
 #
 # Environment:
 #   NINFER_BRANCH   branch to test (default master)
-#   NINFER_REPO     git URL (default this repository, iamwavecut/ninfer-all)
+#   NINFER_REPO     git URL (default this repository, JimmyMax/ninfer-v100)
 #   NINFER_ARCH     CUDA arch number (default: from nvidia-smi, else 80)
 #   PROBE_GPU       which GPU index to test (default 0)
 #   MAX_RUNTIME_SECONDS  dead-man switch that powers the box off (default 3600; 0 disables)
@@ -31,7 +31,7 @@ set -uo pipefail
 exec 2>&1
 
 BRANCH="${NINFER_BRANCH:-master}"
-REPO="${NINFER_REPO:-https://github.com/iamwavecut/ninfer-all.git}"
+REPO="${NINFER_REPO:-https://github.com/JimmyMax/ninfer-v100.git}"
 GPU="${PROBE_GPU:-0}"
 SRC="${SRC:-/root/src}"
 OUT="${OUT:-/root/probe-out}"

@@ -1,7 +1,7 @@
 <!--
 One PR should complete one agreed change, including its implementation, verification and report.
 Keep independent changes in separate PRs. Follow the applicable verification guidance:
-https://github.com/iamwavecut/ninfer-all/blob/master/CONTRIBUTING.md#pull-request-description
+https://github.com/JimmyMax/ninfer-v100/blob/main/CONTRIBUTING.md#pull-request-description
 -->
 
 ## Problem and scope

@@ -6,13 +6,13 @@
 # 两条线共用容器名 llama-cpp-text 与 8000 端口，同一时刻只能跑一条，切换约 30–60 秒。
 #
 # 与 fork 线的差异（仅 3 处）：
-#   1. image              → 本分支自建的 sm70 镜像
+#   1. image              → 本分支发布的 sm70 镜像（ghcr.io/jimmymax/ninfer-v100:sm70）
 #   2. 去掉 --lm-head-draft（Gemma 4 的 assistant 没有 proposal head，带上会启动失败）
 #   3. --draft-tokens 4 → 2（V100-32G 实测 157.5 vs 119.0 tok/s）
 
 services:
   llama-cpp-text:
-    image: ninfer:v100-gemma4
+    image: ghcr.io/jimmymax/ninfer-v100:sm70
     container_name: llama-cpp-text
     restart: unless-stopped
     ports:

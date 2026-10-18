@@ -271,7 +271,7 @@ hf download WaveCut/Ternary-Bonsai-2-27B-NInfer-v3 Ternary-Bonsai-2-27B-ninfer-v
 # The image: `serve`, the artifact under /models, the flags. Listens on http://localhost:8080/v1.
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all serve /models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer \
+  ghcr.io/jimmymax/ninfer-v100 serve /models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer \
   --model-id bonsai2-27b --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 \
   --gdn-state-fp16 --spec dflash2 --draft-tokens 5
 
@@ -368,7 +368,7 @@ ninfer-serve $M --ngram-table $T --model-id qwen3.8-flash-next --max-context 327
 # The container, experts in host memory.
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all serve /models/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer \
+  ghcr.io/jimmymax/ninfer-v100 serve /models/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer \
   --ngram-table /models/Qwen3.8-Flash-Next-ngram-table-IQ4_NL-ninfer-v3.ninfer \
   --model-id qwen3.8-flash-next --max-context 32768 --expert-residency host
 ```
@@ -496,14 +496,27 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 
 ## Docker
 
-`ghcr.io/iamwavecut/ninfer-all:latest` is built from the newest `master` commit that passes CI, on
+`ghcr.io/jimmymax/ninfer-v100:latest` is built from the newest `main` commit that passes CI, on
 CUDA 13.4 and Ubuntu 26.04; a commit that changes only documentation or tooling the image does not
 carry keeps the image before it. It carries two builds and starts the one that matches the GPU: `sm_86` for
 the RTX 30 and RTX 40 series, `sm_120a` for the RTX 50 series and the RTX PRO 6000 Blackwell.
 
+The Tesla V100 is not in that image: CUDA 13 no longer compiles `sm_70`, so the release build
+publishes the Volta build under its own tag, from `Dockerfile.sm70`. `ghcr.io/jimmymax/ninfer-v100:sm70`
+follows the newest release and `:<version>-sm70` pins one; it is CUDA 12.8 on Ubuntu 24.04, and its
+entrypoint is `ninfer-serve` itself, so the artifact is the first argument:
+
+```bash
+docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
+  -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100:sm70 \
+  /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model \
+  --max-context 32768 --kv-dtype int8
+```
+
 - **Host.** An NVIDIA driver of the CUDA 13 branch (580 or newer) and the
   [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-- **Tags.** `latest`, `sha-<commit>` and the `VERSION`; the image is 1.6 GB compressed.
+- **Tags.** `latest`, `sha-<commit>` and the `VERSION` for the `sm_86`/`sm_120a` image; `sm70` and
+  `<version>-sm70` for the V100. The image is 1.6 GB compressed, the V100 one about 3 GB.
 - **Volumes.** `/models` holds artifacts, `/cache` the device profile measured on first start, and
   `/grafts/<model>/` optional [prompt grafts](docs/serving.md#prompt-grafts).
 - **Checked** on an RTX 3090 and an RTX 5090 with driver 580.159.03.
@@ -519,10 +532,10 @@ The container's command chooses what runs:
 The official Qwen3.8-27B with the measured `tuned` profile, on http://localhost:8080/v1:
 
 ```bash
-docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all download qwen38-27b
+docker run --rm -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100 download qwen38-27b
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/iamwavecut/ninfer-all run qwen38-27b
+  ghcr.io/jimmymax/ninfer-v100 run qwen38-27b
 ```
 
 [compose.yaml](compose.yaml) wires the GPU, the port and the volumes for the same:

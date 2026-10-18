@@ -25,12 +25,12 @@ additional, manual path that no release has used yet. This page is that path.
    archive's requirements and launcher profiles.
 4. **Smoke-test on a real card** (below), not just the unit tests.
 5. **Publish.** Tag the merge commit (annotated), push the tag, then
-   `gh release create vX.Y.Z-rtx3090 <zip> <tar.gz> <both SHA256SUMS files> -R iamwavecut/ninfer-all
+   `gh release create vX.Y.Z-rtx3090 <zip> <tar.gz> <both SHA256SUMS files> -R JimmyMax/ninfer-v100
    --notes-file RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
 
 ## Gotchas
 
-**Always pass `-R iamwavecut/ninfer-all` to `gh`.** The checkout also has the `upstream` and
+**Always pass `-R JimmyMax/ninfer-v100` to `gh`.** The checkout also has the `upstream` and
 `ashalliants` remotes, and `gh` without `-R` may resolve to another fork.
 
 **Windows executables import cuBLAS, and the archive must carry it.** The cuBLAS prefill route makes

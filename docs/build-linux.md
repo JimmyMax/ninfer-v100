@@ -16,7 +16,7 @@ An `89` or `120a` build does not run on an RTX 3090, and only a `70` build runs 
 
 ## Container image
 
-The published image, `ghcr.io/iamwavecut/ninfer-all:latest`, is the shortest path on any Linux
+The published image, `ghcr.io/jimmymax/ninfer-v100:latest`, is the shortest path on any Linux
 distribution: CUDA 13.4 on Ubuntu 26.04, with an `sm_86` build for the RTX 30 and 40
 series and an `sm_120a` build for Blackwell, and it starts the one that matches the GPU. It needs a
 driver of the CUDA 13 branch (580 or newer) and the NVIDIA Container Toolkit; make sure that Docker
@@ -29,15 +29,31 @@ docker run --rm --gpus all nvidia/cuda:13.4.2-base-ubuntu26.04 nvidia-smi
 Download and serve the Qwen3.8 model with the measured `tuned` profile:
 
 ```bash
-docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all download qwen38-27b
+docker run --rm -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100 download qwen38-27b
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
-  -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all run qwen38-27b
+  -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100 run qwen38-27b
 ```
 
 The API is available at `http://127.0.0.1:8080/v1`. `docker build --build-arg ARCHS=86 -t ninfer .`
 builds the same image from source with the `sm_86` build alone; the [README](../README.md#docker)
 covers the container's commands, volumes and compose file, and its [Running](../README.md#running)
 section the command for each published artifact.
+
+### Tesla V100 image
+
+CUDA 13 no longer compiles `sm_70`, so the `latest` image cannot carry the V100 build. The release
+pipeline publishes it separately, from [Dockerfile.sm70](../Dockerfile.sm70):
+`ghcr.io/jimmymax/ninfer-v100:sm70` follows the newest release and `:<version>-sm70` pins one. It is
+CUDA 12.8 on Ubuntu 24.04, and its entrypoint is `ninfer-serve`, so the artifact comes first:
+
+```bash
+docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
+  -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100:sm70 \
+  /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model --max-context 32768 --kv-dtype int8
+```
+
+To build it yourself, put an `sm_70` `ninfer-serve` in an empty directory and
+`docker build -f Dockerfile.sm70 -t ninfer:v100-sm70 <directory>`.
 
 ## Native Ubuntu 24.04 build
 

@@ -3,7 +3,7 @@
 This is the README that ships **inside** the Linux release archive, where every file sits in one
 directory. If you are reading it in a checkout instead, the launchers and downloaders it names live
 under `scripts/`, and
-[docs/build-linux.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/build-linux.md)
+[docs/build-linux.md](https://github.com/JimmyMax/ninfer-v100/blob/main/docs/build-linux.md)
 is the guide to building from source. Links here are absolute on purpose: the archive ships no
 `docs/` directory.
 
@@ -109,4 +109,4 @@ clamps it hard. Same flag, different platform behaviour, by design.
 
 ## Full documentation
 
-<https://github.com/iamwavecut/ninfer-all>
+<https://github.com/JimmyMax/ninfer-v100>

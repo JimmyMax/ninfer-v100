@@ -13,7 +13,7 @@ exec 2>&1
 echo "=== pipeline execution test $(date -u +%FT%TZ) ==="
 
 BRANCH="${NINFER_BRANCH:-master}"
-REPO="${NINFER_REPO:-https://github.com/iamwavecut/ninfer-all.git}"
+REPO="${NINFER_REPO:-https://github.com/JimmyMax/ninfer-v100.git}"
 MODEL_URL="${MODEL_URL:-https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6/qwen3_6_35b_a3b.ninfer}"
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-7200}"
 PROMPT="${PROMPT:-List the first eight prime numbers, then explain briefly why 1 is not prime.}"
