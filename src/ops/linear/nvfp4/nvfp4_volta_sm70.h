@@ -18,7 +18,7 @@
 
 namespace ninfer::ops::detail {
 
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // 这个权重在这个宽度上是否走 Volta QPN：NVFP4 + 可读布局 + 解码宽度 + 形状受 QPN 支持。
 [[nodiscard]] bool nvfp4_volta_takes(const Weight& w, std::int32_t tokens) noexcept;
 

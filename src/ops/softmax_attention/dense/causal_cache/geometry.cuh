@@ -4,7 +4,7 @@
 
 namespace ninfer::ops {
 
-#ifdef NINFER_SM70
+#ifdef NINFER_TIER_VOLTA
 // Ported from the V100 fork ("perf(sm70): restore long-context attention scaling"): the small-T
 // decode policy asks for roughly one split per 480 cached tokens, and the former 85-split ceiling
 // started binding near 41K, serializing progressively more KV work into each CTA. Volta's supported

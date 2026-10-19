@@ -8,7 +8,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_SM70
+#ifdef NINFER_TIER_VOLTA
 
 namespace {
 using S = Nvfp4VoltaMmaSchedule;
@@ -83,6 +83,6 @@ void launch_nvfp4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, Works
     CUDA_CHECK(cudaGetLastError());
 }
 
-#endif // NINFER_SM70
+#endif // NINFER_TIER_VOLTA
 
 } // namespace ninfer::ops::detail

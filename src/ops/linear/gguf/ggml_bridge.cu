@@ -177,14 +177,25 @@ struct PickPrep {
 };
 
 // One block: the pairs of each expert counted, scanned into bounds, then placed. The experts with
-// pairs are listed in ascending order.
+// pairs are listed in ascending order, and so are the column tiles of each tile width that hold
+// any pair (MoeRouting::tiles).
 constexpr int kSortThreads = 1024;
+static_assert(sizeof(kMatrixColumnTiles) / sizeof(int) == kMoeTileWidths &&
+                  kMatrixColumnTiles[0] == 16 && kMatrixColumnTiles[1] == 32 &&
+                  kMatrixColumnTiles[2] == 64 && kMatrixColumnTiles[3] == 128,
+              "MoeRouting lists tiles of width 16 << w");
+
+int moe_tile_capacity(int experts, int pairs) {
+    return (pairs + kMatrixColumnTiles[0] - 1) / kMatrixColumnTiles[0] + std::min(experts, pairs);
+}
 
 __launch_bounds__(kSortThreads) __global__
     void moe_sort_kernel(const std::int32_t* __restrict__ ids, int pairs, int experts,
                          std::int32_t* __restrict__ bounds, std::int32_t* __restrict__ sorted,
                          std::int32_t* __restrict__ active,
-                         std::int32_t* __restrict__ active_count) {
+                         std::int32_t* __restrict__ active_count,
+                         std::int32_t* __restrict__ tile_count, std::int32_t* __restrict__ tiles,
+                         int tile_capacity) {
     extern __shared__ int shared[];
     int* count  = shared;
     int* cursor = shared + experts;
@@ -219,6 +230,23 @@ __launch_bounds__(kSortThreads) __global__
     if (threadIdx.x == kSortThreads - 1) {
         bounds[experts] = run;
         *active_count   = listed_total;
+    }
+    // Each width's tiles: a scan over the runs of how many tiles their experts' pairs fill.
+#pragma unroll 1
+    for (int w = 0; w < kMoeTileWidths; ++w) {
+        const int width = 16 << w;
+        int filled      = 0;
+        for (int e = first; e < min(first + per, experts); ++e) {
+            filled += (count[e] + width - 1) / width;
+        }
+        int at = 0, total = 0;
+        __syncthreads();
+        Scan(scan).ExclusiveSum(filled, at, total);
+        std::int32_t* list = tiles + std::int64_t(w) * tile_capacity;
+        for (int e = first; e < min(first + per, experts); ++e) {
+            for (int tile = 0; tile * width < count[e]; ++tile) { list[at++] = e | tile << 16; }
+        }
+        if (threadIdx.x == kSortThreads - 1) { tile_count[w] = total; }
     }
     __syncthreads();
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
@@ -477,6 +505,13 @@ void launch_dequantize(const void* weight, std::int64_t row_bytes, int k,
         rows <= 0) {
         throw std::invalid_argument("gguf dequantize: K must be whole blocks of the type");
     }
+    // The slice decoders write whole 16-byte groups; this kernel stays for the rest.
+    if constexpr (kSliceDequantize<type>) {
+        if (out_row_stride % 8 == 0 && reinterpret_cast<std::uintptr_t>(out) % 16 == 0) {
+            slice_dequantize<type>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
+            return;
+        }
+    }
     dequantize_rows_kernel<type, threads, dst_t>
         <<<dim3((k + QK_K - 1) / QK_K, rows, 1), threads, 0, stream>>>(
             static_cast<const char*>(weight), row_bytes, row_ids, out, out_row_stride, k);
@@ -601,7 +636,9 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
 }
 
 std::size_t moe_routing_bytes(int experts, int pairs) {
-    return (std::size_t(experts) + 1 + std::size_t(pairs) + std::size_t(experts) + 1) *
+    return (std::size_t(experts) + 1 + std::size_t(pairs) + std::size_t(experts) + 1 +
+            detail::kMoeTileWidths +
+            std::size_t(detail::kMoeTileWidths) * detail::moe_tile_capacity(experts, pairs)) *
                sizeof(std::int32_t) +
            256;
 }
@@ -616,10 +653,13 @@ MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts, void
     std::int32_t* sorted       = bounds + experts + 1;
     std::int32_t* active       = sorted + pairs;
     std::int32_t* active_count = active + experts;
+    std::int32_t* tile_count   = active_count + 1;
+    std::int32_t* tiles        = tile_count + detail::kMoeTileWidths;
+    const int capacity         = detail::moe_tile_capacity(experts, pairs);
     detail::moe_sort_kernel<<<1, detail::kSortThreads, 2 * experts * sizeof(int), stream>>>(
-        ids, pairs, experts, bounds, sorted, active, active_count);
+        ids, pairs, experts, bounds, sorted, active, active_count, tile_count, tiles, capacity);
     detail::check(cudaGetLastError(), "moe routing launch");
-    return MoeRouting{bounds, sorted, active, active_count};
+    return MoeRouting{bounds, sorted, active, active_count, tile_count, tiles, capacity};
 }
 
 namespace {
@@ -890,17 +930,18 @@ bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
 }
 
 void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
-                        int max_active, int pairs, int max_columns, bool tail,
-                        const void* activation, float* out, cudaStream_t stream) {
-    if (table.experts == nullptr || routing.bounds == nullptr || activation == nullptr ||
-        out == nullptr) {
+                        int max_active, int pairs, bool tail, const void* activation, float* out,
+                        cudaStream_t stream) {
+    if (table.experts == nullptr || routing.bounds == nullptr || routing.tiles == nullptr ||
+        activation == nullptr || out == nullptr) {
         throw std::invalid_argument("gguf moe matrix product: invalid tables or routing");
     }
 #define NINFER_GGUF_MOE_MATRIX_CASE(NAME)                                                          \
     case GgmlType::NAME:                                                                           \
-        detail::moe_matrix_product_impl<GGML_TYPE_##NAME>(                                         \
-            table.experts, table.row_bytes, table.rows, table.k, routing, max_active, pairs,       \
-            max_columns, tail, activation, out, stream);                                           \
+        detail::moe_matrix_product_impl<GGML_TYPE_##NAME>(table.experts, table.row_bytes,          \
+                                                          table.rows, table.k, routing,            \
+                                                          max_active, pairs, tail, activation,     \
+                                                          out, stream);                            \
         return
     switch (type) {
         NINFER_GGUF_MOE_MATRIX_CASE(Q8_0);

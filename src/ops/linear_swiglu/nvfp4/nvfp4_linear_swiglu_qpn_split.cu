@@ -9,7 +9,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_SM70
+#ifdef NINFER_TIER_VOLTA
 
 namespace {
 constexpr std::int32_t kIntermediate = 17408; // Nvfp4MlpGateUpGeometry::kOutputRows / 2
@@ -58,6 +58,6 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
-#endif // NINFER_SM70
+#endif // NINFER_TIER_VOLTA
 
 } // namespace ninfer::ops::detail

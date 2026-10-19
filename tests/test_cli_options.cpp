@@ -33,6 +33,18 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures = 0;
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--gpu-clock-floor",
+                             "1500"}).gpu_clock_floor_mhz == 1500 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                                  .gpu_clock_floor_mhz == 0,
+                      "--gpu-clock-floor was not parsed, or is not off by default");
+    for (const char* value : {"0", "5001", "fast"}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                           "--gpu-clock-floor", value});
+                          }),
+                          "--gpu-clock-floor accepted 0, 5001 or a word");
+    }
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
                           .speculative.draft_min_p == 0, "draft confidence must be opt-in");
     for (const auto* floor : {"0", "0.3", "1"}) {
@@ -70,7 +82,17 @@ int run_tests() {
             hybrid.hybrid_experts.record_profile == "recorded.json",
             "CLI did not preserve the native hybrid configuration");
     }
-    for (const auto* share : {"-0.1", "1.1", "nan", "inf", "0.5x"}) {
+    {
+        const auto automatic = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-residency", "host", "--expert-dma-share", "auto"});
+        const auto fixed_after = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-dma-share", "auto", "--expert-dma-share", "0.5"});
+        failures += check(automatic.hybrid_experts.dma_share_auto &&
+                              !fixed_after.hybrid_experts.dma_share_auto &&
+                              fixed_after.hybrid_experts.dma_share == 0.5F,
+                          "CLI did not preserve an automatic hybrid DMA share");
+    }
+    for (const auto* share : {"-0.1", "1.1", "nan", "inf", "0.5x", "Auto"}) {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-dma-share", share});
         }), "CLI accepted an invalid hybrid DMA share");
@@ -79,6 +101,29 @@ int run_tests() {
         failures += check(rejects([&] {
             (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-cpu-threads", threads});
         }), "CLI accepted an invalid hybrid CPU worker count");
+    }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency",
+                             "host"}).hybrid_experts.tail_skip_rank == 0 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-residency", "host", "--expert-tail-skip", "7"})
+                                  .hybrid_experts.tail_skip_rank == 7,
+                      "CLI did not keep every miss by default or preserve the tail skip");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                              .hybrid_experts.prefill_buffers == 1 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-prefill-buffers", "2"})
+                                  .hybrid_experts.prefill_buffers == 2,
+                      "CLI did not keep one prefill expert buffer by default or preserve two");
+    for (const auto* count : {"0", "3", "two"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-prefill-buffers",
+                         count});
+        }), "CLI accepted an invalid prefill expert buffer count");
+    }
+    for (const auto* rank : {"0", "10", "-1", "7x"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-tail-skip", rank});
+        }), "CLI accepted an invalid expert tail skip");
     }
     for (const auto* budget : {"0", "32", "4096"}) {
         const auto disk = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
@@ -186,6 +231,27 @@ int run_tests() {
                "--reasoning-effort", "medium"});
     failures += check(with_effort.thinking_budget == 8 && with_effort.reasoning_effort,
                       "thinking budget did not coexist with reasoning effort");
+    failures += check(
+        configured.reasoning_loop == ninfer::ReasoningLoopAction::Off &&
+            parse(
+                {"ninfer-cli", "model.ninfer", "--prompt", "hello", "--reasoning-loop", "conclude"})
+                    .reasoning_loop == ninfer::ReasoningLoopAction::Conclude &&
+            parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--reasoning-loop", "stop"})
+                    .reasoning_loop == ninfer::ReasoningLoopAction::Stop,
+        "--reasoning-loop did not select its action (or was not off by default)");
+    failures +=
+        check(ninfer::cli::usage_text("ninfer-cli").find("--reasoning-loop") != std::string::npos,
+              "CLI help omits --reasoning-loop");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "on"});
+                      }),
+                      "--reasoning-loop on was accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "stop", "--no-thinking"});
+                      }),
+                      "--reasoning-loop was accepted with --no-thinking");
     const ninfer::cli::Options dflash_vision =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--spec", "dflash",
                "--draft-tokens", "7"});
@@ -249,6 +315,7 @@ int run_tests() {
                                         "--frequency-penalty",
                                         "--full-draft-head",
                                         "--gdn-state-fp16",
+                                        "--gpu-clock-floor",
                                         "--greedy",
                                         "--json",
                                         "--json-schema",

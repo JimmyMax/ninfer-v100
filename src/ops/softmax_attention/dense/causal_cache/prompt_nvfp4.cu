@@ -17,11 +17,8 @@ void causal_attention_prompt_nvfp4_attention_launch_for(const Tensor& q, const T
                                                         float scale, const CacheView& cache,
                                                         Metadata metadata, Tensor& out,
                                                         cudaStream_t stream) {
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_nvfp4_kernel<Geometry, Metadata>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptNvfp4SmemBytes);
-    });
+    raise_dynamic_shared_memory(causal_attention_prompt_nvfp4_kernel<Geometry, Metadata>,
+                                kCausalPromptNvfp4SmemBytes);
 
     constexpr auto kStorage = KvCacheStorage::Nvfp4Group16;
     const auto* cache_k_ptr = static_cast<const KvKeyCodeT<kStorage>*>(cache.k_pages.data);

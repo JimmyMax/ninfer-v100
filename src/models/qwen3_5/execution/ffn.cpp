@@ -1,4 +1,6 @@
 #include "models/qwen3_5/execution/ffn.h"
+#include "models/qwen3_5/execution/expert_runtime.h"
+#include "ops/sparse_moe/streamed.h"
 #include "models/qwen3_5/execution/rotation.h"
 
 #include "core/layout.h"
@@ -68,6 +70,22 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                 std::int32_t last, bool mtp, bool verify, bool wide_verification) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
+    if (const auto* streamed = std::get_if<StreamedMoeParameters>(&parameters)) {
+        std::size_t bytes = 0;
+        for (const std::int32_t tokens : {first, last}) {
+            bytes = std::max(bytes, ops::detail::sparse_moe_stream_workspace_bytes(
+                                        tokens, streamed->weights.routed_gate_up.qtype,
+                                        streamed->weights.routed_down.qtype));
+        }
+        // Small-T grows with the column count up to the prefill frontier.
+        for (std::int32_t tokens = first; tokens <= std::min(last, ops::detail::kSparseMoeSmallTMax);
+             ++tokens) {
+            bytes = std::max(bytes, ops::detail::sparse_moe_stream_workspace_bytes(
+                                        tokens, streamed->weights.routed_gate_up.qtype,
+                                        streamed->weights.routed_down.qtype));
+        }
+        return bytes;
+    }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
                                                         moe->routed_down.qtype, first, last);
@@ -142,9 +160,22 @@ const Tensor* ffn_input_signs(const FfnParameters& parameters) {
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream, bool mtp,
-         bool verify, InputBasis basis, bool wide_verification) {
+         bool verify, InputBasis basis, bool wide_verification, NativeExpertRuntime* experts) {
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
+    if (const auto* moe = std::get_if<StreamedMoeParameters>(&parameters)) {
+        if (experts == nullptr) { throw std::logic_error("streamed SparseMoe has no Program delivery service"); }
+        if (hidden.dtype != DType::BF16 || residual.dtype != DType::BF16 ||
+            hidden.ne[0] != 2048 || residual.ne[0] != 2048 || residual.ne[1] != columns ||
+            columns <= 0 || !hidden.is_contiguous() || !residual.is_contiguous()) {
+            throw std::invalid_argument("streamed SparseMoe needs contiguous BF16 [2048,T]");
+        }
+        auto& delivery = experts->layer(moe->delivery_layer);
+        delivery.check();
+        ops::detail::sparse_moe_stream(hidden, moe->weights, residual, delivery,
+                                       experts->local_layer(moe->delivery_layer), workspace, stream);
+        return;
+    }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         const auto storage =
             workspace.alloc_bytes(ffn_workspace_bytes(parameters, columns, columns));

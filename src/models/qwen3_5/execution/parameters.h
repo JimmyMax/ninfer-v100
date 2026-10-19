@@ -42,7 +42,14 @@ struct DenseParameters {
     std::optional<LinearParameters> up;
 };
 
-using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
+struct StreamedMoeParameters {
+    // Routed Weight fields contain only the codec profile; all operand addresses come from the
+    // delivery tables. Router and shared expert remain immutable resident native operands.
+    ops::SparseMoeWeights weights;
+    std::size_t delivery_layer = 0;
+};
+
+using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights, StreamedMoeParameters>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;

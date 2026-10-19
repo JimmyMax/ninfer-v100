@@ -29,7 +29,7 @@ void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& o
 
 // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 的拆分式 QPN 路线（gate/up 的 FP32 暂存 +
 // FP16 激活暂存由调用方提供）。
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                         float* gate_scratch, float* up_scratch,
                                         void* activation_scratch, cudaStream_t stream);

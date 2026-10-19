@@ -6,6 +6,7 @@
 
 #include "artifact/materializer.h"
 #include "core/device.h"
+#include "core/expert_delivery.h"
 #include "core/startup.h"
 #include "models/gemma4/config.h"
 #include "models/qwen3_5/frontend/resources.h"
@@ -37,8 +38,15 @@ struct AttentionWeights {
 };
 
 struct MoeWeights {
-    WeightId router, router_scale, expert_scale, gate_up, down, pre_norm, post_norm;
+    WeightId router, router_scale, expert_scale, pre_norm, post_norm;
+    std::optional<WeightId> gate_up, down; // resident banks only
     WeightId mlp_post_norm; // post_feedforward_layernorm_1 of the dense branch
+};
+
+struct ExpertBanks {
+    QType gate_up_type{}, down_type{};
+    std::uint64_t gate_up_row_bytes = 0, down_row_bytes = 0;
+    ExpertDeliveryLayer delivery;
 };
 
 struct LayerWeights {
@@ -98,6 +106,7 @@ struct LoadOptions {
     bool assistant = false;
     // Binds the artifact's `vision` component, which must then exist, in this placement.
     VisionPlacement vision = VisionPlacement::None;
+    ExpertResidency experts = ExpertResidency::Device;
 };
 
 class Model {
@@ -108,6 +117,20 @@ public:
 
     [[nodiscard]] const TextConfig& config() const noexcept { return config_; }
     [[nodiscard]] const TextWeights& weights() const noexcept { return weights_; }
+    [[nodiscard]] ExpertResidency expert_residency() const noexcept { return expert_residency_; }
+    [[nodiscard]] std::span<const ExpertBanks> expert_banks() const noexcept { return expert_banks_; }
+    [[nodiscard]] std::uint64_t expert_pinned_bytes() const noexcept {
+        std::uint64_t bytes = 0;
+        for (const auto& bank : expert_banks_) {
+            for (const auto& expert : bank.delivery.experts) {
+                for (const auto& blob : expert) { if (blob.pinned) { bytes += blob.bytes; } }
+            }
+        }
+        return bytes;
+    }
+    [[nodiscard]] const std::vector<std::filesystem::path>& expert_files() const noexcept {
+        return expert_files_;
+    }
     // Present when loaded with LoadOptions::assistant.
     [[nodiscard]] const std::optional<AssistantConfig>& assistant_config() const noexcept {
         return assistant_config_;
@@ -154,6 +177,9 @@ private:
     std::vector<BoundWeight> bound_;
     FrontendResources resources_;
     InstanceInfo info_;
+    ExpertResidency expert_residency_ = ExpertResidency::Device;
+    std::vector<ExpertBanks> expert_banks_;
+    std::vector<std::filesystem::path> expert_files_;
 };
 
 // Whether the artifact's text component is Gemma 4.

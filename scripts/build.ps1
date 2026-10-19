@@ -30,7 +30,7 @@ param(
     [switch]$Benchmarks,
     [string]$Target,
     [string]$BuildDir,
-    [ValidateSet('80', '86', '89')][string]$Arch = '86'
+    [ValidateSet('75', '80', '86', '89')][string]$Arch = '86'
 )
 
 $ErrorActionPreference = 'Stop'

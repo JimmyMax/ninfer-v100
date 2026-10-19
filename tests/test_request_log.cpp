@@ -62,6 +62,7 @@ int main() {
     options.allow_prefix_reuse             = true;
     options.preserve_thinking              = true;
     options.default_thinking_budget        = 512;
+    options.reasoning_loop                 = ninfer::ReasoningLoopAction::Conclude;
     options.sampling_overrides.temperature = 0.6F;
     options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
@@ -187,6 +188,8 @@ int main() {
                       "request log path missing");
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
+    failures += check(server.at("server").at("reasoning_loop") == "conclude",
+                      "server reasoning-loop guard missing");
     failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
     options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache = options.kv_cache;
@@ -248,6 +251,13 @@ int main() {
               "Vision workspace layout missing");
     failures += check(server.at("memory").at("cuda_graph_measured_bytes") == 450,
                       "server_start memory does not report the measured CUDA Graph bytes");
+    ninfer::MemorySummary saturated = memory;
+    saturated.cuda_graph_measured_bytes.reset();
+    const Json saturated_server = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
+        saturated, environment, std::uint64_t{123456}));
+    failures += check(saturated_server.at("memory").at("cuda_graph_measured_bytes").is_null(),
+                      "CUDA Graph bytes measured with no free memory left are not reported null");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
@@ -507,6 +517,35 @@ int main() {
                           done.at("result").at("thinking_control_tokens") == 19 &&
                           done.at("result").at("thinking_control_applied") == true,
                       "thinking-control result accounting missing");
+    failures += check(done.at("result").at("reasoning_loop_detected") == false &&
+                          done.at("result").at("reasoning_loop_thinking_tokens") == 0 &&
+                          render_request_done(context, outcome).message.find("reasoning loop") ==
+                              std::string::npos,
+                      "an unfired reasoning-loop guard was reported");
+    {
+        // No budget: the guard concluded after 2,048 thinking tokens at 40 % coverage.
+        auto looped     = outcome;
+        looped.thinking = ninfer::ThinkingBudgetStats{.model_thinking_tokens = 2048,
+                                                      .injected_tokens       = 19,
+                                                      .applied               = true,
+                                                      .loop_detected         = true,
+                                                      .loop_thinking_tokens  = 2048,
+                                                      .loop_coverage         = 0.4F};
+        const Json looped_done =
+            Json::parse(format_request_done_json("serve-test", 3001, context, looped));
+        failures += check(
+            looped_done.at("result").at("thinking_budget").is_null() &&
+                looped_done.at("result").at("model_thinking_tokens") == 2048 &&
+                looped_done.at("result").at("reasoning_loop_detected") == true &&
+                looped_done.at("result").at("reasoning_loop_thinking_tokens") == 2048 &&
+                std::abs(looped_done.at("result").at("reasoning_loop_coverage").get<double>() -
+                         0.4) < 1.0e-6,
+            "done JSON log did not record the reasoning-loop firing");
+        failures += check(render_request_done(context, looped)
+                                  .message.find("reasoning loop after 2,048 thinking tokens (40% "
+                                                "repeated), concluded") != std::string::npos,
+                          "operational done log did not show the reasoning-loop firing");
+    }
     failures +=
         check(done.at("result").at("tool_call_parse").at("marker_seen") == false &&
                   done.at("result").at("tool_call_parse").at("structured_call_count") == 0 &&
@@ -609,6 +648,24 @@ int main() {
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
+
+    GenerationOutcome stranded_outcome = outcome;
+    stranded_outcome.tool_call_parse   = {
+        .marker_seen              = true,
+        .structured_call_count    = 2,
+        .recovered_from_reasoning = true,
+    };
+    const Json stranded_done =
+        Json::parse(format_request_done_json("serve-test", 3004, context, stranded_outcome));
+    const std::optional<OperationalRecord> stranded_note =
+        render_tool_call_fallback(context, stranded_outcome);
+    failures += check(
+        stranded_done.at("result").at("tool_call_parse").at("recovered_from_reasoning") == true &&
+            fallback_done.at("result").at("tool_call_parse").at("recovered_from_reasoning") ==
+                false &&
+            stranded_note && stranded_note->severity == OperationalSeverity::Info &&
+            stranded_note->message == "req#7 tool calls recovered from unclosed thinking | calls=2",
+        "calls recovered from unclosed thinking are missing from the logs");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

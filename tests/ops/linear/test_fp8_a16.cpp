@@ -2,7 +2,7 @@
 #include "ops/linear/linear_test_common.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/sm70/sm70_project.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "core/layout.h"
 #    include "ops/linear/fp8/fp8_cutlass_sm70.h"
 #endif
@@ -81,7 +81,7 @@ int run_fp8_a16() {
         try {
             const std::size_t capacity = ops::linear_workspace_capacity_bytes(
                 QType::FP8_E4M3FN_ROW_BF16, 248320, 5120, policy, 1, 2048);
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
             // 本仓库 V100 增量：输出头（1.27 GB）的反量化暂存会主导 arena，所以它走分块的
             // QPN（零暂存）：t <= 32 时一次调用，更宽时每 32 列重读一遍权重——而 lm_head 在
             // prefill 里只算最后几行（见 models/qwen3_5/execution/text.cpp），宽 T 只出现在

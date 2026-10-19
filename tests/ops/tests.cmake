@@ -44,8 +44,12 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
-ninfer_add_op_test(ninfer_gguf_moe_geglu_test
+ninfer_add_op_test(ninfer_gguf_moe_geglu_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_moe_geglu.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_gguf_flash_attention_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_flash_attention.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_linear_topk_test
@@ -69,6 +73,9 @@ add_test(NAME ninfer_softmax_attention_nvfp4_test
 add_test(NAME ninfer_softmax_attention_k8v4_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --k8v4-only)
 
+add_test(NAME ninfer_softmax_attention_quantized_depth_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --quantized-depth-only)
+
 add_test(NAME ninfer_softmax_attention_rk4v4_e8_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --rk4v4-e8-only)
 add_test(NAME ninfer_softmax_attention_rk2v4_e8_test
@@ -82,16 +89,34 @@ add_test(NAME ninfer_softmax_attention_dflash2_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --dflash2-only)
 add_test(NAME ninfer_softmax_attention_int8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --int8-prompt-only)
+add_test(NAME ninfer_softmax_attention_prompt_split_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --prompt-splits-only)
+# The pipelined small-T tier in both PV forms; the switch is read once per process.
+add_test(NAME ninfer_softmax_attention_small_t_pipelined_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --small-t-pipelined-only)
+add_test(NAME ninfer_softmax_attention_small_t_pipelined_pv_f16_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --small-t-pipelined-only)
+set_tests_properties(ninfer_softmax_attention_small_t_pipelined_test
+  PROPERTIES ENVIRONMENT NINFER_SMALLT_PV_F16=0)
+set_tests_properties(ninfer_softmax_attention_small_t_pipelined_pv_f16_test
+  PROPERTIES ENVIRONMENT NINFER_SMALLT_PV_F16=1)
+add_test(NAME ninfer_softmax_attention_fp8_prompt_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --fp8-prompt-only)
 add_test(NAME ninfer_softmax_attention_pack_gqa_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --pack-gqa-only)
 
 set_tests_properties(
   ninfer_softmax_attention_nvfp4_test
   ninfer_softmax_attention_k8v4_test
+  ninfer_softmax_attention_quantized_depth_test
   ninfer_softmax_attention_rk4v4_e8_test
   ninfer_softmax_attention_rk2v4_e8_test
   ninfer_softmax_attention_dflash2_test
   ninfer_softmax_attention_int8_prompt_test
+  ninfer_softmax_attention_prompt_split_test
+  ninfer_softmax_attention_small_t_pipelined_test
+  ninfer_softmax_attention_small_t_pipelined_pv_f16_test
+  ninfer_softmax_attention_fp8_prompt_test
   ninfer_softmax_attention_pack_gqa_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -133,6 +158,13 @@ ninfer_add_op_test(ninfer_prepare_masked_block_test
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_moe.cpp"
   LIBRARIES ninfer_ops)
+add_test(NAME ninfer_sparse_moe_streaming_test
+  COMMAND ninfer_tests ninfer_sparse_moe_test --streaming)
+set_tests_properties(ninfer_sparse_moe_streaming_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_op_test(ninfer_sparse_moe_candidates_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_sparse_moe_candidates.cpp"
+  LIBRARIES ninfer_ops)
 
 # The routing sort on its own, exhaustively. The Op test above covers SparseMoe end to end and
 # would not localise a network that mis-sorts a minority of score permutations; this one runs the
@@ -148,6 +180,12 @@ ninfer_add_op_test(ninfer_e8_root_decode_test
 
 ninfer_add_op_test(ninfer_fixed_point_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fixed_point.cu"
+  LIBRARIES ninfer_ops)
+
+# The warp MMA helpers every tensor-core kernel builds on, through the PTX fragment layouts: native
+# instructions on sm_8x and newer, the Turing implementations on sm_75.
+ninfer_add_op_test(ninfer_mma_fragments_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mma_fragments.cu"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_mtp_pack_test
@@ -240,6 +278,10 @@ add_test(NAME ninfer_sparse_moe_wide_test
   COMMAND ninfer_tests ninfer_sparse_moe_test --wide-only)
 set_tests_properties(ninfer_sparse_moe_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+add_test(NAME ninfer_sparse_moe_candidates_op_test
+  COMMAND ninfer_tests ninfer_sparse_moe_test --candidates-only)
+set_tests_properties(ninfer_sparse_moe_candidates_op_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
 
 foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution ngram-negative-penalties wide-accept wide-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
@@ -258,13 +300,22 @@ set_tests_properties(ninfer_gdn_state_fp16_two_stage_test
 
 add_test(NAME ninfer_gdn_replay_fold_wide_test
   COMMAND ninfer_tests ninfer_gdn_replay_fold_test --wide-only)
-# About 300 cases with an FP64 oracle each: 11 minutes on the Tesla V100 host (Xeon E5-2683 v4).
+# About 300 cases with an FP64 oracle each, on the host's cores: 11 minutes on the Tesla V100 host
+# (Xeon E5-2683 v4), about 35 on a six-core host.
 set_tests_properties(ninfer_gdn_replay_fold_wide_test
-  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200 RUN_SERIAL TRUE)
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 RUN_SERIAL TRUE)
+
+# A Turing card has no selectable unified table (src/ops/linear/common/route_table.h), so a build
+# for Turing alone runs the route-table variants on the legacy table only; in a build of several
+# architectures a Turing card runs its legacy table under either variant.
+set(ninfer_linear_route_tables legacy unified)
+if(NINFER_ARCH_TURING AND NOT (NINFER_ARCH_VOLTA OR NINFER_ARCH_AMPERE OR NINFER_ARCH_BLACKWELL))
+  set(ninfer_linear_route_tables legacy)
+endif()
 
 # The fused projections once more with every width on each route table: their own routes, and
 # upstream's over the unified templates that a device profile may take per width.
-foreach(table IN ITEMS legacy unified)
+foreach(table IN LISTS ninfer_linear_route_tables)
   foreach(test IN ITEMS attn_input_proj attn_input_small_t gdn_input_proj gdn_input_small_t
                         gdn_input_proj_conv_snapshot gdn_input_proj_conv_record linear_add_q4_a16
                         linear_add_q5_a16 linear_add_q5_small_t linear_add_q8_a16
@@ -277,7 +328,7 @@ foreach(table IN ITEMS legacy unified)
 endforeach()
 
 # The FP8 Linear and fused suites on each table too.
-foreach(table IN ITEMS legacy unified)
+foreach(table IN LISTS ninfer_linear_route_tables)
   foreach(test IN ITEMS linear_fp8_a16 linear_fp8_a8 linear_add_fp8 linear_swiglu_fp8)
     add_test(NAME ninfer_${test}_${table}_routes_test COMMAND ninfer_tests ninfer_${test}_test)
     set_tests_properties(ninfer_${test}_${table}_routes_test
@@ -286,7 +337,7 @@ foreach(table IN ITEMS legacy unified)
 endforeach()
 
 # The NVFP4 Linear and fused suites on each table too.
-foreach(table IN ITEMS legacy unified)
+foreach(table IN LISTS ninfer_linear_route_tables)
   foreach(test IN ITEMS linear_nvfp4_a16 linear_nvfp4_a4 linear_add_nvfp4 linear_swiglu_nvfp4)
     add_test(NAME ninfer_${test}_${table}_routes_test COMMAND ninfer_tests ninfer_${test}_test)
     set_tests_properties(ninfer_${test}_${table}_routes_test
@@ -295,7 +346,7 @@ foreach(table IN ITEMS legacy unified)
 endforeach()
 
 # The BF16 Linear suite on each table too.
-foreach(table IN ITEMS legacy unified)
+foreach(table IN LISTS ninfer_linear_route_tables)
   add_test(NAME ninfer_linear_bf16_a16_${table}_routes_test
     COMMAND ninfer_tests ninfer_linear_bf16_a16_test)
   add_test(NAME ninfer_linear_add_bf16_a16_${table}_routes_test
@@ -310,6 +361,9 @@ ninfer_add_test(ninfer_moe_expert_cpu_test
 ninfer_add_op_test(ninfer_gguf_expert_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_expert_cpu.cpp"
   LIBRARIES ninfer_ops)
+target_include_directories(ninfer_gguf_expert_cpu_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+
 
 # The vendored ggml CUDA headers' two host helpers: the test links them, so a missing definition is
 # a build failure here rather than a Debug-build report from a user (issue #2).

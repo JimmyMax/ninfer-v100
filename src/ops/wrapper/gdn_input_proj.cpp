@@ -12,6 +12,7 @@
 #include "ops/linear/sm70/sm70_project.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_weight_view.h"
+#include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
@@ -946,7 +947,8 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
     }
     // qk fills the head of `qkv`; value_z fills its tail and, from its own second row range, `z`.
     // Both parents read the same activations, so one quantisation serves all three destinations.
-    if (allows_cublas_prefill(policy) && x.ne[1] >= kCublasPrefillMinTokens) {
+    if (allows_cublas_prefill(policy) &&
+        detail::cublas_prefill_takes(detail::kCublasGdnInput, x.ne[1])) {
         const std::int32_t qkv_rows   = qkv.ne[0];
         const std::int32_t z_rows     = z.ne[0];
         const std::int32_t qk_rows    = qk_weight.n;
@@ -992,10 +994,13 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
     const auto routes = [&](std::int32_t lo, std::int32_t hi) -> std::size_t {
         if (!allows_a8_int(policy) || !registered) { return 0; }
         const std::size_t a8 = detail::q4_q5_gdn_input_a8_workspace_capacity_bytes(lo, hi);
-        if (allows_cublas_prefill(policy) && hi >= kCublasPrefillMinTokens) {
+        const std::int32_t first =
+            allows_cublas_prefill(policy)
+                ? detail::cublas_prefill_first_width(detail::kCublasGdnInput, lo, hi)
+                : 0;
+        if (first != 0) {
             return std::max(a8, detail::w4_cublas_projection_workspace_capacity_bytes(
-                                    std::max(qk_rows, value_z_rows), input_rows,
-                                    std::max(lo, kCublasPrefillMinTokens), hi));
+                                    std::max(qk_rows, value_z_rows), input_rows, first, hi));
         }
         return a8;
     };

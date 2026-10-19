@@ -51,7 +51,7 @@ done
 # to be kept consistent by hand.
 if (( package )); then benchmarks=1; fi
 
-case "$arch" in 80|86|89|120a) ;; *) printf 'CUDA arch must be 80, 86, 89 or 120a, got %s\n' "$arch" >&2; exit 2 ;; esac
+case "$arch" in 70|75|80|86|89|120a) ;; *) printf 'CUDA arch must be 70, 75, 80, 86, 89 or 120a, got %s\n' "$arch" >&2; exit 2 ;; esac
 
 # --- locate the toolchain ---------------------------------------------------------------------
 

@@ -40,11 +40,16 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   tokens (1024 or 512 on a card without room for them, [below](#memory-and-context)), prefix
   reuse across turns and requests with host-memory images ([below](#prefix-reuse)), structured
   output, tool calls in Gemma's
-  `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls, streaming, reasoning
-  in its own channel when thinking is on, and causal scoring (`ninfer-perplexity`).
+  `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls (a forced
+  `tool_choice` ends the generation prompt with Gemma's own opener, `<|tool_call>call:NAME{`, so
+  the model continues with the arguments; see [forced selection](serving.md#function-tools)),
+  streaming, reasoning in its own channel when thinking is on, and causal scoring
+  (`ninfer-perplexity`).
 - **Thinking.** Off unless asked for, as the release's chat template has it: a request turns it on
   with `chat_template_kwargs: {"enable_thinking": true}`, and the reasoning arrives as
-  `reasoning_content`.
+  `reasoning_content`. Gemma has no early-close control, so thinking budgets do not apply and the
+  [reasoning-loop guard](serving.md#openai-chat-completions) stops a looping reply under `conclude`
+  as under `stop`.
 - **Sampling defaults.** The release's `generation_config.json` (temperature 1.0, top-p 0.95) with
   top-k held at the sampler's 20 candidates.
 
@@ -372,8 +377,10 @@ round drafts shrink as requests join (same streams as above, `--spec mtp`, tok/s
 
 ## Structured output
 
-A request with `response_format` (with `--structured-output`) samples under its grammar's token
-mask. The mask of its next token is computed on a thread of its own from the grammar's state
+A request with `response_format` or another constraint of
+[Structured output](serving.md#structured-output) (with `--structured-output`) samples under its
+grammar's token mask; strict tool arguments are refused, since Gemma's tool-call markup has no
+grammar here. The mask of its next token is computed on a thread of its own from the grammar's state
 after the last accepted token, while the GPU runs the decode step that produces the token's
 logits: the step does not wait for the mask, and a row whose mask is late keeps its logits and is
 sampled once the mask is ready, while the other requests go on. With `--spec mtp` such a request
@@ -383,11 +390,11 @@ drafts, its next mask starting as soon as a token is accepted, and drafts again 
 cheap. A single mask over 5 s, or a grammar with no admissible token, fails the request with an
 explicit error.
 
-String length bounds (`minLength`, `maxLength`) cost the most: a position inside a counted string
-has no cached mask. For plain string values in a schema without alternatives the bounds are
-therefore enforced beside the grammar, which compiles the string unbounded: with Gemma's
-262,144-token vocabulary a two-string schema with `maxLength: 2800` compiles in 0.9 s instead of
-28 s and its masks take 0.08 ms instead of ~80 ms (one Apple M-series core).
+String length bounds (`minLength`, `maxLength`) compile to a counted repetition whose masks do
+not depend on the count, in or out of `anyOf`: with Qwen3.5's 248,070-token vocabulary a schema
+with strings of `maxLength: 200` and `maxLength: 2800` compiles in 81 ms instead of 24.8 s, and
+its masks inside the strings take 0.04 ms instead of 70-96 ms (one Apple M-series core; Gemma's
+262,144-token vocabulary was not measured).
 
 Every running request must make progress: one that neither computes a prompt chunk nor accepts a
 token for 120 s fails with `inference request made no progress for 120 s` instead of holding its
@@ -453,8 +460,8 @@ dominate a small one. A follow-up turn over the same picture reuses it without e
   product of the decoded blocks (`ninfer_linear_gguf_test`, `ninfer_gguf_moe_geglu_test`); the
   decode attention (both head widths, stored and derived keys, several rows of one sequence at
   consecutive positions), its q8_1 output and the decode routing match FP64 oracles
-  (`ninfer_gemma4_kernels_test`); Gemma's tool-call markup parses as streamed
-  (`ninfer_gemma4_output_test`).
+  (`ninfer_gemma4_kernels_test`); Gemma's tool-call markup parses as streamed, a forced call
+  from its seeded opener included (`ninfer_gemma4_output_test`, `ninfer_qwen3_5_frontend_test`).
 - The KV-cache formats (`ninfer_gemma4_kv_test`), each of the eight quantized ones: the codes and
   scales a store writes, decoded on the host by the engine's codec oracles (and turned back in FP64
   for a rotated plane), stay within the coding's error of the rows stored; a ring's load and a prompt
@@ -500,3 +507,39 @@ dominate a small one. A follow-up turn over the same picture reuses it without e
   --ppl-stride` on this model does not reproduce its own fresh-window result for the windows after
   the first (a window scored alone gives 487.6 nats where the strided run reports 401.3), so its
   strided totals are not a reference here.
+
+## Expert residency
+
+`--expert-residency device` keeps the routed GGUF banks on the GPU. `host` keeps them in pinned host
+memory and `disk` in the artifact's files, read through the OS page cache. Both run all expert
+arithmetic on the GPU with the resident kernels and outputs: top-8 GeGLU, the 704-wide middle, the
+dense branch and the sandwich norms. A 12 GB card runs the model this way; the GPU holds 1.7 GiB of
+other weights instead of 13.7 GiB.
+
+```sh
+ninfer /models/gemma4.ninfer --expert-residency host
+ninfer /models/gemma4.ninfer --expert-residency disk --expert-cache-mib 0
+```
+
+Experts reach the GPU through the shared transport (`core/expert_delivery`):
+
+- **Layer banks.** A prompt chunk's experts missing from the cache (and decode's, without a cache)
+  land in a whole-layer bank laid out like the resident bank, each expert at its index, so
+  consecutive experts arrive in one copy. Two banks let the next layer of a prompt chunk arrive
+  while the current one computes (one bank where memory is short). Each prompt chunk needs nearly
+  every expert of every layer, so the expert bank crosses the bus about once per chunk; prompts take
+  the resident chunks of up to 2048 tokens.
+- **Cache.** `--expert-cache-mib` (default: what is free after startup) holds the experts decode and
+  verification used most recently: their misses enter the cache over the least recently used experts
+  the call does not route. A prompt chunk evicts nothing; it promotes its most routed experts from
+  the bank into free slots by device copies, up to each layer's share of the cache, so a long prompt
+  does not flush decode's working set. `0` keeps the banks only.
+- **Calls.** Vector decode and verification run the cached pairs while the rest arrive, then the
+  rest; both add to one fixed-point sum, so outputs equal resident execution bit for bit. Prompt
+  chunks wait for their experts and run the existing matrix path.
+
+The loader keeps the stored GGUF blocks; nothing is repacked. Startup diagnostics report the cache,
+the layer banks, metadata and pinned buffers; runtime expert counters start at zero after warm-up.
+Disk residency uses two bounded pinned transfer halves and no application RAM cache. Flash-Next's
+CPU, hybrid and profile options do not apply. Gemma model suspend is unsupported, as with resident
+experts.

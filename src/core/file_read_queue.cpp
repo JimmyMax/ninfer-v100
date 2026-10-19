@@ -1,4 +1,5 @@
 #include "core/file_read_queue.h"
+#include "core/file_read_error.h"
 
 #include <algorithm>
 #include <atomic>
@@ -316,8 +317,10 @@ struct FileReadQueue::Impl {
             for (std::size_t i = 0; i < group.size(); ++i) {
                 const auto& slot = slots[i];
                 if (slot.error != 0) {
-                    throw std::runtime_error("file read queue: " + paths[group[i].file].string() +
-                        (slot.error == -1 ? " ends early" : " read failed (error " + std::to_string(slot.error) + ")"));
+                    throw FileReadError("file read queue: " + paths[group[i].file].string() +
+                                        (slot.error == -1 ? " ends early"
+                                                          : " read failed (error " +
+                                                                std::to_string(slot.error) + ")"));
                 }
             }
             if (direct) {

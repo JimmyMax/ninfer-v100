@@ -284,18 +284,41 @@ void apply_structured_output_instruction(PromptInput& input,
                                          const StructuredOutputOptions& options) {
     if (options.kind == StructuredOutputKind::None) { return; }
     MessagePart instruction;
+    const bool json = options.kind == StructuredOutputKind::JsonObject ||
+                      options.kind == StructuredOutputKind::JsonSchema;
     instruction.text =
-        "\n\nThe response format is JSON. Return the final answer as raw JSON without Markdown "
-        "fences or surrounding text.";
+        json ? "\n\nThe response format is JSON. Return the final answer as raw JSON without "
+               "Markdown fences or surrounding text."
+             : "\n\nReturn the final answer alone, without Markdown fences or surrounding text.";
     if (!input.options.tool_jsons.empty()) {
-        instruction.text +=
-            " Tool calls remain available when needed to obtain information; do not call tools "
-            "merely to format JSON.";
+        instruction.text += json ? " Tool calls remain available when needed to obtain "
+                                   "information; do not call tools merely to format JSON."
+                                 : " Tool calls remain available when needed to obtain "
+                                   "information.";
     }
-    if (options.kind == StructuredOutputKind::JsonSchema) {
+    switch (options.kind) {
+    case StructuredOutputKind::JsonSchema:
         instruction.text += "\nThe final answer must match this JSON Schema:\n" + options.schema;
-    } else {
+        break;
+    case StructuredOutputKind::JsonObject:
         instruction.text += " The final answer must be a JSON object.";
+        break;
+    case StructuredOutputKind::Regex:
+        instruction.text +=
+            "\nThe whole final answer must match this regular expression:\n" + options.grammar;
+        break;
+    case StructuredOutputKind::Choice:
+        instruction.text +=
+            "\nThe final answer must be exactly one of these options, one per line:";
+        for (const std::string& choice : options.choices) { instruction.text += "\n" + choice; }
+        break;
+    case StructuredOutputKind::Grammar:
+        instruction.text +=
+            "\nThe whole final answer must follow this GBNF grammar from its root rule:\n" +
+            options.grammar;
+        break;
+    case StructuredOutputKind::None:
+        break;
     }
     if (!input.messages.empty() && (input.messages.front().role == ChatRole::System ||
                                     input.messages.front().role == ChatRole::Developer)) {

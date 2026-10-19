@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
@@ -52,8 +53,14 @@ struct MissLayer {
 struct MissOptions {
     std::uint32_t token_capacity = 8;    // tokens of one call
     double cpu_share             = 0.0;  // share of a request's missing experts the CPU computes
-    std::uint32_t cpu_threads    = 0;    // 0: the physical cores less two, at most 16
+    // Instead of a fixed share, each request gives the CPU the experts that make its copies and
+    // its CPU products end soonest, by times fitted to the earlier requests.
+    bool cpu_balance             = false;
+    std::uint32_t cpu_threads    = 0;    // 0: half the usable logical CPUs less two, at most 16
     std::uint64_t staging_bytes  = 128ULL << 20; // device staging per rank, two halves
+    // 1..9: a call leaves out each missing expert that all its tokens rank past this many places
+    // of their top ten (lossy); 0 serves every miss.
+    std::uint32_t tail_skip_rank = 0;
 };
 
 struct MissStats {
@@ -103,6 +110,10 @@ public:
     // Keeps the service (and the CPU workers) spinning for the next half second; a pass calls it
     // before its first layer. Rethrows a service failure.
     void keep_alive();
+    // Rethrows a failure the service recorded while serving a call. A failed call released the
+    // GPU with its missing experts left out, so a pass checks this once it has completed, before
+    // anything it computed is used.
+    void raise_failure();
     // Enqueued before a pass on each rank's stream: waits for the slots taken behind earlier calls
     // (the CPU experts' admissions), which the pass's tables may already point at. Call it only
     // once the earlier passes were served (they are synchronized; see the executor's pass()).
@@ -114,6 +125,8 @@ public:
     void set_resident(std::size_t layer, const ExpertCache::Ranges& resident);
     [[nodiscard]] MissStats stats() const;
     [[nodiscard]] bool cpu_enabled() const noexcept;
+    // With a CPU share: its threads and vector backend, e.g. "14 threads, avx2"; else empty.
+    [[nodiscard]] std::string cpu_description() const;
 
 private:
     struct Impl;

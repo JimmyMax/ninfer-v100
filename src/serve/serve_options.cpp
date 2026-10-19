@@ -2,6 +2,7 @@
 #include "product/ngram_table_options.h"
 #include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
+#include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
@@ -92,7 +93,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                8192)\n"
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
-           "                                (default 1024)\n"
+           "                                (default 1024; 4096 for native MoE experts\n"
+           "                                in host memory or files)\n"
            "  --decode-rounds-per-prefill N decode rounds after each prefill chunk while\n"
            "                                others generate (0: chunk / 64; 1 alternates)\n"
            "  --default-max-tokens N        output limit of a request that sets none\n"
@@ -103,23 +105,24 @@ std::string serve_usage_text(const char* argv0) {
            "                                metadata.name\n"
            "  --chat-template FILE          replace the artifact's chat template at startup\n"
            "  --device N                    CUDA device index (default 0)\n"
-           "  --devices A,B,...             one pipeline stage per listed device, 2..8\n"
-           "                                (Linux); excludes --device\n"
+           "  --devices A,B,...             one pipeline stage per listed device, 2..8;\n"
+           "                                excludes --device\n"
            "  --stage-layers A,B,...        layers per stage in --devices order (default:\n"
            "                                split by free memory)\n"
-           "  --expert-residency device|host|disk  Qwen3.8-Flash-Next: expert banks in GPU\n"
-           "                                memory (default), in pinned host memory read\n"
-           "                                across the bus, or left in the artifact's files\n"
-           "                                and streamed into the device expert cache\n"
-           "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
-           "                                most used experts (default auto: what is free;\n"
-           "                                0 turns the host cache off; disk needs one)\n" +
+           "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
+           "                                host memory, or in artifact files\n"
+           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen\n"
+           "                                and Gemma allow 0 (layer banks only).\n"
+           "                                Flash-Next disk requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs (on by default)\n"
            "  --cuda-graph-allowance-mib N  CUDA Graph driver-state allowance taken from the\n"
            "                                KV sizing budget (default 0: computed per\n"
            "                                profile)\n"
+           "  --gpu-clock-floor MHZ         hold the GPUs' graphics clock at MHZ or more while\n"
+           "                                requests run, so pipeline stages do not wait at\n"
+           "                                idle clocks (needs administrator or root rights)\n"
            "  --device-profile auto|off|calibrate\n"
            "                                per-GPU route profile: auto uses the stored or\n"
            "                                built-in one and calibrates a device that has\n"
@@ -166,8 +169,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --rope-scaling-original-context N\n"
            "                                the interpolation threshold (default: the\n"
            "                                model's native window)\n"
-           "  --wddm-evictable-budget       Windows D3D12 builds: budget against dedicated\n"
-           "                                memory, holding arenas resident\n"
+           "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
+           "                                memory, committing arenas at startup\n"
            "\n"
            "ROUTER (several models, llama.cpp-compatible; give no artifact path)\n"
            "  --models-dir DIR              serve every .ninfer in DIR (and each subdirectory\n"
@@ -198,10 +201,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                resuming the model (also per suspend request)\n"
            "\n"
            "KV CACHE\n"
-           "  --kv-capacity N|auto          shared KV capacity in tokens (default\n"
-           "                                --max-context, or auto with\n"
-           "                                --use-alt-prefix-caching); auto sizes the pool\n"
-           "                                from free memory\n"
+           "  --kv-capacity N|auto          shared KV capacity in tokens (default auto with\n"
+           "                                the hybrid prefix cache, --max-context with the\n"
+           "                                checkpoint catalog); auto sizes the pool from\n"
+           "                                free memory\n"
            "  --kv-headroom-mib N           memory --kv-capacity auto leaves free (default\n"
            "                                " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
@@ -210,6 +213,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n"
            "\n"
            "CONTEXT CACHE\n"
+           "  The hybrid prefix cache is the default. Pipeline --devices, --no-prefix-reuse,\n"
+           "  --graft and each checkpoint catalog option below (state slots, host KV,\n"
+           "  catalogs, anchors, prefix grid, session keys, cache policies, disk tier, slot\n"
+           "  files) select the checkpoint catalog instead.\n"
            "  --no-prefix-reuse             disable compatible-prefix caching (on by\n"
            "                                default); excludes the options below\n"
            "  --device-state-slots N        checkpoint states on the device beyond the\n"
@@ -220,7 +227,7 @@ std::string serve_usage_text(const char* argv0) {
            "                                above: host states for every checkpoint the\n"
            "                                capture path creates (at most half), more\n"
            "                                automatic anchors with the headroom, host KV the\n"
-           "                                rest; with --use-alt-prefix-caching the pool KV\n"
+           "                                rest; with the hybrid prefix cache the pool KV\n"
            "                                blocks and state snapshots share (default 8192,\n"
            "                                0 keeps the cache on the device); auto: the\n"
            "                                host memory free once the model is loaded, less\n"
@@ -255,6 +262,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                anchors, doubling per anchor back from the\n"
            "                                prompt end (default 1024; 0 anchors every\n"
            "                                boundary)\n"
+           "  --progress-anchor-tokens N    anchor every prompt at each multiple of N tokens,\n"
+           "                                so a client that cancels a long prefill and\n"
+           "                                retries resumes from the deepest anchor instead\n"
+           "                                of token zero (default 16384; 0 disables;\n"
+           "                                otherwise at least 256)\n"
            "  --max-cache-markers-per-request N\n"
            "                                client cache markers one request may carry\n"
            "                                (default 4)\n"
@@ -303,13 +315,13 @@ std::string serve_usage_text(const char* argv0) {
            "                                was last saved to or restored from before an\n"
            "                                involuntary eviction destroys it (needs\n"
            "                                --slot-save-path)\n"
-           "  --use-alt-prefix-caching      the hybrid prefix cache instead of the checkpoint\n"
-           "                                catalog: content-addressed KV blocks and sparse\n"
-           "                                state snapshots; free VRAM becomes block cache\n"
-           "                                and --host-cache-mib sizes the Host tier;\n"
-           "                                excludes the catalog options above\n"
-           "  --use-original-prefix-caching the checkpoint catalog, which is the default;\n"
-           "                                accepted for command lines that name it\n"
+           "  --use-alt-prefix-caching      the hybrid prefix cache, the default:\n"
+           "                                content-addressed KV blocks and sparse state\n"
+           "                                snapshots; free VRAM becomes block cache and\n"
+           "                                --host-cache-mib sizes the Host tier; named, it\n"
+           "                                rejects a catalog option instead of yielding\n"
+           "  --use-original-prefix-caching the checkpoint catalog instead of the hybrid\n"
+           "                                prefix cache\n"
            "  --device-snapshot-slots N     hybrid: device state snapshot slots (default\n"
            "                                concurrency + 1; + 2 without a Host tier)\n"
            "  --cache-taps-per-request N    hybrid: new prefill snapshots per request\n"
@@ -402,6 +414,11 @@ std::string serve_usage_text(const char* argv0) {
            "                                notice a request gets at its thinking budget;\n"
            "                                the canonical </think> close is appended when\n"
            "                                missing\n"
+           "  --reasoning-loop off|stop|conclude\n"
+           "                                every 512 thinking tokens, test whether the\n"
+           "                                thinking repeats whole passages; stop ends the\n"
+           "                                reply as length, conclude closes the thinking\n"
+           "                                and lets the model answer (default off)\n"
            "  --default-reasoning-effort E  none, minimal, low, medium, high, xhigh or max\n"
            "                                for requests that set no effort and keep\n"
            "                                thinking on\n"
@@ -416,7 +433,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                none; a request opts out with \"graft\": \"\"\n"
            "\n"
            "API BEHAVIOR\n"
-           "  --structured-output           accept JSON and JSON Schema response formats;\n"
+           "  --structured-output           enforce response formats (JSON, JSON Schema,\n"
+           "                                regex, choice, GBNF) and strict tool arguments;\n"
            "                                reserves the grammar masks and adds a grammar\n"
            "                                stage to every DFlash round\n"
            "  --unconstrained-response-format\n"
@@ -445,8 +463,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-webui                    do not serve a WebUI built in with\n"
            "                                NINFER_WEBUI_DIR on GET /\n"
            "  --webui-mcp-proxy             relay the WebUI's MCP traffic at /cors-proxy;\n"
-           "                                http targets only, reaches any host and carries\n"
-           "                                no API key, so only on a trusted bind\n"
+           "                                http targets only and reaches any host, so only\n"
+           "                                on a trusted bind\n"
            "  --max-request-mib N           request body limit, enforced before parsing\n"
            "                                (default 384)\n"
            "  --max-pending-requests N      requests waiting for admission (default 16)\n"
@@ -555,6 +573,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     const char* legacy_cache_flag  = nullptr;
     const char* hybrid_option_flag = nullptr;
     bool original_cache_selected   = false;
+    bool hybrid_cache_selected     = false;
     if (argc >= 2 && std::string(argv[1]) == "--version") {
         options.version_requested = true;
         return options;
@@ -749,7 +768,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             continue;
         }
         if (arg == "--use-alt-prefix-caching") {
-            options.context_cache.mode = ContextCacheMode::Hybrid;
+            hybrid_cache_selected = true;
             continue;
         }
         if (arg == "--use-original-prefix-caching") {
@@ -975,6 +994,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             long_anchor_spacing_explicit = true;
             continue;
         }
+        if (arg == "--progress-anchor-tokens") {
+            legacy_cache_flag = "--progress-anchor-tokens";
+            const int tokens  = parse_nonnegative_int(require_value("--progress-anchor-tokens"),
+                                                      "progress-anchor-tokens");
+            if (tokens != 0 && static_cast<std::uint32_t>(tokens) < kMinimumProgressAnchorTokens) {
+                throw std::invalid_argument("--progress-anchor-tokens must be 0 or at least " +
+                                            std::to_string(kMinimumProgressAnchorTokens));
+            }
+            options.context_cache.progress_anchor_tokens = static_cast<std::uint32_t>(tokens);
+            continue;
+        }
         if (arg == "--max-cache-markers-per-request") {
             options.context_cache.max_cache_markers_per_request = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-cache-markers-per-request"),
@@ -1135,6 +1165,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
+        if (arg == "--reasoning-loop") {
+            options.reasoning_loop =
+                product::parse_reasoning_loop_action(require_value("--reasoning-loop"));
+            continue;
+        }
         if (arg == "--vision") {
             options.enable_vision = true;
             continue;
@@ -1182,6 +1217,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+            continue;
+        }
+        if (arg == "--gpu-clock-floor") {
+            const std::uint64_t mhz =
+                parse_u64(require_value("--gpu-clock-floor"), "gpu-clock-floor");
+            if (mhz == 0 || mhz > 5000) {
+                throw std::invalid_argument("--gpu-clock-floor must be in [1, 5000] MHz");
+            }
+            options.gpu_clock_floor_mhz = static_cast<std::uint32_t>(mhz);
             continue;
         }
         if (arg == "--cuda-graph-allowance-mib") {
@@ -1508,6 +1552,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--default-graft '" + options.default_graft +
                                     "' does not name a --graft");
     }
+    if (original_cache_selected && hybrid_cache_selected) {
+        throw std::invalid_argument(
+            "--use-original-prefix-caching and --use-alt-prefix-caching select different prefix "
+            "caching systems");
+    }
+    // The hybrid prefix cache is the default. What only the checkpoint catalog serves selects the
+    // catalog instead: one of its options, pipeline stages, disabled prefix reuse (the hybrid
+    // cache cannot be off) or a graft (a direct graft lives in a catalog shared-prefix slot).
+    // A named --use-alt-prefix-caching keeps the hybrid cache and rejects them below.
+    const char* catalog_option = legacy_cache_flag;
+    if (catalog_option == nullptr && options.devices.size() > 1) { catalog_option = "--devices"; }
+    if (catalog_option == nullptr && !options.allow_prefix_reuse) {
+        catalog_option = "--no-prefix-reuse";
+    }
+    if (catalog_option == nullptr && !options.grafts.empty()) { catalog_option = "--graft"; }
+    options.context_cache.mode =
+        hybrid_cache_selected || (!original_cache_selected && catalog_option == nullptr)
+            ? ContextCacheMode::Hybrid
+            : ContextCacheMode::Legacy;
     if (!kv_capacity_explicit) {
         // The hybrid cache turns every Device page no active request holds into block cache, so
         // it sizes the KV pool to free VRAM unless a capacity is given.
@@ -1515,15 +1578,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                   ? KvCapacityPolicy::automatic()
                                   : KvCapacityPolicy::explicit_capacity(options.max_context);
     }
-    if (original_cache_selected && options.context_cache.mode == ContextCacheMode::Hybrid) {
-        throw std::invalid_argument(
-            "--use-original-prefix-caching and --use-alt-prefix-caching select different prefix "
-            "caching systems");
-    }
     if (options.context_cache.mode == ContextCacheMode::Hybrid) {
         if (legacy_cache_flag != nullptr) {
             throw std::invalid_argument(std::string(legacy_cache_flag) +
-                                        " configures the default prefix cache and cannot be "
+                                        " configures the checkpoint catalog and cannot be "
                                         "combined with --use-alt-prefix-caching");
         }
         if (!options.allow_prefix_reuse) {
@@ -1557,8 +1615,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         }
     } else if (hybrid_option_flag != nullptr) {
-        throw std::invalid_argument(std::string(hybrid_option_flag) +
-                                    " requires --use-alt-prefix-caching");
+        throw std::invalid_argument(
+            std::string(hybrid_option_flag) + " configures the hybrid prefix cache, and " +
+            (original_cache_selected ? "--use-original-prefix-caching" : catalog_option) +
+            " selects the checkpoint catalog");
     }
     if (kv_headroom_mib.has_value()) {
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
@@ -1651,8 +1711,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    if (options.prefill_chunk % 128 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     if (options.unconstrained_response_format && options.structured_output) {
         throw std::invalid_argument(

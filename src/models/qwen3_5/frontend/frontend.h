@@ -48,6 +48,9 @@ struct FrontendOptions {
     // Minimum token gap between consecutive automatic anchors (and between the prompt end and the
     // first one), doubling per anchor; 0 anchors every one of the last boundaries.
     std::uint32_t long_anchor_min_spacing_tokens = 0;
+    // When nonzero, preparation proposes a PrivateLongAnchor at every multiple of this many tokens
+    // strictly inside the prompt (ContextCacheOptions::progress_anchor_tokens).
+    std::uint32_t progress_anchor_tokens = 0;
     // Hidden prompt prefixes a request may select through PromptOptions::graft.
     std::vector<PromptGraft> grafts;
 };

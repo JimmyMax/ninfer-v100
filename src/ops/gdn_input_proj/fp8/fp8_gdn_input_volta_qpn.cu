@@ -6,7 +6,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_SM70
+#ifdef NINFER_TIER_VOLTA
 
 // See the attention sibling: same kernel, same reason, different epilogue.
 void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -21,6 +21,6 @@ void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tenso
     }
 }
 
-#endif // NINFER_SM70
+#endif // NINFER_TIER_VOLTA
 
 } // namespace ninfer::ops::detail

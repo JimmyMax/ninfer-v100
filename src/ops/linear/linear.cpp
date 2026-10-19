@@ -5,7 +5,7 @@
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
 #endif
 #include "ops/linear/q4/q4_dispatch.h"
@@ -87,7 +87,7 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 // The sm_70 routes take every dense format; without an arena, the widths that need none.
 bool sm70_route(const Tensor& x, const Weight& w, const Tensor& out,
                 const WorkspaceArena* workspace) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 在解码宽度上交由 QPN 内核
     // （dispatch_linear 的 NVFP4 分支），不要被这里的 sm70 small-T 路线截走 ——
     // 那条路线用 Nvfp4Decoder，实测只有 85 GB/s（DRAM 9.5%）。
@@ -144,7 +144,7 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::bf16_dispatch(x, w, out, policy, stream);
         return;
     case QType::NVFP4:
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
         // 本仓库 V100 增量（docs/v100/PLAN.md）：解码/校验宽度上交由 fork 的 QPN 内核，
         // 它直接消费 NVFP4 码；上游的 Volta A16 路线在同一形状上只有 85 GB/s（DRAM 9.5%）。
         if (detail::nvfp4_volta_takes(w, x.ne[1])) {

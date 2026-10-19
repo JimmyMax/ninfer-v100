@@ -115,6 +115,8 @@ struct ToolDefinition {
     std::string name;
     std::string description;
     std::string input_schema_json;
+    // Arguments are generated under input_schema_json (needs --structured-output).
+    bool strict = false;
     std::optional<std::string> input_examples_json;
     std::optional<CacheBoundary> cache_boundary_after;
 };
@@ -275,6 +277,11 @@ struct GenerationRequest {
     // Sampling from the token after the reasoning block closes (a `post_thinking` object).
     std::optional<SamplingParams> post_thinking;
     StructuredOutputOptions structured_output;
+    // The request field that asked for structured_output, named by errors about it.
+    std::string structured_output_param = "response_format";
+    // Chat Completions takes a tool's strict flag as a hint where it cannot be enforced (a server
+    // without --structured-output); the other protocols refuse it there.
+    bool strict_tools_advisory = false;
     // Each generated content token's log probability, with `top_logprobs` (0 to
     // kMaximumTokenLogprobs) of its most likely alternatives in the response.
     bool logprobs    = false;

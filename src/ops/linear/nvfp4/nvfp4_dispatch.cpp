@@ -3,7 +3,7 @@
 #include "ops/linear/nvfp4/nvfp4_dispatch_unified.h"
 #include "ops/linear/nvfp4/nvfp4_shapes.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/linear/nvfp4/nvfp4_launch.h" // 本仓库 V100 增量：kNvfp4VoltaQpnMaxTokens
 #endif
 #include <array>
@@ -50,7 +50,7 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
 
 void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                     WorkspaceArena* workspace, cudaStream_t stream) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：加载时重排过的权重（VoltaQpnPrepacked）只有两条
     // 消费路径——QPN（t <= 32，见 linear.cpp 的钩子）与 CUTLASS（t > 32，见 linear_swiglu /
     // linear_add 的钩子）。落到这里的宽 T 说明调用方把重排后的权重喂给了没有片段序解码器的

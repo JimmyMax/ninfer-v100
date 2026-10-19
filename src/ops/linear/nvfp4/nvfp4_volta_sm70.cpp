@@ -1,6 +1,6 @@
 #include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
 
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/linear/nvfp4/nvfp4_launch.h"
 
 namespace ninfer::ops::detail {

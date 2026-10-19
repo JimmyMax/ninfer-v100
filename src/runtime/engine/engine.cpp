@@ -2,6 +2,7 @@
 #include "text/structured_output.h"
 
 #include "core/device.h"
+#include "core/gpu_clock_floor.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
@@ -37,6 +38,16 @@
 namespace ninfer {
 namespace {
 
+// Gemma 4 and Flash-Next keep context caches of their own, which the checkpoint catalog's options
+// configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program.
+EngineOptions with_family_context_cache(EngineOptions options) {
+    if (runtime::is_gemma4_artifact(options.artifact_path) ||
+        runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        options.context_cache.mode = ContextCacheMode::Legacy;
+    }
+    return options;
+}
+
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     if (options.devices.empty()) {
@@ -44,21 +55,27 @@ DeviceContext initialize_device(const EngineOptions& options) {
         phase.complete();
         return device;
     }
-#ifdef _WIN32
-    // Multi-GPU execution is a Linux feature. Repeating one device id still works on Windows, which
-    // exercises the whole stage path on a single card.
-    for (const int id : options.devices) {
-        if (id != options.devices.front()) {
-            throw std::invalid_argument(
-                "multi-GPU execution is supported on Linux only; repeat one device id "
-                "(for example --devices 0,0) to test the pipeline on a single GPU");
-        }
-    }
-#endif
     DeviceContext device{std::span<const int>(options.devices)};
     phase.complete();
     return device;
 }
+
+// One diagnostic line per device that EngineOptions::gpu_clock_floor_mhz was asked for.
+void report_gpu_clock_floor(const EngineOptions& options, const GpuClockFloor& floor) {
+    for (const std::string& line : floor.report()) {
+        runtime::publish_diagnostic(
+            options.diagnostic_observer,
+            floor.complete() ? DiagnosticLevel::Info : DiagnosticLevel::Warning,
+            "gpu clock floor: %s", line.c_str());
+    }
+}
+
+// A generation's hold on the clock floor beside its reference to the Engine, both kept until its
+// handle ends; the hold ends first.
+struct HeldEngine {
+    std::shared_ptr<void> engine;
+    std::shared_ptr<void> clock_floor;
+};
 
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
@@ -265,8 +282,11 @@ public:
                               std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Gemma4Core>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(std::move(engine_options))),
-          device(initialize_device(options)) {
+        : options(runtime::normalize_engine_options(
+              with_family_context_cache(std::move(engine_options)))),
+          device(initialize_device(options)),
+          clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
+        report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
             auto constructed    = runtime::construct_gemma4(options, device);
@@ -295,8 +315,11 @@ public:
             return;
         }
         if (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
+            options.hybrid_experts.dma_share_auto ||
             options.hybrid_experts.cpu_threads != 0 || options.hybrid_experts.mapped_misses ||
-            options.hybrid_experts.adaptive_cache || !options.hybrid_experts.routing_profile.empty() ||
+            options.hybrid_experts.tail_skip_rank != 0 ||
+            options.hybrid_experts.prefill_buffers != 1 || options.hybrid_experts.adaptive_cache ||
+            !options.hybrid_experts.routing_profile.empty() ||
             !options.hybrid_experts.record_profile.empty()) {
             throw std::invalid_argument("hybrid expert options require native Qwen3.8-Flash-Next host experts");
         }
@@ -449,6 +472,8 @@ public:
 
     EngineOptions options;
     DeviceContext device;
+    // Held by each generation and scoring call (GpuClockFloor::hold).
+    GpuClockFloor clock_floor;
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> flash;
     std::unique_ptr<runtime::Gemma4Instance> gemma;
@@ -633,6 +658,7 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     }
     PreparedPrompt prompt      = prepare_tokens(std::move(tokens), false);
     const std::size_t expected = prompt.summary().prompt_tokens - first_target;
+    const std::shared_ptr<void> clock_floor = impl_->clock_floor.hold();
     std::vector<float> result  = std::visit(
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
@@ -727,11 +753,17 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
+                // Held before the core can start the request, so its prompt runs at the floor.
+                std::shared_ptr<void> keep_alive = impl_;
+                if (auto clock_floor = impl_->clock_floor.hold()) {
+                    keep_alive = std::make_shared<HeldEngine>(
+                        HeldEngine{.engine = impl_, .clock_floor = std::move(clock_floor)});
+                }
                 auto submission = core->submit(std::move(prompt.impl_->value), prompt_summary,
                                                prepare_seconds, std::move(resolved_options),
                                                consumer_mode, observation, pending_deadline);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                    impl_, std::move(submission), resolved_sampling));
+                    std::move(keep_alive), std::move(submission), resolved_sampling));
             }
         },
         impl_->core);

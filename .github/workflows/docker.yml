@@ -1,8 +1,9 @@
+
 # Publishes ghcr.io/<owner>/<repo> after CI passes on main: the runtime image around the
 # binaries that CI built and tested (its dist-sm86 and dist-sm120a artifacts), so nothing is
 # compiled twice and nothing unpublished by CI reaches the image. A CI run that changed nothing the
 # binaries are built from builds none, and the image it would publish is the one already there. Tags:
-#   latest            the newest main commit that passed CI
+#   latest            the newest main commit that passed CIer
 #   <VERSION>         the newest such commit of that release line
 #   sha-<12 hex>      the published commit
 # The registry keeps `latest` and the image published before it (docker/prune-images.sh).
@@ -91,7 +92,7 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ env.SHA }}
-            org.opencontainers.image.description=NInfer: Qwen3.5/3.6/3.8 inference server for RTX 30, 40 and 50 GPUs
+            org.opencontainers.image.description=NInfer: Qwen3.5/3.6/3.8, Qwen3.8-Flash-Next and Gemma 4 inference server for RTX 20, 30, 40 and 50 GPUs
             org.opencontainers.image.licenses=Apache-2.0
           # The layers below the binaries (Ubuntu and the libraries) come back from the last
           # published image through its inline cache. An Actions layer cache would hold the

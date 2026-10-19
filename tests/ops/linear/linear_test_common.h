@@ -53,9 +53,14 @@ struct Invocation {
 // [5120, 17408], where both of these read 0.60. So how much a decode that rounds costs is a
 // property of the fixture's code-and-activation pairing and not of K alone; run the shapes that
 // matter both ways rather than reasoning from one number.
+//
+// `CenteredWideRange` is `Centered` with every 97th element scaled by 2^-30 and every 89th by 2^20:
+// values a BF16 operand holds and an FP16 one does not, so a Turing build's BF16 MMA emulation
+// (ops/common/mma.cuh), which takes another route for them, meets them in some tiles only.
 enum class ActivationSigns : std::uint8_t {
     Centered,
     Biased,
+    CenteredWideRange,
 };
 
 struct ShapeCase {

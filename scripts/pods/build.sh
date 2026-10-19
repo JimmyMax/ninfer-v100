@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 build=${NINFER_BUILD_DIR:-/workspace/ninfer-work/build}
+arch=${NINFER_CUDA_ARCH:-86}
 # nvcc's concurrent temporary files can fill this rental's model volume before linking. Keep
 # them in the host's tmpfs; the build's memory-derived worker limit still applies.
 export TMPDIR
@@ -23,7 +24,8 @@ launcher=()
 if command -v ccache >/dev/null; then
     export CCACHE_DIR=${CCACHE_DIR:-/workspace/ccache} CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-40G}
     export CCACHE_COMPILERCHECK=content CCACHE_BASEDIR=${CCACHE_BASEDIR:-$(dirname "$PWD")}
-    [ -d "$CCACHE_DIR" ] || /workspace/ninfer-work/py311/bin/python scripts/pods/ccache_sync.py pull
+    [ -d "$CCACHE_DIR" ] || /workspace/ninfer-work/py311/bin/python scripts/pods/ccache_sync.py pull \
+        --arch "$arch" --dir "$CCACHE_DIR"
     ccache --zero-stats >/dev/null
     launcher=(-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
               -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache)
@@ -31,7 +33,7 @@ fi
 if [ ! -f "$build/CMakeCache.txt" ] || [ ! -f "$build/build.ninja" ] || \
    [ ! -f "$build/src/runtime/engine/device_profiles_builtin.cpp" ]; then
     cmake -S . -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CUDA_ARCHITECTURES=86 -DBUILD_TESTING=ON -DNINFER_BUILD_APPS=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="$arch" -DBUILD_TESTING=ON -DNINFER_BUILD_APPS=ON \
         -DNINFER_BUILD_BENCHMARKS=ON -DPython3_EXECUTABLE=/workspace/ninfer-work/py311/bin/python \
         ${launcher[@]+"${launcher[@]}"}
 fi
@@ -43,6 +45,7 @@ echo "build seconds: $((SECONDS - started))"
 if command -v ccache >/dev/null; then
     ccache --show-stats | grep -E "Hits|Misses|Cache size" || true
     [ "${NINFER_CCACHE_PUSH:-1}" = 0 ] || \
-        /workspace/ninfer-work/py311/bin/python scripts/pods/ccache_sync.py push
+        /workspace/ninfer-work/py311/bin/python scripts/pods/ccache_sync.py push --arch "$arch" \
+            --dir "$CCACHE_DIR"
 fi
 sha256sum "$build/apps/ninfer" "$build/apps/ninfer-serve" > ../jobs/build-binaries.sha256

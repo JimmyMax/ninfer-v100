@@ -17,6 +17,7 @@
 // {0, +1, -1} bf16 byte tables, and the B fragments byte permutes of the lane's activation
 // vectors. The group scale multiplies the slab's accumulator once per row.
 
+#include "ops/common/device_limits.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/t2/t2_rowsplit_storage.cuh"
@@ -107,7 +108,9 @@ __device__ __forceinline__ void t2_v2_b_fragment(const uint4& xa, const uint4& x
 }
 
 template <class Schedule>
-__global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void t2_small_t_v2_kernel(
+__global__ __launch_bounds__(Schedule::kThreads,
+                             resident_ctas_bound(Schedule::kThreads, Schedule::kMinBlocks)) void
+t2_small_t_v2_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out, std::int32_t rows,
     std::int32_t k, std::int32_t cols) {

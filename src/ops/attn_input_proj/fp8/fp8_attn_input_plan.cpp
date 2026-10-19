@@ -4,7 +4,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 
 #include "ops/linear/fp8/fp8_config.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.h" // 本仓库 V100 增量
 #    include "ops/linear/fp8/fp8_launch.h"                        // 本仓库 V100 增量：QPN
 #endif
@@ -58,7 +58,7 @@ static std::size_t fp8_attn_input_workspace_capacity_bytes_own(LinearPolicy poli
 
 std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：本 op 的 14336x5120 在 sm_70 上由 QPN
     // （t<=32，读 BF16 激活，零暂存——上游 A16 解码契约如此）与 CUTLASS（t>=33，自带暂存）
     // 拥有全部宽度。容量来自同一决策而不是 route table——测试会强制 unified 表，而钩子不受
@@ -87,7 +87,7 @@ std::size_t fp8_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::in
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：注意力投影是这个模型 FP8 权重的主要所在地
     // （每层一个 14336x5120）。sm_70 上 t>=33 走 CUTLASS 宽 T，t<=32 走 QPN。必须在
     // route-table 检查之前拦截。

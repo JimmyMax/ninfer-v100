@@ -13,6 +13,9 @@ ninfer_add_test(ninfer_checkpoint_recovery_impact_test
 ninfer_add_test(ninfer_slot_spill_guard_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_slot_spill_guard.cpp")
 
+ninfer_add_test(ninfer_worker_recovery_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_worker_recovery.cpp")
+
 ninfer_add_test(ninfer_resource_manager_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_resource_manager.cpp"
   LIBRARIES ninfer_runtime_support)
 # Bounds-checked containers: a slot read from the wrong catalogue (issue #39) aborts here instead of

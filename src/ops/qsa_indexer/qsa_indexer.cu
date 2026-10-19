@@ -9,7 +9,7 @@
 #include "core/device.h"
 #include "core/layout.h"
 #include "ops/common/math.h"
-#include "ops/common/sm70_emulation.cuh"
+#include "ops/common/pre_sm80.cuh"
 
 #include <cub/block/block_scan.cuh>
 #include <cuda_bf16.h>
@@ -149,9 +149,9 @@ __global__ void __launch_bounds__(128)
     const int start = *first;
     const int blocks = min((start + min(t0 + 4, tokens)) / kBlock, capacity);
     if (blocks <= kTopBlocks || b0 >= blocks) { return; }
-#if defined(NINFER_SM70_DEVICE)
-    // Volta has no TF32 tensor cores: each lane sums its eight dots of the warp's 16 x 16 tile in
-    // FP32 directly, the full product the three TF32 terms approximate.
+#if defined(NINFER_PRE_SM80_DEVICE)
+    // Volta and Turing have no TF32 tensor cores: each lane sums its eight dots of the warp's
+    // 16 x 16 tile in FP32 directly, the full product the three TF32 terms approximate.
     float sum[8] = {};
 #else
     wmma::fragment<wmma::accumulator, 16, 16, 8, float> sum;
@@ -164,7 +164,7 @@ __global__ void __launch_bounds__(128)
         const bool scored = t < tokens && (start + t + 1) / kBlock > kTopBlocks;
         const float q = scored ? queries[(static_cast<std::int64_t>(t) * kHeads +
                                          row % kHeads) * kHeadDim + base + d] : 0.0f;
-#if defined(NINFER_SM70_DEVICE)
+#if defined(NINFER_PRE_SM80_DEVICE)
         q_hi[tid] = q;
 #    pragma unroll
         for (int i = lane; i < 16 * 8; i += 32) {
@@ -210,7 +210,7 @@ __global__ void __launch_bounds__(128)
         __syncthreads();
 #endif
     }
-#if defined(NINFER_SM70_DEVICE)
+#if defined(NINFER_PRE_SM80_DEVICE)
 #    pragma unroll
     for (int i = 0; i < 8; ++i) { dots[warp][(lane / 16 + 2 * i) * 16 + lane % 16] = sum[i]; }
 #else

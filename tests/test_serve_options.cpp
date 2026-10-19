@@ -62,6 +62,9 @@ int main() {
                                  "--expert-dma-share", share}).hybrid_experts.dma_share == std::stof(share),
                           "server did not preserve an explicit hybrid DMA share");
     }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host",
+                             "--expert-dma-share", "auto"}).hybrid_experts.dma_share_auto,
+                      "server did not preserve an automatic hybrid DMA share");
     const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});
@@ -217,9 +220,8 @@ int main() {
                           defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,
                       "media preparation resource defaults mismatch");
-    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
-                          defaults.kv_capacity.explicit_tokens == defaults.max_context,
-                      "default KV capacity does not follow max context");
+    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Automatic,
+                      "the default hybrid prefix cache did not size KV from free memory");
     failures += check(defaults.context_cache.host_state_slots == ninfer::kDefaultHostStateSlots &&
                           defaults.context_cache.host_kv_capacity_bytes ==
                               ninfer::kDefaultHostKvCapacityBytes,
@@ -330,7 +332,6 @@ int main() {
             parse({"ninfer-serve", "model.ninfer", "--rope-yarn-factor", factor});
         failures += check(fixed.rope_yarn_factor == std::stof(factor) &&
                               fixed.max_context == 8192 &&
-                              fixed.kv_capacity.explicit_tokens == 8192 &&
                               make_engine_options(fixed).rope_yarn_factor == std::stof(factor),
                           "a YaRN factor must reach the Engine without growing the context");
     }
@@ -406,6 +407,23 @@ int main() {
                              "--default-reasoning-effort", "none"})
                               .default_reasoning_effort == RequestedReasoningEffort::None,
                       "--default-reasoning-effort none was refused beside --no-thinking");
+
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).reasoning_loop ==
+                          ninfer::ReasoningLoopAction::Off,
+                      "the reasoning-loop guard is not off by default");
+    failures += check(
+        parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "stop"}).reasoning_loop ==
+                ninfer::ReasoningLoopAction::Stop &&
+            parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "conclude"})
+                    .reasoning_loop == ninfer::ReasoningLoopAction::Conclude &&
+            parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "off"}).reasoning_loop ==
+                ninfer::ReasoningLoopAction::Off,
+        "--reasoning-loop did not select its action");
+    bool bad_reasoning_loop_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--reasoning-loop", "on"});
+    } catch (const std::invalid_argument&) { bad_reasoning_loop_rejected = true; }
+    failures += check(bad_reasoning_loop_rejected, "--reasoning-loop on was accepted");
 
     bool empty_model_id_rejected = false;
     try {
@@ -709,8 +727,8 @@ int main() {
                       "--auto-prefix-grid was accepted with prefix reuse disabled");
     // Hybrid prefix cache selection and its own capacities.
     failures += check(parse({"ninfer-serve", "model.ninfer"}).context_cache.mode ==
-                          ninfer::ContextCacheMode::Legacy,
-                      "the default prefix cache must remain the Legacy mode");
+                          ninfer::ContextCacheMode::Hybrid,
+                      "the default prefix cache must be the hybrid prefix cache");
     const ServeOptions hybrid =
         parse({"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching", "--host-cache-mib",
                "4096", "--device-snapshot-slots", "3", "--cache-taps-per-request", "5",
@@ -743,9 +761,33 @@ int main() {
                           hybrid_explicit_kv.kv_capacity.explicit_tokens == 16384 &&
                           hybrid_explicit_kv.context_cache.host_cache_budget_bytes == 0U,
                       "hybrid mode must keep an explicit KV capacity and a zero Host budget");
-    failures += check(parse({"ninfer-serve", "model.ninfer"}).kv_capacity.mode ==
-                          ninfer::KvCapacityMode::Explicit,
-                      "the default cache must keep the explicit max-context KV capacity");
+    const ServeOptions catalog =
+        parse({"ninfer-serve", "model.ninfer", "--use-original-prefix-caching"});
+    failures += check(catalog.context_cache.mode == ninfer::ContextCacheMode::Legacy &&
+                          catalog.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          catalog.kv_capacity.explicit_tokens == catalog.max_context,
+                      "the checkpoint catalog must keep the explicit max-context KV capacity");
+    // Without a named mode, what only the checkpoint catalog serves selects it: one of its
+    // options, pipeline stages, disabled prefix reuse or a graft.
+    for (const std::vector<std::string>& catalog_selector :
+         std::vector<std::vector<std::string>>{{"--device-state-slots", "2"},
+                                               {"--host-kv-mib", "64"},
+                                               {"--progress-anchor-tokens", "4096"},
+                                               {"--no-endpoint-anchors"},
+                                               {"--auto-prefix-grid"},
+                                               {"--slot-save-path", "sessions"},
+                                               {"--devices", "0,1"},
+                                               {"--no-prefix-reuse"},
+                                               {"--graft", "notes=notes.graft"}}) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+        arguments.insert(arguments.end(), catalog_selector.begin(), catalog_selector.end());
+        const ServeOptions selected = parse(std::move(arguments));
+        const std::string message =
+            catalog_selector.front() + " did not select the checkpoint catalog";
+        failures += check(selected.context_cache.mode == ninfer::ContextCacheMode::Legacy &&
+                              selected.kv_capacity.mode == ninfer::KvCapacityMode::Explicit,
+                          message.c_str());
+    }
     for (const std::vector<std::string>& legacy_flag :
          std::vector<std::vector<std::string>>{{"--device-state-slots", "2"},
                                                {"--host-state-slots", "2"},
@@ -757,6 +799,7 @@ int main() {
                                                {"--auto-long-anchors"},
                                                {"--branch-anchors"},
                                                {"--no-endpoint-anchors"},
+                                               {"--progress-anchor-tokens", "4096"},
                                                {"--auto-prefix-grid"},
                                                {"--derive-session-keys"},
                                                {"--context-cache-policy", "rolling"},
@@ -816,11 +859,20 @@ int main() {
                                                {"--cache-tap-min-gap", "64"}}) {
         std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
         arguments.insert(arguments.end(), hybrid_flag.begin(), hybrid_flag.end());
-        bool rejected = false;
-        try {
-            (void)parse(std::move(arguments));
-        } catch (const std::invalid_argument&) { rejected = true; }
-        failures += check(rejected, "a hybrid prefix-cache flag was accepted without the mode");
+        failures += check(parse(arguments).context_cache.mode == ninfer::ContextCacheMode::Hybrid,
+                          "a hybrid prefix-cache flag did not keep the default hybrid cache");
+        for (const std::vector<std::string>& catalog_selector :
+             std::vector<std::vector<std::string>>{{"--use-original-prefix-caching"},
+                                                   {"--host-kv-mib", "64"}}) {
+            std::vector<std::string> mixed = arguments;
+            mixed.insert(mixed.end(), catalog_selector.begin(), catalog_selector.end());
+            bool rejected = false;
+            try {
+                (void)parse(std::move(mixed));
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(
+                rejected, "a hybrid prefix-cache flag was accepted with the checkpoint catalog");
+        }
     }
     bool hybrid_without_reuse_rejected = false;
     try {
@@ -1044,6 +1096,7 @@ int main() {
                                         "--frequency-penalty",
                                         "--full-draft-head",
                                         "--gdn-state-fp16",
+                                        "--gpu-clock-floor",
                                         "--graft",
                                         "--greedy",
                                         "--host",
@@ -1105,6 +1158,7 @@ int main() {
                                         "--prefix-cache-file",
                                         "--presence-penalty",
                                         "--preserve-thinking",
+                                        "--progress-anchor-tokens",
                                         "--recency-eviction",
                                         "--recover-invariant-failures",
                                         "--release-diverged-checkpoints",
@@ -1194,7 +1248,8 @@ int main() {
                       "serve help omits the artifact-derived model id default");
 
     const ServeOptions inherited =
-        parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
+        parse({"ninfer-serve", "model.ninfer", "--use-original-prefix-caching", "--max-context",
+               "16384"});
     failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           inherited.kv_capacity.explicit_tokens == 16384,
                       "omitted --kv-capacity did not follow --max-context");
@@ -1253,6 +1308,18 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--fast-prefill-kernel") !=
                           std::string::npos,
                       "serve help omits --fast-prefill-kernel");
+
+    const ServeOptions clock_floor =
+        parse({"ninfer-serve", "model.ninfer", "--gpu-clock-floor", "1500"});
+    failures += check(clock_floor.gpu_clock_floor_mhz == 1500 && defaults.gpu_clock_floor_mhz == 0,
+                      "--gpu-clock-floor was not parsed, or is not off by default");
+    for (const char* value : {"0", "5001", "fast"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--gpu-clock-floor", value});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--gpu-clock-floor accepted 0, 5001 or a word");
+    }
 
     const ServeOptions graph_allowance =
         parse({"ninfer-serve", "model.ninfer", "--cuda-graph-allowance-mib", "512"});
@@ -1530,6 +1597,19 @@ int main() {
                               !parse({"ninfer-serve", "model.ninfer", "--no-endpoint-anchors"})
                                    .context_cache.endpoint_anchors,
                           "--no-endpoint-anchors did not turn the default endpoint anchors off");
+        failures += check(
+            parse({"ninfer-serve", "model.ninfer"}).context_cache.progress_anchor_tokens == 16384 &&
+                parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "0"})
+                        .context_cache.progress_anchor_tokens == 0 &&
+                parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "256"})
+                        .context_cache.progress_anchor_tokens == 256,
+            "--progress-anchor-tokens did not set the stride or its default");
+        bool fine_stride_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--progress-anchor-tokens", "255"});
+        } catch (const std::invalid_argument&) { fine_stride_rejected = true; }
+        failures +=
+            check(fine_stride_rejected, "a progress-anchor stride below 256 tokens was accepted");
         bool spacing_without_anchors_rejected = false;
         try {
             (void)parse({"ninfer-serve", "model.ninfer", "--long-anchor-spacing", "512"});

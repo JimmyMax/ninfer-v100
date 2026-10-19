@@ -7,6 +7,7 @@
 // middle the products themselves rounded to BF16, and the routed weighted sum.
 
 #include "core/arena.h"
+#include "core/expert_delivery.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 
 #include <cuda_bf16.h>
@@ -18,6 +19,10 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <filesystem>
+#include <fstream>
+#include <chrono>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -44,6 +49,7 @@ struct Bank {
     int rows = 0, k = 0;
     std::int64_t row_bytes = 0, expert_bytes = 0;
     DeviceBuffer bytes;
+    std::unique_ptr<PinnedHostBuffer> pinned;
     std::vector<float> exact; // [experts][rows][k]
 
     Bank(int rows_, int k_, std::mt19937& rng) : rows(rows_), k(k_) {
@@ -64,6 +70,8 @@ struct Bank {
                 exact[b * kBlockValues + j + 16] = dv * float((block[2 + j] >> 4) - 8);
             }
         }
+        pinned = std::make_unique<PinnedHostBuffer>(host.size());
+        std::memcpy(pinned->data(), host.data(), host.size());
         bytes = DeviceBuffer(host.size() + kTail);
         check(cudaMemset(bytes.p, 0, host.size() + kTail), "zero a bank");
         bytes.copy_from_host(host.data(), host.size());
@@ -111,7 +119,8 @@ int report(const char* what, int tokens, const Error& e, double rms_bound, doubl
     return ok ? 0 : 1;
 }
 
-int run(int tokens, const Bank& gate_up, const Bank& down, std::mt19937& rng) {
+int run(int tokens, const Bank& gate_up, const Bank& down, std::mt19937& rng,
+        ExpertDelivery* delivery = nullptr) {
     const int pairs = tokens * kTopK;
     std::normal_distribution<float> normal(0.0f, 1.0f);
     std::uniform_real_distribution<float> unit(0.05f, 1.0f);
@@ -158,13 +167,18 @@ int run(int tokens, const Bank& gate_up, const Bank& down, std::mt19937& rng) {
     const int max_active = std::min(pairs, kExperts);
     const DeviceBuffer gu_table = gate_up.table(0), gate_table = gate_up.table(0),
                        up_table = gate_up.table(kWidth), down_table = down.table(0);
-    const gguf::MoeTable t_gu{static_cast<const void* const*>(gu_table.p), gate_up.row_bytes,
+    if (delivery) {
+        (void)delivery->begin(0, static_cast<const std::int32_t*>(d_ids.p), pairs, nullptr);
+        delivery->await(nullptr);
+    }
+    const auto* delivered = delivery ? delivery->tables(0) : nullptr;
+    const gguf::MoeTable t_gu{delivered ? delivered + 2 * kExperts : static_cast<const void* const*>(gu_table.p), gate_up.row_bytes,
                               2 * kWidth, kHidden};
-    const gguf::MoeTable t_gate{static_cast<const void* const*>(gate_table.p), gate_up.row_bytes,
+    const gguf::MoeTable t_gate{delivered ? delivered : static_cast<const void* const*>(gate_table.p), gate_up.row_bytes,
                                 kWidth, kHidden};
-    const gguf::MoeTable t_up{static_cast<const void* const*>(up_table.p), gate_up.row_bytes,
+    const gguf::MoeTable t_up{delivered ? delivered + kExperts : static_cast<const void* const*>(up_table.p), gate_up.row_bytes,
                               kWidth, kHidden};
-    const gguf::MoeTable t_down{static_cast<const void* const*>(down_table.p), down.row_bytes,
+    const gguf::MoeTable t_down{delivered ? delivered + 3 * kExperts : static_cast<const void* const*>(down_table.p), down.row_bytes,
                                 kHidden, kWidth};
     DeviceBuffer d_middle(std::size_t(pairs) * kWidth * 2);
     std::vector<__nv_bfloat16> middle(std::size_t(pairs) * kWidth);
@@ -214,8 +228,8 @@ int run(int tokens, const Bank& gate_up, const Bank& down, std::mt19937& rng) {
                                              static_cast<const __nv_bfloat16*>(d_x.p), kHidden,
                                              routing, pairs, kTopK, act.p, nullptr);
         DeviceBuffer d_gu(std::size_t(pairs) * 2 * kWidth * 4);
-        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_gu, routing, max_active, pairs, tokens,
-                                 true, act.p, static_cast<float*>(d_gu.p), nullptr);
+        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_gu, routing, max_active, pairs, true,
+                                 act.p, static_cast<float*>(d_gu.p), nullptr);
         check(cudaDeviceSynchronize(), "matrix gate_up");
         std::vector<float> gu(std::size_t(pairs) * 2 * kWidth);
         d_gu.copy_to_host(gu.data(), gu.size() * 4);
@@ -233,8 +247,8 @@ int run(int tokens, const Bank& gate_up, const Bank& down, std::mt19937& rng) {
                                              static_cast<const __nv_bfloat16*>(d_middle.p), kWidth,
                                              routing, pairs, 1, act2.p, nullptr);
         DeviceBuffer d_rows(got_rows.size() * 4);
-        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_down, routing, max_active, pairs, tokens,
-                                 true, act2.p, static_cast<float*>(d_rows.p), nullptr);
+        gguf::moe_matrix_product(gguf::GgmlType::Q4_0, t_down, routing, max_active, pairs, true,
+                                 act2.p, static_cast<float*>(d_rows.p), nullptr);
         check(cudaDeviceSynchronize(), "matrix down");
         d_rows.copy_to_host(got_rows.data(), got_rows.size() * 4);
         for (int t = 0; t < tokens; ++t) {
@@ -284,6 +298,50 @@ int main() {
         const Bank down(kHidden, kWidth, rng);
         int failures = 0;
         for (const int tokens : {1, 3, 8, 9, 26, 130}) { failures += run(tokens, gate_up, down, rng); }
+        DeviceContext device(0);
+        RankContext rank = device.rank(0);
+        rank.stream = nullptr; // the oracle harness deliberately uses the legacy stream
+        const auto path = std::filesystem::temp_directory_path() /
+            ("ninfer-gemma-adapter-" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(path);
+        struct Cleanup { std::filesystem::path p; ~Cleanup() { std::filesystem::remove_all(p); } } cleanup{path};
+        for (bool disk : {false, true}) {
+            ExpertDeliveryLayer layer;
+            layer.aliases = {{0, 0}, {0, std::uint64_t(kWidth * gate_up.row_bytes)}, {0, 0}, {1, 0}};
+            std::vector<std::filesystem::path> files;
+            for (const Bank* bank : {&gate_up, &down}) {
+                if (disk) {
+                    files.push_back(path / std::to_string(files.size()));
+                    std::ofstream file(files.back(), std::ios::binary);
+                    file.write(static_cast<const char*>(bank->pinned->data()), bank->pinned->size());
+                    if (!file) { throw std::runtime_error("adapter fixture write failed"); }
+                }
+            }
+            for (int e = 0; e < kExperts; ++e) {
+                std::vector<ExpertBlob> blobs;
+                for (const Bank* bank : {&gate_up, &down}) {
+                    ExpertBlob blob;
+                    blob.bytes = bank->expert_bytes;
+                    blob.zero_tail = kTail;
+                    if (disk) {
+                        blob.extents = {{blobs.size(), std::uint64_t(e * bank->expert_bytes), blob.bytes}};
+                    } else {
+                        blob.pinned = static_cast<const std::byte*>(bank->pinned->data()) + e * bank->expert_bytes;
+                        blob.pinned_region = reinterpret_cast<std::uintptr_t>(bank->pinned->data());
+                    }
+                    blobs.push_back(std::move(blob));
+                }
+                layer.experts.push_back(std::move(blobs));
+            }
+            ExpertDeliveryOptions options;
+            options.pair_capacity = 9 * kTopK;
+            options.cache_bytes = 8ULL << 20;
+            ExpertDelivery delivery(rank, files, {std::move(layer)}, options);
+            std::cout << (disk ? "disk" : "host") << " delivered Gemma FP64 oracle\n";
+            for (int tokens : {1, 8, 9}) { failures += run(tokens, gate_up, down, rng, &delivery); }
+            delivery.drain();
+        }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " GGUF MoE GeGLU\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

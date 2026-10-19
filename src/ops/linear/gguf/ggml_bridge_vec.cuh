@@ -87,6 +87,14 @@ __device__ __forceinline__ void scale_min_k4(const std::uint8_t* s, int j, int& 
     }
 }
 
+// The product of one slice of a type the CPU also computes (Q2_0, Q8_0, IQ4_NL, IQ4_XS, IQ3_XXS,
+// IQ3_S; IQ2_S spells out its two halves): the slice factor times the activation scale, rounded,
+// times the integer dot, rounded, never fused with the sum it joins, so that gguf_expert_cpu
+// reproduces every bit.
+__device__ __forceinline__ float cpu_product(float factor, float d, int dot) {
+    return __fmul_rn(__fmul_rn(factor, d), float(dot));
+}
+
 // dot() is the contribution of one slice to one column: d and sum are the column's slice scale and
 // the sum of its unquantized values.
 template <ggml_type type>
@@ -103,7 +111,7 @@ struct Decoder<GGML_TYPE_Q8_0> {
         for (int i = 0; i < 8; ++i) { s.w[i] = int(u32_a2(b + 2 + 4 * i)); }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -198,7 +206,7 @@ struct Decoder<GGML_TYPE_Q2_0> {
     }
 
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 
     // The transposed form for activations stored by decode_quantize<true>: word 4h + k holds the
@@ -221,7 +229,7 @@ struct Decoder<GGML_TYPE_Q2_0> {
     }
 
     __device__ __forceinline__ static float dot_t(const Slice& s, const int* a, float d, int qsum) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)) - qsum);
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)) - qsum);
     }
 };
 
@@ -267,7 +275,7 @@ struct Decoder<GGML_TYPE_IQ4_NL> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -291,7 +299,7 @@ struct Decoder<GGML_TYPE_IQ4_XS> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -517,7 +525,9 @@ struct Decoder<GGML_TYPE_IQ2_S> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return d * (s.f[0] * float(dot4(s.w, a, 0)) + s.f[1] * float(dot4(s.w + 4, a + 4, 0)));
+        // Spelled out as the CPU's product computes it (gguf_expert_cpu).
+        return __fmul_rn(d, __fmaf_rn(s.f[0], float(dot4(s.w, a, 0)),
+                                      __fmul_rn(s.f[1], float(dot4(s.w + 4, a + 4, 0)))));
     }
 };
 
@@ -540,7 +550,7 @@ struct Decoder<GGML_TYPE_IQ3_XXS> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -563,7 +573,7 @@ struct Decoder<GGML_TYPE_IQ3_S> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -1688,7 +1698,121 @@ void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t strea
     }
 }
 
+namespace vec {
+
+// Value j of word e (value 4e + j of the slice) as dequantize_row_* gives it, from the decoded
+// slice: each type's dot product above, with one activation set to one.
+template <ggml_type type>
+__device__ __forceinline__ float slice_value(const Slice& s, int e, int j) {
+    const float c = float(static_cast<std::int8_t>(std::uint32_t(s.w[e]) >> (8 * j)));
+    if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
+        return s.f[0] * c - s.f[1];
+    } else if constexpr (type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ2_XS ||
+                         type == GGML_TYPE_IQ2_S) {
+        return (e < 4 ? s.f[0] : s.f[1]) * c;
+    } else if constexpr (type == GGML_TYPE_Q2_K) {
+        return e < 4 ? s.f[0] * c - s.f[2] : s.f[1] * c - s.f[3];
+    } else if constexpr (type == GGML_TYPE_Q3_K) {
+        const float h = float(static_cast<std::int8_t>(std::uint32_t(s.h[e]) >> (8 * j)));
+        return (e < 4 ? s.f[0] : s.f[1]) * (c + h - 4.0f);
+    } else if constexpr (type == GGML_TYPE_IQ1_S) {
+        return s.f[0] * (c + s.f[1]);
+    } else {
+        return s.f[0] * c;
+    }
+}
+
+template <typename dst_t>
+__device__ __forceinline__ void store8(dst_t* out, const float (&v)[8]) {
+    if constexpr (std::is_same_v<dst_t, float>) {
+        reinterpret_cast<float4*>(out)[0] = make_float4(v[0], v[1], v[2], v[3]);
+        reinterpret_cast<float4*>(out)[1] = make_float4(v[4], v[5], v[6], v[7]);
+    } else {
+        uint4 packed;
+        std::uint32_t* words = reinterpret_cast<std::uint32_t*>(&packed);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if constexpr (std::is_same_v<dst_t, half>) {
+                const half2 pair = __floats2half2_rn(v[2 * i], v[2 * i + 1]);
+                words[i]         = *reinterpret_cast<const std::uint32_t*>(&pair);
+            } else {
+                const __nv_bfloat162 pair = __floats2bfloat162_rn(v[2 * i], v[2 * i + 1]);
+                words[i]                  = *reinterpret_cast<const std::uint32_t*>(&pair);
+            }
+        }
+        *reinterpret_cast<uint4*>(out) = packed;
+    }
+}
+
+// One thread a 32-value slice; consecutive threads take consecutive slices of a row, so a warp
+// reads consecutive blocks and writes 2 KiB of FP16 in 16-byte stores. The generic kernel
+// (ggml_bridge.cu) runs one 32-thread block a super-block with 2-byte stores, about a quarter of
+// the write rate on a Tesla V100.
+template <ggml_type type, typename dst_t>
+__launch_bounds__(256) __global__
+    void slice_dequantize_kernel(const std::uint8_t* __restrict__ weight, std::int64_t row_bytes,
+                                 const std::int32_t* __restrict__ row_ids, int rows, int k,
+                                 dst_t* __restrict__ out, std::int64_t out_row_stride) {
+    using D                 = Decoder<type>;
+    constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
+    constexpr int kPerBlock = D::kBlockElems / 32;
+    __shared__ __align__(16) std::uint32_t table[kTable];
+    if constexpr (D::kTableWords > 0) {
+        const std::uint32_t* src = D::table();
+        for (int i = threadIdx.x; i < D::kTableWords; i += blockDim.x) { table[i] = src[i]; }
+        __syncthreads();
+    }
+    const int slices          = k / 32;
+    const std::int64_t total  = std::int64_t(rows) * slices;
+    for (std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+         i += std::int64_t(gridDim.x) * blockDim.x) {
+        const int row         = int(i / slices);
+        const int slice       = int(i % slices);
+        const std::int64_t at = row_ids != nullptr ? row_ids[row] : row;
+        Slice s;
+        D::decode(weight + at * row_bytes + std::int64_t(slice / kPerBlock) * D::kBlockBytes,
+                  slice % kPerBlock, table, s);
+        dst_t* y = out + std::int64_t(row) * out_row_stride + 32 * std::int64_t(slice);
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float v[8];
+#pragma unroll
+            for (int t = 0; t < 8; ++t) { v[t] = slice_value<type>(s, 2 * q + t / 4, t % 4); }
+            store8(y + 8 * q, v);
+        }
+    }
+}
+
+} // namespace vec
+
+template <ggml_type type, typename dst_t>
+void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const std::int32_t* row_ids,
+                      int rows, dst_t* out, std::int64_t out_row_stride, cudaStream_t stream) {
+    using D = vec::Decoder<type>;
+    if (!kSliceDequantize<type> || k % D::kBlockElems != 0 || rows <= 0 ||
+        out_row_stride % 8 != 0 || reinterpret_cast<std::uintptr_t>(out) % 16 != 0) {
+        throw std::invalid_argument("gguf slice dequantize: unsupported type or geometry");
+    }
+    static const int resident = [] {
+        int blocks = 0;
+        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                  &blocks, vec::slice_dequantize_kernel<type, dst_t>, 256, 0),
+              "slice dequantize occupancy");
+        return std::max(blocks, 1);
+    }();
+    const std::int64_t threads = std::int64_t(rows) * (k / 32);
+    const int blocks = int(std::min<std::int64_t>((threads + 255) / 256,
+                                                  std::int64_t(resident) * device_facts().sm_count));
+    vec::slice_dequantize_kernel<type, dst_t><<<blocks, 256, 0, stream>>>(
+        static_cast<const std::uint8_t*>(weight), row_bytes, row_ids, rows, k, out, out_row_stride);
+    check(cudaGetLastError(), "slice dequantize launch");
+}
+
 } // namespace ninfer::ops::gguf::detail
+
+#define NINFER_GGUF_SLICE_DEQUANTIZE_INSTANCE(TYPE, DST)                                           \
+    template void ninfer::ops::gguf::detail::slice_dequantize<TYPE, DST>(                          \
+        const void*, std::int64_t, int, const std::int32_t*, int, DST*, std::int64_t, cudaStream_t)
 
 #define NINFER_GGUF_VECTOR_INSTANCE(TYPE)                                                          \
     template void ninfer::ops::gguf::detail::vec_launch<TYPE>(                                     \
@@ -1700,4 +1824,7 @@ void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t strea
     template void ninfer::ops::gguf::detail::moe_decode_down_launch<TYPE>(                         \
         const ninfer::ops::gguf::MoeDecodeDownArgs&, int, cudaStream_t);                           \
     template void ninfer::ops::gguf::detail::moe_decode_prep_launch<TYPE>(                         \
-        const ninfer::ops::gguf::MoeDecodePrepArgs&, cudaStream_t)
+        const ninfer::ops::gguf::MoeDecodePrepArgs&, cudaStream_t);                                \
+    NINFER_GGUF_SLICE_DEQUANTIZE_INSTANCE(TYPE, half);                                             \
+    NINFER_GGUF_SLICE_DEQUANTIZE_INSTANCE(TYPE, __nv_bfloat16);                                    \
+    NINFER_GGUF_SLICE_DEQUANTIZE_INSTANCE(TYPE, float)

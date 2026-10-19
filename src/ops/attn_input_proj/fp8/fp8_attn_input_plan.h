@@ -40,7 +40,7 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
 
 // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 的 QPN 路线；x_fp16 非空时跳过内核内的
 // bf16->fp16 转换（激活已暂存）。
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 void launch_fp8_attn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& query,
                                      const void* x_fp16, Tensor& gate, Tensor& key, Tensor& value,
                                      cudaStream_t stream);

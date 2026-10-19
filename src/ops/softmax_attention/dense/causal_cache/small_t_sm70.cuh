@@ -11,7 +11,10 @@
 // into m8n8k4.row.row products with V (the quad pairs take eight of each 32 head dimensions). Each
 // lane reads its key's K row and the V rows of its products straight from the pages, converting
 // BF16 to FP16 (saturated at +-65504) as it loads them. One row group splits its tiles over up to
-// four warps, combined in shared memory before the partial is written.
+// four warps, combined in shared memory before the partial is written. A tile whose keys (or the
+// CTA's queries) hold a BF16 value beyond FP16 forms its scores again in FP32 from the BF16 values
+// (exact_scores), and one whose values do adds what their saturation took from P V
+// (add_value_excess), so the products keep BF16's range.
 //
 // The INT8-family caches (causal_attention_small_t_sm70_i8_kernel: int8, rk8v4, rk4v4, rk4v4-e8,
 // rk2v4-e8) take the same products: the fused append rotates and quantizes the new rows exactly as
@@ -116,9 +119,19 @@ constexpr int i8_resident_ctas() {
     return ctas > 0 ? ctas : 1;
 }
 
+// Flags BF16 values beyond FP16 in `bits` (detail::sm70::bf16x2_beyond_f16, accumulated): a
+// value is beyond where bits & kBeyondBits is nonzero.
+inline constexpr unsigned kBeyondBits = 0x80008000u;
+__device__ __forceinline__ unsigned beyond_bits(unsigned bf16x2) {
+    return (bf16x2 & 0x7f807f80u) + 0x38803880u;
+}
+
 // K and V of a BF16 cache: the current step's rows from the append input, the rest from the pages.
+// kExact: the rows also give the BF16 values of the CTA's queries (query) and keys and values
+// (key_bf16, value_bf16), and key8 and value4 flag what they saturate.
 template <typename Geometry, typename CacheInput>
 struct Bf16Rows {
+    static constexpr bool kExact = true;
     const __nv_bfloat16* cache_k;
     const __nv_bfloat16* cache_v;
     CacheInput input;
@@ -129,6 +142,30 @@ struct Bf16Rows {
     int kv_head;
     int first_pos;
     int valid_tokens;
+    const __nv_bfloat16* q; // the call's queries from the CTA's column on
+    int tokens;
+    int row_count;
+    bool query_beyond; // some query of the CTA is beyond FP16
+
+    __device__ __forceinline__ const __nv_bfloat16* query(int row) const {
+        int q_head = 0;
+        int token  = 0;
+        causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+        return row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)
+                   ? q + causal_q_index<Geometry>(q_head, 0, token)
+                   : nullptr;
+    }
+
+    __device__ __forceinline__ const __nv_bfloat16* key_bf16(int k) const { return key(k); }
+    __device__ __forceinline__ const __nv_bfloat16* value_bf16(int k) const {
+        return value(k, 0);
+    }
+    __device__ __forceinline__ bool keys_beyond(unsigned bits) const {
+        return __any_sync(0xffffffffu, (bits & kBeyondBits) != 0u);
+    }
+    __device__ __forceinline__ bool values_beyond(unsigned bits) const {
+        return __any_sync(0xffffffffu, (bits & kBeyondBits) != 0u);
+    }
 
     __device__ __forceinline__ const __nv_bfloat16* address(const __nv_bfloat16* plane, bool keys,
                                                             int key, int d) const {
@@ -148,8 +185,9 @@ struct Bf16Rows {
         return address(cache_k, true, k, 0);
     }
 
-    __device__ __forceinline__ uint4 key8(const __nv_bfloat16* row, int d) const {
+    __device__ __forceinline__ uint4 key8(const __nv_bfloat16* row, int d, unsigned& bits) const {
         const uint4 b = __ldg(reinterpret_cast<const uint4*>(row + d));
+        bits |= beyond_bits(b.x) | beyond_bits(b.y) | beyond_bits(b.z) | beyond_bits(b.w);
         return make_uint4(to_f16x2(b.x), to_f16x2(b.y), to_f16x2(b.z), to_f16x2(b.w));
     }
 
@@ -157,23 +195,24 @@ struct Bf16Rows {
         return address(cache_v, false, k, dim0);
     }
 
-    __device__ __forceinline__ uint2 value4(const __nv_bfloat16* row, int n) const {
+    __device__ __forceinline__ uint2 value4(const __nv_bfloat16* row, int n, unsigned& bits) const {
         const uint2 b = __ldg(reinterpret_cast<const uint2*>(row + 32 * n));
+        bits |= beyond_bits(b.x) | beyond_bits(b.y);
         return make_uint2(to_f16x2(b.x), to_f16x2(b.y));
     }
 };
 
-// Four int8 codes (dimension order) of a packed 4-bit key word's low or high half: the Lloyd-Max
-// levels, the E8-snapped signed int4 codes, or eight dimensions of one E8 root block.
+// Eight int8 codes (dimension order) of eight key dimensions from their stored bytes in `w`: eight
+// INT8 codes, a packed 4-bit word (the Lloyd-Max levels or the E8-snapped signed int4 codes) in
+// w.x, or one E8 root block in the low half of w.x.
 template <KvKeyCoding Keys>
-__device__ __forceinline__ uint2 key_codes8(const std::uint8_t* row, int d) {
+__device__ __forceinline__ uint2 key_codes8(uint2 w) {
     if constexpr (Keys == KvKeyCoding::Int8) {
-        return *reinterpret_cast<const uint2*>(row + d);
+        return w;
     } else if constexpr (Keys == KvKeyCoding::RootE8) {
-        const unsigned block = *reinterpret_cast<const std::uint16_t*>(row + d / 4);
-        return kv_cache_e8_root_decode_block(block & 0xffu, block >> 8);
+        return kv_cache_e8_root_decode_block(w.x & 0xffu, (w.x >> 8) & 0xffu);
     } else {
-        const unsigned word = *reinterpret_cast<const unsigned*>(row + d / 2);
+        const unsigned word = w.x;
         if constexpr (Keys == KvKeyCoding::Lloyd4) {
             return make_uint2(kv_cache_lloyd4_expand4(word), kv_cache_lloyd4_expand4(word >> 16));
         } else {
@@ -185,9 +224,13 @@ __device__ __forceinline__ uint2 key_codes8(const std::uint8_t* row, int d) {
 }
 
 // K and V of an INT8-family cache (rotated keys): INT8 G64 codes or a packed key coding over the
-// G64 key scales, INT8 G64 values or packed signed int4 values over G32 scales.
+// G64 key scales, INT8 G64 values or packed signed int4 values over G32 scales. A lane reads 32
+// dimensions of a row at a time in one or two 16-byte loads (kChunks): attend_tile's key chunks,
+// and the 32 consecutive value dimensions of its value products.
 template <typename Geometry, KvKeyCoding Keys, bool PackedValues>
 struct Int8Rows {
+    static constexpr bool kChunks = true;
+    static constexpr int kKeyChunksInFlight = 8;
     const std::uint8_t* cache_k;
     const std::uint8_t* cache_v;
     const __half* scale_k;
@@ -198,16 +241,24 @@ struct Int8Rows {
     bool staged_pages;
     int kv_head;
 
-    using ValueScales = std::conditional_t<PackedValues, uint4, uint2>;
-
     struct KeyRow {
         const std::uint8_t* codes;
         uint2 scales; // the row's four G64 scales
     };
 
+    // The stored bytes of 32 key dimensions: 32 INT8 codes, 16 bytes of a 4-bit coding, or four
+    // E8 root blocks (8 bytes); `hi` holds INT8 keys' second 16 bytes only.
+    struct KeyChunk {
+        uint4 lo;
+        uint4 hi;
+    };
+
+    // A lane's 32 value dimensions [dim0, dim0 + 32) of one key: 32 INT8 codes or 16 bytes of
+    // packed int4 codes, and their one scale (G64 or G32).
     struct ValueRow {
-        const std::uint8_t* codes; // at the lane's first dimension
-        ValueScales scales;
+        uint4 lo;
+        uint4 hi;
+        __half2 scale;
     };
 
     __device__ __forceinline__ int page_of(int k) const {
@@ -234,63 +285,92 @@ struct Int8Rows {
                     scale_k + kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, 0, offset))};
     }
 
-    __device__ __forceinline__ uint4 key8(const KeyRow& r, int d) const {
-        const int group = d / kKVCacheInt8Group;
+    // The stored bytes of dimensions [d0, d0 + 32), d0 a multiple of 32.
+    __device__ __forceinline__ KeyChunk key_chunk(const KeyRow& r, int d0) const {
+        KeyChunk c{};
+        if constexpr (Keys == KvKeyCoding::Int8) {
+            const auto* p = reinterpret_cast<const uint4*>(r.codes + d0);
+            c.lo          = p[0];
+            c.hi          = p[1];
+        } else if constexpr (Keys == KvKeyCoding::RootE8) {
+            const uint2 v = *reinterpret_cast<const uint2*>(r.codes + d0 / 4);
+            c.lo          = make_uint4(v.x, v.y, 0, 0);
+        } else {
+            c.lo = *reinterpret_cast<const uint4*>(r.codes + d0 / 2);
+        }
+        return c;
+    }
+
+    // Dimensions d0 + 8j..+7 of a chunk in FP16.
+    __device__ __forceinline__ uint4 key8(const KeyRow& r, const KeyChunk& c, int d0, int j) const {
+        uint2 w;
+        if constexpr (Keys == KvKeyCoding::Int8) {
+            const uint4& half = j < 2 ? c.lo : c.hi;
+            w                 = (j & 1) ? make_uint2(half.z, half.w) : make_uint2(half.x, half.y);
+        } else if constexpr (Keys == KvKeyCoding::RootE8) {
+            const unsigned word = j < 2 ? c.lo.x : c.lo.y;
+            w                   = make_uint2((j & 1) ? word >> 16 : word & 0xffffu, 0u);
+        } else {
+            w = make_uint2(j == 0 ? c.lo.x : j == 1 ? c.lo.y : j == 2 ? c.lo.z : c.lo.w, 0u);
+        }
+        const int group = (d0 + 8 * j) / kKVCacheInt8Group;
         const __half2 s = half_of(group < 2 ? r.scales.x : r.scales.y, group & 1);
-        const uint2 c   = key_codes8<Keys>(r.codes, d);
+        const uint2 codes = key_codes8<Keys>(w);
         uint4 out;
-        int8x4_to_f16x2(c.x, s, out.x, out.y);
-        int8x4_to_f16x2(c.y, s, out.z, out.w);
+        int8x4_to_f16x2(codes.x, s, out.x, out.y);
+        int8x4_to_f16x2(codes.y, s, out.z, out.w);
         return out;
     }
 
+    // Dimensions [dim0, dim0 + 32) of key k, dim0 a multiple of 32.
     __device__ __forceinline__ ValueRow value(int k, int dim0) const {
         const int page   = page_of(k);
         const int offset = k & kPagedKVPageMask;
-        ValueRow out;
+        ValueRow out{};
         if constexpr (PackedValues) {
-            out.codes =
-                cache_v + kv_cache_int4_value_code_index<Geometry>(page, kv_head, dim0 / 2, offset);
-            out.scales = *reinterpret_cast<const uint4*>(
-                scale_v + kv_cache_int4_value_scale_index<Geometry>(page, kv_head, 0, offset));
+            out.lo = *reinterpret_cast<const uint4*>(
+                cache_v +
+                kv_cache_int4_value_code_index<Geometry>(page, kv_head, dim0 / 2, offset));
+            out.scale = __half2half2(scale_v[kv_cache_int4_value_scale_index<Geometry>(
+                page, kv_head, dim0 / 32, offset)]);
         } else {
-            out.codes =
-                cache_v + kv_cache_int8_quant_code_index<Geometry>(page, kv_head, dim0, offset);
-            out.scales = *reinterpret_cast<const uint2*>(
-                scale_v + kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, 0, offset));
+            const auto* p = reinterpret_cast<const uint4*>(
+                cache_v + kv_cache_int8_quant_code_index<Geometry>(page, kv_head, dim0, offset));
+            out.lo    = p[0];
+            out.hi    = p[1];
+            out.scale = __half2half2(scale_v[kv_cache_int8_quant_scale_index<Geometry>(
+                page, kv_head, dim0 / kKVCacheInt8Group, offset)]);
         }
         return out;
     }
 
-    // Dimensions dim0 + 32n..+3 (dim0 < 32): G64 group n / 2, or G32 group n of packed values.
+    // Dimensions dim0 + 4n..+3 of a value row.
     __device__ __forceinline__ uint2 value4(const ValueRow& r, int n) const {
         unsigned codes = 0;
-        __half2 s;
         if constexpr (PackedValues) {
-            const unsigned pair = *reinterpret_cast<const std::uint16_t*>(r.codes + 16 * n);
+            const unsigned word = n < 2 ? r.lo.x : n < 4 ? r.lo.y : n < 6 ? r.lo.z : r.lo.w;
+            const unsigned pair = (n & 1) ? word >> 16 : word & 0xffffu;
             const unsigned low  = __vsub4((pair & 0x0f0fu) ^ 0x0808u, 0x0808u);
             const unsigned high = __vsub4(((pair >> 4) & 0x0f0fu) ^ 0x0808u, 0x0808u);
             codes               = __byte_perm(low, high, 0x5140);
-            const unsigned word = n < 2   ? r.scales.x
-                                  : n < 4 ? r.scales.y
-                                  : n < 6 ? r.scales.z
-                                          : r.scales.w;
-            s                   = half_of(word, n & 1);
         } else {
-            codes = *reinterpret_cast<const unsigned*>(r.codes + 32 * n);
-            s     = half_of(n < 4 ? r.scales.x : r.scales.y, (n / 2) & 1);
+            const uint4& half = n < 4 ? r.lo : r.hi;
+            const int m       = n & 3;
+            codes = m == 0 ? half.x : m == 1 ? half.y : m == 2 ? half.z : half.w;
         }
         uint2 out;
-        int8x4_to_f16x2(codes, s, out.x, out.y);
+        int8x4_to_f16x2(codes, r.scale, out.x, out.y);
         return out;
     }
 };
 
 // K and V of the FP8 (row-scaled E4M3) and NVFP4 (G16 E2M1 over E4M3 scales) caches: fp8, nvfp4,
 // and k8v4's FP8 keys with NVFP4 values. Keys are stored rotated in both codings, NVFP4 values too
-// (their reducer rotates the output back).
-template <typename Geometry, bool KeyFp8, bool ValueFp8>
+// (their reducer rotates the output back). Chunked as Int8Rows: 32 dimensions a load.
+template <typename Geometry, bool KeyFp8, bool ValueFp8, int KeyChunksInFlight = 8>
 struct QuantRows {
+    static constexpr bool kChunks = true;
+    static constexpr int kKeyChunksInFlight = KeyChunksInFlight;
     const std::uint8_t* cache_k;
     const std::uint8_t* cache_v;
     const void* scale_k;
@@ -306,10 +386,18 @@ struct QuantRows {
         uint4 scales; // FP8: the row's FP16 scale in the low half of x; NVFP4: its 16 E4M3 bytes
     };
 
+    // The stored bytes of 32 dimensions: 32 FP8 codes or 16 bytes of E2M1 pairs (`hi` FP8 only).
+    struct KeyChunk {
+        uint4 lo;
+        uint4 hi;
+    };
+
+    // A lane's 32 value dimensions [dim0, dim0 + 32) of one key and the row's scales.
     struct ValueRow {
-        const std::uint8_t* codes; // at the lane's first dimension
+        uint4 lo;
+        uint4 hi;
         uint4 scales;
-        int group0; // NVFP4: the G16 group of the lane's first dimension
+        int group0; // NVFP4: the G16 group of dim0
     };
 
     __device__ __forceinline__ int page_of(int k) const {
@@ -367,47 +455,235 @@ struct QuantRows {
         return {cache_k + at, load_scales<KeyFp8>(scale_k, page, kv_head, offset)};
     }
 
-    __device__ __forceinline__ uint4 key8(const KeyRow& r, int d) const {
+    // The stored bytes of dimensions [d0, d0 + 32), d0 a multiple of 32.
+    __device__ __forceinline__ KeyChunk key_chunk(const KeyRow& r, int d0) const {
+        KeyChunk c{};
         if constexpr (KeyFp8) {
-            const uint2 c   = *reinterpret_cast<const uint2*>(r.codes + d);
-            const __half2 s = fp16_scale(r.scales);
-            return make_uint4(fp8x2(c.x, s), fp8x2(c.x >> 16, s), fp8x2(c.y, s),
-                              fp8x2(c.y >> 16, s));
+            const auto* p = reinterpret_cast<const uint4*>(r.codes + d0);
+            c.lo          = p[0];
+            c.hi          = p[1];
         } else {
-            const unsigned c = *reinterpret_cast<const unsigned*>(r.codes + d / 2);
-            const __half2 s  = e4m3_scale(r.scales, d / kKVCacheNvfp4Group);
-            return make_uint4(e2m1x2(c, s), e2m1x2(c >> 8, s), e2m1x2(c >> 16, s),
-                              e2m1x2(c >> 24, s));
+            c.lo = *reinterpret_cast<const uint4*>(r.codes + d0 / 2);
+        }
+        return c;
+    }
+
+    // Dimensions d0 + 8j..+7 of a chunk in FP16.
+    __device__ __forceinline__ uint4 key8(const KeyRow& r, const KeyChunk& c, int d0, int j) const {
+        if constexpr (KeyFp8) {
+            const uint4& half = j < 2 ? c.lo : c.hi;
+            const uint2 w = (j & 1) ? make_uint2(half.z, half.w) : make_uint2(half.x, half.y);
+            const __half2 s = fp16_scale(r.scales);
+            return make_uint4(fp8x2(w.x, s), fp8x2(w.x >> 16, s), fp8x2(w.y, s),
+                              fp8x2(w.y >> 16, s));
+        } else {
+            const unsigned w = j == 0 ? c.lo.x : j == 1 ? c.lo.y : j == 2 ? c.lo.z : c.lo.w;
+            const __half2 s  = e4m3_scale(r.scales, (d0 + 8 * j) / kKVCacheNvfp4Group);
+            return make_uint4(e2m1x2(w, s), e2m1x2(w >> 8, s), e2m1x2(w >> 16, s),
+                              e2m1x2(w >> 24, s));
         }
     }
 
+    // Dimensions [dim0, dim0 + 32) of key k, dim0 a multiple of 32.
     __device__ __forceinline__ ValueRow value(int k, int dim0) const {
         const int page   = page_of(k);
         const int offset = k & kPagedKVPageMask;
-        const std::int64_t at =
-            ValueFp8 ? kv_cache_fp8_code_index<Geometry>(page, kv_head, dim0, offset)
-                     : kv_cache_nvfp4_code_index<Geometry>(page, kv_head, dim0, offset);
-        return {cache_v + at, load_scales<ValueFp8>(scale_v, page, kv_head, offset),
-                dim0 / kKVCacheNvfp4Group};
+        ValueRow out{};
+        if constexpr (ValueFp8) {
+            const auto* p = reinterpret_cast<const uint4*>(
+                cache_v + kv_cache_fp8_code_index<Geometry>(page, kv_head, dim0, offset));
+            out.lo = p[0];
+            out.hi = p[1];
+        } else {
+            out.lo = *reinterpret_cast<const uint4*>(
+                cache_v + kv_cache_nvfp4_code_index<Geometry>(page, kv_head, dim0, offset));
+        }
+        out.scales = load_scales<ValueFp8>(scale_v, page, kv_head, offset);
+        out.group0 = dim0 / kKVCacheNvfp4Group;
+        return out;
     }
 
-    // Dimensions dim0 + 32n..+3 (dim0 < 32): NVFP4 group group0 + 2n.
+    // Dimensions dim0 + 4n..+3 of a value row: NVFP4 group group0 + n / 4.
     __device__ __forceinline__ uint2 value4(const ValueRow& r, int n) const {
         if constexpr (ValueFp8) {
-            const unsigned c = *reinterpret_cast<const unsigned*>(r.codes + 32 * n);
-            const __half2 s  = fp16_scale(r.scales);
+            const uint4& half = n < 4 ? r.lo : r.hi;
+            const int m       = n & 3;
+            const unsigned c  = m == 0 ? half.x : m == 1 ? half.y : m == 2 ? half.z : half.w;
+            const __half2 s   = fp16_scale(r.scales);
             return make_uint2(fp8x2(c, s), fp8x2(c >> 16, s));
         } else {
-            const unsigned c = *reinterpret_cast<const std::uint16_t*>(r.codes + 16 * n);
-            const __half2 s  = e4m3_scale(r.scales, r.group0 + 2 * n);
+            const unsigned word = n < 2 ? r.lo.x : n < 4 ? r.lo.y : n < 6 ? r.lo.z : r.lo.w;
+            const unsigned c    = (n & 1) ? word >> 16 : word & 0xffffu;
+            const __half2 s     = e4m3_scale(r.scales, r.group0 + n / 4);
             return make_uint2(e2m1x2(c, s), e2m1x2(c >> 8, s));
         }
     }
 };
 
+// NVFP4's scalar row access for the one/two-tile H16 verification splits. Keep the same
+// represented FP16 operands, but read each MMA fragment separately and use its logical output
+// dimensions. The chunked provider still owns the common pages and stored-scale decoding.
+template <typename Geometry>
+struct Nvfp4ScalarRows {
+    static constexpr bool kChunks = false;
+    using PackedRows = QuantRows<Geometry, false, false>;
+    using KeyRow = typename PackedRows::KeyRow;
+    PackedRows packed;
+
+    struct ValueRow {
+        const std::uint8_t* codes;
+        uint4 scales;
+        int group0;
+    };
+
+    __device__ __forceinline__ KeyRow key(int k) const { return packed.key(k); }
+
+    __device__ __forceinline__ uint4 key8(const KeyRow& row, int d) const {
+        const unsigned codes = *reinterpret_cast<const unsigned*>(row.codes + d / 2);
+        const __half2 scale = PackedRows::e4m3_scale(row.scales, d / kKVCacheNvfp4Group);
+        return make_uint4(PackedRows::e2m1x2(codes, scale),
+                          PackedRows::e2m1x2(codes >> 8, scale),
+                          PackedRows::e2m1x2(codes >> 16, scale),
+                          PackedRows::e2m1x2(codes >> 24, scale));
+    }
+
+    __device__ __forceinline__ ValueRow value(int k, int dim0) const {
+        const int page = packed.page_of(k);
+        const int offset = k & kPagedKVPageMask;
+        const auto at = kv_cache_nvfp4_code_index<Geometry>(page, packed.kv_head, dim0, offset);
+        return {packed.cache_v + at,
+                PackedRows::template load_scales<false>(packed.scale_v, page, packed.kv_head,
+                                                        offset),
+                dim0 / kKVCacheNvfp4Group};
+    }
+
+    __device__ __forceinline__ uint2 value4(const ValueRow& row, int n) const {
+        const unsigned codes = *reinterpret_cast<const std::uint16_t*>(row.codes + 16 * n);
+        const __half2 scale = PackedRows::e4m3_scale(row.scales, row.group0 + 2 * n);
+        return make_uint2(PackedRows::e2m1x2(codes, scale),
+                          PackedRows::e2m1x2(codes >> 8, scale));
+    }
+};
+
+// Rows whose lanes read 32 dimensions of a row at a time (Int8Rows::kChunks).
+template <class Rows, class = void>
+struct chunked_rows : std::false_type {};
+template <class Rows>
+struct chunked_rows<Rows, std::void_t<decltype(Rows::kChunks)>>
+    : std::bool_constant<Rows::kChunks> {};
+
+// Rows of BF16 values that FP16 may not hold (Bf16Rows::kExact).
+template <class Rows, class = void>
+struct exact_rows : std::false_type {};
+template <class Rows>
+struct exact_rows<Rows, std::void_t<decltype(Rows::kExact)>> : std::bool_constant<Rows::kExact> {};
+
+// Eight BF16 values of a and of b: sum a_e b_e in FP32.
+__device__ __forceinline__ float dot8_bf16(uint4 a, uint4 b) {
+    const unsigned aw[4] = {a.x, a.y, a.z, a.w};
+    const unsigned bw[4] = {b.x, b.y, b.z, b.w};
+    float sum            = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        sum = fmaf(__uint_as_float(aw[i] << 16), __uint_as_float(bw[i] << 16), sum);
+        sum = fmaf(__uint_as_float(aw[i] & 0xffff0000u), __uint_as_float(bw[i] & 0xffff0000u), sum);
+    }
+    return sum;
+}
+
+// The tile's unscaled scores in FP32 from the BF16 queries and keys, in place of the FP16 products:
+// element i is row (lane & 1) + (i & 2) + 4h of the warp's rows from q_row0 and key k0 + 8 qp +
+// (i & 4) + (lane & 2) + (i & 1). Keys outside [key_lo, key_hi) and rows without a query score 0
+// (the caller masks them).
+template <class Rows>
+__device__ __forceinline__ void exact_scores(const Rows& rows, int k0, int key_lo, int key_hi,
+                                          int q_row0, float (&s)[8]) {
+    constexpr int D = kCausalHeadDim;
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    const int qp    = (lane >> 2) & 3;
+    const int h     = lane >> 4;
+    const __nv_bfloat16* query[2] = {rows.query(q_row0 + (lane & 1) + 4 * h),
+                                     rows.query(q_row0 + (lane & 1) + 4 * h + 2)};
+    const __nv_bfloat16* key[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        const int k = k0 + qp * 8 + 4 * (e >> 1) + (lane & 2) + (e & 1);
+        key[e]      = k >= key_lo && k < key_hi ? rows.key_bf16(k) : nullptr;
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { s[i] = 0.0f; }
+#pragma unroll 1
+    for (int d = 0; d < D; d += 8) {
+        uint4 q8[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            q8[r] = query[r] != nullptr ? __ldg(reinterpret_cast<const uint4*>(query[r] + d))
+                                        : make_uint4(0u, 0u, 0u, 0u);
+        }
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            if (key[e] == nullptr) { continue; }
+            const uint4 k8 = __ldg(reinterpret_cast<const uint4*>(key[e] + d));
+            const int i    = 4 * (e >> 1) + (e & 1);
+            s[i] += dot8_bf16(q8[0], k8);
+            s[i + 2] += dot8_bf16(q8[1], k8);
+        }
+    }
+}
+
+// Adds to the warp's outputs what saturating the tile's BF16 values to FP16 took from P V: the
+// FP16 probability in p_tile times the value's excess (detail::sm70::saturated_excess), for each
+// output element of the lane (row (lane & 1) + (i & 2) + 4h, dimension 32n + 8qp + (i & 4) +
+// (lane & 2) + (i & 1)). A zero probability adds nothing, whatever the value.
+template <class Rows>
+__device__ __forceinline__ void add_value_excess(const Rows& rows, const __half* p_tile, int k0,
+                                              int key_lo, int key_hi, float (&acc)[8][8]) {
+    constexpr int Bc      = 32;
+    constexpr int PStride = kPStride;
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    const int qp          = (lane >> 2) & 3;
+    const int row_a       = (lane & 1) + 4 * (lane >> 4);
+#pragma unroll 1
+    for (int kk = 0; kk < Bc; ++kk) {
+        const int k = k0 + kk;
+        if (k < key_lo || k >= key_hi) { continue; }
+        const float p[2] = {__half2float(p_tile[row_a * PStride + kk]),
+                            __half2float(p_tile[(row_a + 2) * PStride + kk])};
+        const __nv_bfloat16* v = rows.value_bf16(k);
+#pragma unroll
+        for (int n = 0; n < 8; ++n) {
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int d         = 32 * n + 8 * qp + 4 * half + (lane & 2);
+                const unsigned word = *reinterpret_cast<const unsigned*>(v + d);
+                const float lo      = detail::sm70::saturated_excess(__uint_as_float(word << 16));
+                const float hi =
+                    detail::sm70::saturated_excess(__uint_as_float(word & 0xffff0000u));
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    if (p[r] == 0.0f) { continue; }
+                    const int i = 4 * half + 2 * r;
+                    acc[n][i] = fmaf(p[r], lo, acc[n][i]);
+                    acc[n][i + 1] = fmaf(p[r], hi, acc[n][i + 1]);
+                }
+            }
+        }
+    }
+}
+
+// The value dimension of accumulator element i of product n in a lane: column c = (i & 4) +
+// (lane & 2) + (i & 1) of product n is dimension 32n + 8qp + c, or, for chunked rows, 64qp +
+// 32(c / 4) + 4n + c % 4, which gives each lane's B operands 32 consecutive dimensions.
+template <bool Chunks>
+__device__ __forceinline__ int acc_dim(int lane, int n, int i) {
+    const int qp     = (lane >> 2) & 3;
+    const int column = (lane & 2) + (i & 1);
+    return Chunks ? 64 * qp + 8 * (i & 4) + 4 * n + column : 32 * n + 8 * qp + (i & 4) + column;
+}
+
 // The online-softmax state of a warp's eight query rows in one lane: rows a ((lane & 1) + 4h)
 // and b (a + 2) of the group, and the lane's share of their FP32 outputs (element i of product n is
-// row (lane & 1) + (i & 2) + 4h, dimension 32n + 8qp + (i & 4) + (lane & 2) + (i & 1)).
+// row (lane & 1) + (i & 2) + 4h, dimension acc_dim(lane, n, i)).
 struct RowState {
     float m_a;
     float m_b;
@@ -430,12 +706,15 @@ struct RowState {
 // (q_row is this lane's A row, Q in FP16 QStride halves apart), the masked online softmax in FP32,
 // P through the warp's p_tile into m8n8k4.row.row products with V. Keys outside [key_lo, key_hi)
 // and past a row's position (qabs_a, qabs_b; -1 for no row) are masked. `rows` supplies K and V in
-// FP16: key(k) and key8(row, d) the eight dimensions from d of key k, value(k, dim0) and
-// value4(row, n) the four from dim0 + 32 n.
+// FP16: key(k) and key8(row, d) the eight dimensions from d of key k (chunked rows: key_chunk(row,
+// d0) the stored bytes of 32 and key8(row, chunk, d0, j) the eight from d0 + 8j), value(k, dim0)
+// and value4(row, n) the four from dim0 + 32 n (chunked rows: from dim0 + 4n). Exact rows
+// (exact_rows) also flag saturated keys and values (keys_beyond, values_beyond, query_beyond) and
+// give their BF16 values, the warp's rows numbered from q_row0.
 template <class Rows>
 __device__ __forceinline__ void attend_tile(const Rows& rows, const __half* q_row, __half* p_tile,
                                             int k0, int key_lo, int key_hi, int qabs_a, int qabs_b,
-                                            float scale, RowState& st) {
+                                            float scale, RowState& st, int q_row0 = 0) {
     constexpr int D             = kCausalHeadDim;
     constexpr int Bc            = 32;
     constexpr int PStride       = kPStride;
@@ -446,18 +725,48 @@ __device__ __forceinline__ void attend_tile(const Rows& rows, const __half* q_ro
     const int h                 = lane >> 4;
     const int a_row             = (lane & 3) + 4 * h;
 
+    constexpr bool Chunks = chunked_rows<Rows>::value;
+    constexpr bool Exact  = exact_rows<Rows>::value;
+
     // S = Q K^T: this lane supplies the K row of key k0 + 8 qp + (lane % 4) + 4h.
     float s[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    unsigned key_bits = 0u;
     {
         const int key    = k0 + qp * 8 + (lane & 3) + 4 * h;
         const bool live  = key >= key_lo && key < key_hi;
         const auto k_row = rows.key(live ? key : k0);
+        if constexpr (Chunks) {
+#pragma unroll (Rows::kKeyChunksInFlight)
+            for (int d0 = 0; d0 < D; d0 += 32) {
+                const auto chunk = rows.key_chunk(k_row, d0);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const uint4 k8 = live ? rows.key8(k_row, chunk, d0, j) : make_uint4(0, 0, 0, 0);
+                    const uint4 q8 = *reinterpret_cast<const uint4*>(q_row + d0 + 8 * j);
+                    hmma<false>(s, q8.x, q8.y, k8.x, k8.y);
+                    hmma<false>(s, q8.z, q8.w, k8.z, k8.w);
+                }
+            }
+        } else {
 #pragma unroll 8
-        for (int d = 0; d < D; d += 8) {
-            const uint4 k8 = live ? rows.key8(k_row, d) : make_uint4(0, 0, 0, 0);
-            const uint4 q8 = *reinterpret_cast<const uint4*>(q_row + d);
-            hmma<false>(s, q8.x, q8.y, k8.x, k8.y);
-            hmma<false>(s, q8.z, q8.w, k8.z, k8.w);
+            for (int d = 0; d < D; d += 8) {
+                uint4 k8 = make_uint4(0, 0, 0, 0);
+                if (live) {
+                    if constexpr (Exact) {
+                        k8 = rows.key8(k_row, d, key_bits);
+                    } else {
+                        k8 = rows.key8(k_row, d);
+                    }
+                }
+                const uint4 q8 = *reinterpret_cast<const uint4*>(q_row + d);
+                hmma<false>(s, q8.x, q8.y, k8.x, k8.y);
+                hmma<false>(s, q8.z, q8.w, k8.z, k8.w);
+            }
+        }
+    }
+    if constexpr (Exact) {
+        if (rows.keys_beyond(key_bits) || rows.query_beyond) {
+            exact_scores(rows, k0, key_lo, key_hi, q_row0, s);
         }
     }
     // Masked, scaled scores and the tile's row maxima (rows a: i & 2 == 0, b: i & 2 == 2).
@@ -515,17 +824,32 @@ __device__ __forceinline__ void attend_tile(const Rows& rows, const __half* q_ro
         for (int i = 0; i < 8; ++i) { st.acc[n][i] *= (i & 2) ? alpha_b : alpha_a; }
     }
     __syncwarp();
-    // O += P V: four keys per product; the quad pairs take eight of each 32 dimensions.
+    // O += P V: four keys per product; the quad pairs take eight of each 32 dimensions, or, for
+    // chunked rows, 64 consecutive dimensions each.
+    const int value_dim0 = Chunks ? 64 * qp + 32 * h : 8 * qp + 4 * h;
+    unsigned value_bits  = 0u;
 #pragma unroll 2
     for (int step = 0; step < Bc / 4; ++step) {
         const uint2 p4   = *reinterpret_cast<const uint2*>(p_tile + a_row * PStride + 4 * step);
         const int key    = k0 + 4 * step + (lane & 3);
         const bool live  = key >= key_lo && key < key_hi;
-        const auto v_row = rows.value(live ? key : k0, qp * 8 + 4 * h);
+        const auto v_row = rows.value(live ? key : k0, value_dim0);
 #pragma unroll
         for (int n = 0; n < 8; ++n) {
-            const uint2 v4 = live ? rows.value4(v_row, n) : make_uint2(0, 0);
+            uint2 v4 = make_uint2(0, 0);
+            if (live) {
+                if constexpr (Exact) {
+                    v4 = rows.value4(v_row, n, value_bits);
+                } else {
+                    v4 = rows.value4(v_row, n);
+                }
+            }
             hmma<true>(st.acc[n], p4.x, p4.y, v4.x, v4.y);
+        }
+    }
+    if constexpr (Exact) {
+        if (rows.values_beyond(value_bits)) {
+            add_value_excess(rows, p_tile, k0, key_lo, key_hi, st.acc);
         }
     }
     __syncwarp();
@@ -548,13 +872,13 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
     constexpr int QStride  = kQStride;
     constexpr int PStride  = kPStride;
     constexpr float Log2E  = 1.4426950408889634074f;
+    constexpr bool Chunks  = chunked_rows<Rows>::value;
     const int tid          = static_cast<int>(threadIdx.x);
     const int warp         = tid >> 5;
     const int lane         = tid & 31;
 
     const int group    = warp / KeyWarps;
     const int key_warp = warp % KeyWarps;
-    const int qp       = (lane >> 2) & 3;
     const int h        = lane >> 4;
     const int a_row    = (lane & 3) + 4 * h;
     // The accumulator rows of this lane: element i is row (lane & 1) + (i & 2) + 4h of the group.
@@ -571,7 +895,7 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
     RowState st;
     for (int block = key_warp; block < key_blocks; block += KeyWarps) {
         attend_tile(rows, q_row, p_tile, first_tile + block * Bc, split_start, split_end, qabs_a,
-                    qabs_b, scale, st);
+                    qabs_b, scale, st, group * 8);
     }
     float& m_a         = st.m_a;
     float& m_b         = st.m_b;
@@ -579,8 +903,7 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
     float& l_b         = st.l_b;
     float (&acc)[8][8] = st.acc;
 
-    // Element i of product n: row (lane & 1) + (i & 2) + 4h, dimension 32n + 8qp + (i & 4) +
-    // (lane & 2) + (i & 1).
+    // Element i of product n: row (lane & 1) + (i & 2) + 4h, dimension acc_dim(lane, n, i).
     const auto write_row = [&](int row, float m, float l) {
         int q_head = 0;
         int token  = 0;
@@ -602,7 +925,7 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
                 int q_head = 0;
                 int token  = 0;
                 causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-                const int d                            = n * 32 + qp * 8 + (i & 4) + (lane & 2);
+                const int d                            = acc_dim<Chunks>(lane, n, i);
                 *reinterpret_cast<float2*>(&partial_acc[causal_partial_acc_index<Geometry>(
                     q_head, d, token, split, tokens)]) = make_float2(acc[n][i], acc[n][i + 1]);
             }
@@ -633,6 +956,12 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
         const float f_a   = m_a == -CUDART_INF_F ? 0.0f : exp2_approx((m_a - max_a) * Log2E);
         const float f_b   = m_b == -CUDART_INF_F ? 0.0f : exp2_approx((m_b - max_b) * Log2E);
         float* group_acc  = combined + group * 8 * D;
+        // Chunked rows keep a row's dimension d at slot_of(d, row): their quad pairs' dimensions
+        // are 64 apart, one bank, so bits 6-7 move to 3-4, and rows are D apart, so odd rows flip
+        // bit 2. A warp's adds then meet at most two to a bank.
+        const auto slot_of = [](int d, int row) {
+            return Chunks ? d ^ ((row & 1) << 2) ^ (((d >> 6) & 3) << 3) : d;
+        };
         for (int w = 0; w < KeyWarps; ++w) {
             if (key_warp == w) {
 #pragma unroll
@@ -640,9 +969,9 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         const int local   = (lane & 1) + (i & 2) + 4 * h;
-                        const int d       = n * 32 + qp * 8 + (i & 4) + (lane & 2) + (i & 1);
+                        const int d       = acc_dim<Chunks>(lane, n, i);
                         const float share = acc[n][i] * ((i & 2) ? f_b : f_a);
-                        float& slot       = group_acc[local * D + d];
+                        float& slot       = group_acc[local * D + slot_of(d, local)];
                         slot              = w == 0 ? share : slot + share;
                     }
                 }
@@ -675,7 +1004,7 @@ attend(const Rows& rows, const __half* q_s, __half* p_s, float (*stat_m)[8], flo
                 partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m;
                 partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l;
             }
-            const float* src = combined + (g * 8 + local) * D + d;
+            const float* src = combined + (g * 8 + local) * D + slot_of(d, local);
             *reinterpret_cast<float2*>(
                 &partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)]) =
                 make_float2(src[0], src[1]);
@@ -780,7 +1109,8 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, tokens, logical_capacity);
     const int active_split_count =
         causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
@@ -796,6 +1126,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         write_neutral();
         return;
     }
+    // Keys at or past the live end are beyond every live column: none is loaded.
+    const int load_end = split_end < live_end ? split_end : live_end;
+
     const int first_tile    = (split_start / Bc) * Bc;
     const int key_blocks    = div_up(split_end - first_tile, Bc);
     const int first_page    = first_tile >> kPagedKVPageShift;
@@ -828,6 +1161,7 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
     }
 
     // The CTA's query rows in FP16, zero past row_count.
+    unsigned query_bits = 0u;
     for (int idx = tid; idx < Groups * 8 * (D / 2); idx += Threads) {
         const int row = idx / (D / 2);
         const int d   = (idx - row * (D / 2)) * 2;
@@ -836,19 +1170,22 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
         unsigned value = 0;
         if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)) {
-            value = sm70_attention::to_f16x2(
-                *reinterpret_cast<const unsigned*>(&q[causal_q_index<Geometry>(q_head, d, token)]));
+            const unsigned word =
+                *reinterpret_cast<const unsigned*>(&q[causal_q_index<Geometry>(q_head, d, token)]);
+            query_bits |= sm70_attention::beyond_bits(word);
+            value = sm70_attention::to_f16x2(word);
         }
         *reinterpret_cast<unsigned*>(&q_s[row * QStride + d]) = value;
     }
-    __syncthreads();
+    const bool query_beyond = __syncthreads_or((query_bits & sm70_attention::kBeyondBits) != 0u);
 
     const sm70_attention::Bf16Rows<Geometry, CacheInput> rows{
         cache_k,    cache_v,      input,   physical_pages_s, block_table,
-        first_page, staged_pages, kv_head, first_pos,        valid_tokens};
+        first_page, staged_pages, kv_head, first_pos,        valid_tokens,
+        q,          tokens,       row_count, query_beyond};
     sm70_attention::attend<Geometry, TokenTile>(
         rows, q_s, p_s, stat_m, stat_l, combined, tokens, row_count, kv_head, split, split_start,
-        split_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
+        load_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
 }
 
 // The INT8-family caches (rotated keys in any key coding, INT8 or packed int4 values), launched by
@@ -956,7 +1293,8 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
     const int active_split_count =
         causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, wave_splits);
     if (split >= active_split_count) { return; }
@@ -972,6 +1310,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         write_neutral();
         return;
     }
+    // Keys at or past the live end are beyond every live column: none is loaded.
+    const int load_end = split_end < live_end ? split_end : live_end;
+
     const int first_tile    = (split_start / Bc) * Bc;
     const int key_blocks    = div_up(split_end - first_tile, Bc);
     const int first_page    = first_tile >> kPagedKVPageShift;
@@ -1113,7 +1454,7 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         kv_head};
     sm70_attention::attend<Geometry, TokenTile>(
         rows, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head, split, split_start,
-        split_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
+        load_end, first_tile, key_blocks, pos, scale, partial_acc, partial_m, partial_l);
 }
 
 // The FP8 and NVFP4 caches (fp8: FP8 keys and values; nvfp4: NVFP4 keys and values; k8v4: FP8
@@ -1224,7 +1565,8 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
     const int active_split_count =
         causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
@@ -1248,6 +1590,9 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
         write_neutral();
         return;
     }
+    // Keys at or past the live end are beyond every live column: none is loaded.
+    const int load_end = split_end < live_end ? split_end : live_end;
+
     const int first_tile    = (split_start / Bc) * Bc;
     const int key_blocks    = div_up(split_end - first_tile, Bc);
     const int first_page    = first_tile >> kPagedKVPageShift;
@@ -1359,8 +1704,34 @@ __launch_bounds__(32 * sm70_attention::Shape<TokenTile * Geometry::GroupSize>::k
     const sm70_attention::QuantRows<Geometry, KeyFp8, ValueFp8> rows{
         cache_k,     cache_v,    cache_k_scale, cache_v_scale, physical_pages_s,
         block_table, first_page, staged_pages,  kv_head};
+    if constexpr (!MultiBatch && !KeyFp8 && !ValueFp8 && TokenTile == 4) {
+        // These choices are measured over the complete Op on V100. Use the actual split work,
+        // not the host envelope: one captured graph serves every position inside that envelope.
+        if constexpr (Geometry::QHeads == 16) {
+            if (key_blocks <= 2) {
+                const sm70_attention::Nvfp4ScalarRows<Geometry> scalar{rows};
+                sm70_attention::attend<Geometry, TokenTile>(
+                    scalar, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head, split,
+                    split_start, load_end, first_tile, key_blocks, positions, attention_scale,
+                    partial_acc, partial_m, partial_l);
+                return;
+            }
+        }
+        // Fused append benefits from the shorter QK unroll. Cached-only H16 splits at 9K/12K/
+        // 24K keep eight chunks in flight; above 256 active CTAs, two chunks win again.
+        if (CacheInput::writes_cache || Geometry::KVHeads * active_split_count > 256) {
+            const sm70_attention::QuantRows<Geometry, false, false, 2> limited{
+                cache_k, cache_v, cache_k_scale, cache_v_scale, physical_pages_s,
+                block_table, first_page, staged_pages, kv_head};
+            sm70_attention::attend<Geometry, TokenTile>(
+                limited, q_s, p_s, stat_m, stat_l, combined, TokenTile, RowCount, kv_head, split,
+                split_start, load_end, first_tile, key_blocks, positions, attention_scale,
+                partial_acc, partial_m, partial_l);
+            return;
+        }
+    }
     sm70_attention::attend<Geometry, TokenTile>(rows, q_s, p_s, stat_m, stat_l, combined, TokenTile,
-                                                RowCount, kv_head, split, split_start, split_end,
+                                                RowCount, kv_head, split, split_start, load_end,
                                                 first_tile, key_blocks, positions, attention_scale,
                                                 partial_acc, partial_m, partial_l);
 }

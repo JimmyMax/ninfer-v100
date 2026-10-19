@@ -6,7 +6,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_SM70
+#ifdef NINFER_TIER_VOLTA
 
 // The attention projections are where the model's FP8 weights actually live -- two per layer for
 // all 64 layers -- so the quadpair route matters here more than it does in plain Linear. The
@@ -26,6 +26,6 @@ void launch_fp8_attn_input_volta_qpn(const Tensor& x, const Weight& weight, Tens
     }
 }
 
-#endif // NINFER_SM70
+#endif // NINFER_TIER_VOLTA
 
 } // namespace ninfer::ops::detail

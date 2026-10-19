@@ -88,3 +88,93 @@ def test_explicit_stop_and_guard_cancel_a_queued_start(monkeypatch, entry):
     monkeypatch.setattr(harness, "vast", provider)
     harness.main()
     assert len(stopped) == 1
+
+
+CATALOG = [
+    {"gpuId": "NVIDIA GeForce RTX 3090", "displayName": "RTX 3090", "communityCloud": True,
+     "communityPricePerHr": 0.22, "securePricePerHr": 0.5, "available": True},
+    {"gpuId": "NVIDIA GeForce RTX 3090 Ti", "displayName": "RTX 3090 Ti", "communityCloud": True,
+     "communityPricePerHr": 0.27, "securePricePerHr": None, "available": False},
+    {"gpuId": "NVIDIA L4", "displayName": "L4", "communityCloud": False,
+     "communityPricePerHr": None, "securePricePerHr": 0.59, "available": True},
+]
+
+
+def test_download_cap_joins_only_a_query_without_one():
+    assert harness.with_download_cap("gpu_name=RTX_3060", 0.005) == \
+        "gpu_name=RTX_3060 inet_down_cost<=0.005"
+    assert harness.with_download_cap("inet_down_cost<0.01", 0.005) == "inet_down_cost<0.01"
+
+
+def test_vast_cost_counts_traffic_beside_hours():
+    # The 2026-10-14 RTX 3060 Ti host: 80.8 GB at $0.039/GB outweighed its GPU time.
+    offer = {"dph_total": 0.1, "inet_down_cost": 0.039, "inet_up_cost": 0.039}
+    assert harness.vast_cost(offer, 2, 80.8, 1) == pytest.approx(0.2 + 80.8 * 0.039 + 0.039)
+
+
+@pytest.mark.parametrize("name", ["RTX 3090", "rtx 3090", "NVIDIA GeForce RTX 3090"])
+def test_runpod_quote_names_the_same_card(name):
+    quote = harness.runpod_quote(CATALOG, name, 2, 10, 100)
+    assert quote["gpu"] == "NVIDIA GeForce RTX 3090" and quote["cloud"] == "community"
+    assert quote["cost"] == pytest.approx((0.44 + 100 * 0.10 / 730) * 10, abs=1e-3)
+    assert "--gpus 2 --disk 100" in quote["command"] and "--secure" not in quote["command"]
+
+
+def test_runpod_quote_takes_the_secure_price_without_a_community_one():
+    quote = harness.runpod_quote(CATALOG, "L4", 1, 1, 0)
+    assert quote["cloud"] == "secure" and quote["hourly"] == 0.59
+    assert quote["command"].endswith(" --secure")
+
+
+@pytest.mark.parametrize("catalog", [CATALOG, None])
+def test_runpod_quote_without_the_card(catalog):
+    assert harness.runpod_quote(catalog, "RTX 3060", 1, 1, 0) is None
+
+
+@pytest.mark.parametrize("vast_total,available,expected", [
+    (1.0, True, "runpod"), (0.5, True, "runpod"), (0.4, True, "vast"),
+    (1.0, False, "vast"), (None, True, "runpod"), (None, False, None),
+])
+def test_runpod_is_preferred_unless_vast_costs_less(vast_total, available, expected):
+    assert harness.preferred(vast_total, {"cost": 0.5, "available": available}) == expected
+
+
+def rent_with(monkeypatch, tmp_path, offer, *options):
+    class Created(Exception):
+        pass
+
+    def provider(*args):
+        if args == ("show", "instances"):
+            return []
+        if args[:2] == ("search", "offers"):
+            assert args[2] == "ask_contract_id=7 verified=any"
+            return [offer]
+        raise Created(args)
+
+    key = tmp_path / "id_test"
+    key.with_suffix(".pub").write_text("ssh-ed25519 AAAAtest test\n")
+    monkeypatch.setattr(harness, "STATE", tmp_path / "pod.json")
+    monkeypatch.setattr(harness, "SSH_KEY", key)
+    monkeypatch.setattr(harness, "vast", provider)
+    monkeypatch.setattr(harness, "runpod_catalog", lambda: CATALOG)
+    monkeypatch.setattr(harness.sys, "argv", ["harness", "rent", "7", "--hours", "2",
+                                              "--image", "image", *options])
+    with pytest.raises((ValueError, Created)) as raised:
+        harness.main()
+    return raised.value
+
+
+def test_rent_refuses_an_offer_over_the_download_price(monkeypatch, tmp_path):
+    offer = {"gpu_name": "RTX 3060", "num_gpus": 1, "dph_total": 0.1, "inet_down_cost": 0.039}
+    error = rent_with(monkeypatch, tmp_path, offer, "--download-gb", "80")
+    assert "bills $0.0390/GB of downloads" in str(error)
+
+
+def test_rent_sends_a_card_runpod_quotes_for_less_to_runpod(monkeypatch, tmp_path):
+    offer = {"gpu_name": "RTX 3090", "num_gpus": 1, "dph_total": 0.3, "inet_down_cost": 0.004}
+    # $0.3/h for 2 h and 100 GB at $0.004/GB against RunPod's $0.22/h and container disk.
+    error = rent_with(monkeypatch, tmp_path, offer, "--download-gb", "100", "--disk", "100")
+    assert isinstance(error, ValueError) and "pod-up.sh --gpu 'NVIDIA GeForce RTX 3090'" in str(error)
+    error = rent_with(monkeypatch, tmp_path, offer, "--download-gb", "100", "--disk", "100",
+                      "--over-runpod")
+    assert type(error).__name__ == "Created"

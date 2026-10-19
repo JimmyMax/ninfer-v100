@@ -128,7 +128,7 @@ std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& requ
 std::string render_tool_definition(const ToolDefinition& tool) {
     using Json  = RequestJson;
     Json schema = Json::parse(tool.input_schema_json);
-    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", false}};
+    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", tool.strict}};
     if (!tool.description.empty()) { function["description"] = tool.description; }
     if (tool.input_examples_json) {
         function["input_examples"] = Json::parse(*tool.input_examples_json);
@@ -210,7 +210,7 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             request.continuation != PromptContinuationMode::NewAssistantTurn) {
             invalid_prompt_option(
                 "structured output requires default stops and a new assistant turn",
-                "response_format", "incompatible_structured_output");
+                request.structured_output_param, "incompatible_structured_output");
         }
         // Preserve explicit reasoning requests; retain the economical final-only default when
         // the caller has not selected a reasoning mode or budget.
@@ -447,6 +447,9 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
+        // Constrained requests too: the guard's control span goes through the same grammar-checked
+        // path a reached thinking budget uses.
+        options.execution.thinking.loop = server.reasoning_loop;
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.execution.post_thinking_sampling =

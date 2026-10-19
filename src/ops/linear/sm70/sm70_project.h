@@ -34,11 +34,20 @@ struct Destination {
 
 inline constexpr int kMaxDestinations = 4;
 
+// The columns a wide call converts and multiplies at once: every prompt chunk in one pass, a
+// Vision item's patches in several, which bounds its FP16 activations and FP32 product plane.
+inline constexpr std::int32_t kWideColumns = 8192;
+
 // The activations of one call in FP16 (or, for the small-T route's direct widths, as the caller's
-// BF16 plane) and the slab scratch every parent of up to `max_rows` rows shares.
+// BF16 plane) and the slab scratch every parent of up to `max_rows` rows shares. A wide call of
+// more than kWideColumns columns keeps its BF16 plane and converts each pass's columns into `pass`.
 struct Activation {
     const __half* data        = nullptr;
     const __nv_bfloat16* bf16 = nullptr;
+    __half* pass              = nullptr;
+    // The small-T route's flags of its FP16 plane: nonzero for each 64-value chunk of a column
+    // holding a value beyond FP16 ([T][k / 64]; sm70_small.h).
+    const std::uint8_t* beyond_chunks = nullptr;
     std::int32_t k            = 0;
     std::int32_t tokens       = 0;
     std::int32_t max_rows     = 0;

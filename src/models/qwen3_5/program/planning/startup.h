@@ -110,6 +110,7 @@ struct SequencePlanningInputs {
     ops::RopeYarn rope_yarn;
     std::uint32_t mtp_attention_window = 0;
     models::LoadOptions features;
+    std::optional<std::uint64_t> expert_cache_bytes;
     bool use_cuda_graph    = true;
     // Nonzero replaces the computed per-profile CUDA Graph allowance in total.
     std::size_t cuda_graph_allowance_bytes = 0;
@@ -146,6 +147,7 @@ struct SequencePlanImpl {
     ops::RopeYarn rope_yarn;
     std::uint32_t mtp_attention_window = 0;
     models::LoadOptions features;
+    std::optional<std::uint64_t> expert_cache_bytes;
     bool use_cuda_graph    = true;
     bool causal_scoring    = false;
     bool structured_output = false;

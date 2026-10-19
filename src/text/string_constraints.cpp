@@ -112,21 +112,11 @@ struct Rule {
     std::optional<std::int64_t> maximum;
 };
 
-struct LengthBound {
-    std::size_t minimum = 0;
-    std::optional<std::size_t> maximum;
-};
-
 struct Plan {
     Json root;
     Json yes = true;
     Json no = false;
     bool constrained = false; // unique string arrays
-    bool string_root = false; // the output is one JSON string
-    // String values whose minLength/maxLength this state enforces, taken out of the schema the
-    // grammar compiles: a counted string in the grammar has no cacheable token masks.
-    std::unordered_map<const Json*, LengthBound> lengths;
-    std::string grammar_schema;
 
     explicit Plan(const std::string& schema) : root(Json::parse(schema)) {
         std::set<const Json*> scanned;
@@ -134,76 +124,6 @@ struct Plan {
         if (constrained) {
             std::set<std::pair<std::vector<const Json*>, bool>> visited;
             walk({&root}, false, visited);
-        }
-        grammar_schema = schema;
-        // The parser follows a JSON object, array or string output (another root is opaque to it).
-        bool followed = false;
-        try {
-            const Json* top = &root;
-            for (int hops = 0; top->is_object() && top->contains("$ref") && hops < 16; ++hops) top = &ref(*top);
-            if (top->is_object() && top->contains("type")) {
-                string_root = top->at("type") == "string";
-                followed    = string_root || top->at("type") == "object" || top->at("type") == "array";
-            }
-        } catch (const std::invalid_argument&) {}
-        if (followed && !has_alternatives(root)) {
-            std::vector<Json::json_pointer> bounded;
-            find_lengths(root, Json::json_pointer(), bounded);
-            if (!bounded.empty()) {
-                Json grammar = root;
-                for (const auto& pointer : bounded) {
-                    grammar.at(pointer).erase("minLength");
-                    grammar.at(pointer).erase("maxLength");
-                }
-                grammar_schema = grammar.dump();
-            }
-        }
-    }
-    // Every value position of a schema without alternatives has one interpretation, so a string's
-    // bounds can be enforced outside the grammar exactly; with anyOf the grammar keeps them.
-    static bool has_alternatives(const Json& node) {
-        if (node.is_object()) {
-            for (const auto& [key, value] : node.items()) {
-                if (key == "anyOf" || key == "oneOf" || key == "allOf" || has_alternatives(value)) {
-                    return true;
-                }
-            }
-        } else if (node.is_array()) {
-            for (const auto& value : node) {
-                if (has_alternatives(value)) { return true; }
-            }
-        }
-        return false;
-    }
-    // Plain bounded strings: type string with minLength/maxLength and annotations only (a pattern,
-    // format or enum stays with its bounds in the grammar).
-    void find_lengths(const Json& node, const Json::json_pointer& at,
-                      std::vector<Json::json_pointer>& bounded) {
-        if (!node.is_object()) { return; }
-        if (node.contains("type") && node.at("type") == "string" &&
-            (node.contains("minLength") || node.contains("maxLength"))) {
-            const bool plain = std::all_of(node.items().begin(), node.items().end(), [](const auto& item) {
-                return item.key() == "type" || item.key() == "minLength" || item.key() == "maxLength" ||
-                       annotation(item.key());
-            });
-            if (plain) {
-                LengthBound bound;
-                bound.minimum = node.value("minLength", std::size_t{0});
-                if (node.contains("maxLength")) { bound.maximum = node.at("maxLength").get<std::size_t>(); }
-                lengths.emplace(&node, bound);
-                bounded.push_back(at);
-            }
-        }
-        for (const auto& [key, value] : node.items()) {
-            if (key == "properties" || key == "$defs" || key == "definitions") {
-                if (value.is_object()) {
-                    for (const auto& [name, child] : value.items()) { find_lengths(child, at / key / name, bounded); }
-                }
-            } else if (key == "items" || key == "additionalProperties") {
-                find_lengths(value, at / key, bounded);
-            } else if (key == "prefixItems" && value.is_array()) {
-                for (std::size_t i = 0; i < value.size(); ++i) { find_lengths(value[i], at / key / i, bounded); }
-            }
         }
     }
     const Json& ref(const Json& node) const {
@@ -524,11 +444,6 @@ struct Parser {
     std::string pending;
     StringDomain options;
     std::string primitive;
-    // The current value string's enforced bounds and its decoded scalars so far.
-    bool bounded = false;
-    std::size_t length_min = 0;
-    std::optional<std::size_t> length_max;
-    std::size_t scalars = 0;
 
     Parser(std::shared_ptr<const Plan> p, std::string close)
         : plan(std::move(p)), reasoning_close(std::move(close)),
@@ -637,11 +552,6 @@ struct Parser {
             key_string = false;
             decoded.clear();
             pending.clear();
-            scalars = 0;
-            const auto bound = nodes.size() == 1 ? plan->lengths.find(nodes.front()) : plan->lengths.end();
-            bounded    = bound != plan->lengths.end();
-            length_min = bounded ? bound->second.minimum : 0;
-            length_max = bounded ? bound->second.maximum : std::nullopt;
             options = plan->strings(nodes);
             if (!frames.empty() && frames.back().kind == Kind::Array && frames.back().guarded && options.finite) {
                 const auto& frame = frames.back();
@@ -678,62 +588,18 @@ struct Parser {
         }
         return false;
     }
-    bool count_scalar() {
-        ++scalars;
-        return !(bounded && length_max && scalars > *length_max);
-    }
     bool append_scalar(std::uint32_t cp) {
         try { decoded += utf8(cp); }
         catch (const std::invalid_argument&) { return false; }
         pending.clear();
-        return count_scalar() && prefix_valid();
-    }
-    // Whether `token` keeps the current bounded string within its maximum, when the token does
-    // not close it; nullopt when it does, which needs the full parse.
-    std::optional<bool> fits_inside(std::string_view token) const {
-        std::size_t count = scalars;
-        std::string partial = pending;
-        const auto complete = [](const std::string& bytes) {
-            const auto first = static_cast<unsigned char>(bytes[0]);
-            if (first == '\\') {
-                if (bytes.size() >= 2 && bytes[1] != 'u') { return bytes.size() == 2; }
-                if (bytes.size() < 6) { return false; }
-                std::uint32_t cp = 0;
-                for (std::size_t i = 2; i < 6; ++i) cp = (cp << 4) | static_cast<std::uint32_t>(std::max(0, hex(bytes[i])));
-                return cp < 0xd800 || cp > 0xdbff ? bytes.size() == 6 : bytes.size() == 12;
-            }
-            const std::size_t n = first >= 0xf0 ? 4 : first >= 0xe0 ? 3 : 2;
-            return bytes.size() == n;
-        };
-        for (const char raw : token) {
-            const auto c = static_cast<unsigned char>(raw);
-            if (partial.empty()) {
-                if (c == '"') { return std::nullopt; }
-                if (c == '\\' || c >= 0x80) {
-                    partial.assign(1, raw);
-                } else {
-                    ++count;
-                }
-            } else {
-                partial.push_back(raw);
-                if (complete(partial)) {
-                    ++count;
-                    partial.clear();
-                }
-            }
-            // An escape or UTF-8 sequence under way is one more scalar once it completes.
-            if (length_max && count + (partial.empty() ? 0 : 1) > *length_max) { return false; }
-        }
-        return true;
+        return prefix_valid();
     }
     bool string_byte(unsigned char c) {
         if (pending.empty()) {
             if (c == '"') {
                 if (options.finite &&
                     std::find(options.values.begin(), options.values.end(), decoded) == options.values.end()) return false;
-                if (!key_string && bounded && scalars < length_min) return false;
                 in_string = false;
-                bounded   = false;
                 if (key_string) {
                     if (frames.empty() || frames.back().kind != Kind::Object) return false;
                     auto& frame = frames.back();
@@ -751,7 +617,7 @@ struct Parser {
             }
             if (c < 0x20) return false;
             decoded.push_back(static_cast<char>(c));
-            return count_scalar() && prefix_valid();
+            return prefix_valid();
         }
         pending.push_back(static_cast<char>(c));
         if (pending[0] == '\\') {
@@ -857,7 +723,10 @@ struct Parser {
                 if (whitespace(c)) continue;
                 // Native tool envelopes are separate alternatives, intentionally
                 // outside the final-content JSON contract.
-                if (c != '{' && c != '[' && !(c == '"' && plan->string_root)) { mode = Mode::Opaque; return true; }
+                if (c != '{' && c != '[') {
+                    mode = Mode::Opaque;
+                    return true;
+                }
                 mode = Mode::JSON;
             }
             if (!json_byte(c)) return false;
@@ -883,29 +752,12 @@ StringConstraintState& StringConstraintState::operator=(const StringConstraintSt
 }
 StringConstraintState::StringConstraintState(StringConstraintState&&) noexcept = default;
 StringConstraintState& StringConstraintState::operator=(StringConstraintState&&) noexcept = default;
-bool StringConstraintState::has_constraints() const noexcept {
-    return impl_->plan->constrained || !impl_->plan->lengths.empty();
-}
-const std::string& StringConstraintState::grammar_schema() const noexcept { return impl_->plan->grammar_schema; }
+
+bool StringConstraintState::has_constraints() const noexcept { return impl_->plan->constrained; }
 bool StringConstraintState::accepts(std::string_view token) const {
     if (!has_constraints()) return true;
-    const auto& parser = impl_->parser;
-    if (!impl_->plan->constrained && parser.mode == Mode::JSON && parser.in_string && parser.bounded) {
-        // Only the length is checked here: a token that stays inside the string needs no copy.
-        if (const auto fits = parser.fits_inside(token)) return *fits;
-    }
-    auto shadow = parser;
+    auto shadow = impl_->parser;
     return shadow.token(token);
-}
-bool StringConstraintState::needs_scan(std::size_t longest_token) const noexcept {
-    if (!has_constraints()) return false;
-    if (impl_->plan->constrained) return true;
-    const auto& parser = impl_->parser;
-    if (parser.mode != Mode::JSON || !parser.in_string || !parser.bounded) return false;
-    // A token adds at most one scalar per byte: far from both bounds none is at stake.
-    const std::size_t under_way = parser.scalars + (parser.pending.empty() ? 0 : 1);
-    return under_way < parser.length_min ||
-           (parser.length_max && under_way + longest_token > *parser.length_max);
 }
 bool StringConstraintState::accept(std::string_view token) {
     if (!has_constraints()) return true;
@@ -921,14 +773,9 @@ bool StringConstraintState::needs_check(std::string_view token) const noexcept {
     if (parser.mode == Mode::Reasoning)
         return token.find(parser.reasoning_close[0]) != std::string_view::npos || !parser.reasoning_tail.empty();
     // Outside strings primitive tokens can select a narrowed branch or begin the wrong instance
-    // type for uniqueness, so structural-byte filtering is unsafe; lengths only concern strings.
+    // type for uniqueness, so structural-byte filtering is unsafe.
     if (!parser.in_string) return unique;
     if (unique && parser.options.finite) return true;
-    if (parser.bounded) {
-        const std::size_t under_way = parser.scalars + (parser.pending.empty() ? 0 : 1);
-        if (parser.length_max && under_way + token.size() > *parser.length_max) return true;
-        if (under_way < parser.length_min && token.find('"') != std::string_view::npos) return true;
-    }
     // Within an unrestricted string only a close/escape can finish a duplicate value.
     return unique && token.find_first_of("\"\\") != std::string_view::npos;
 }

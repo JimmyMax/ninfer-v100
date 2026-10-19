@@ -52,6 +52,7 @@ std::uint64_t ProgramImpl::device_state_backing_bytes() const noexcept {
     for (const VmmRegion& region : suspendable.workspace_by_rank) {
         bytes += region.reserved_bytes();
     }
+    if (experts) { bytes += experts->device_backing_bytes(); }
     return bytes;
 }
 
@@ -78,6 +79,7 @@ std::vector<DeviceSnapshot::Range> ProgramImpl::live_persistent_ranges() const {
 }
 
 void ProgramImpl::release_device_state_backing() {
+    if (experts) { experts->release_device_backing(); }
     if (kv_arena) { kv_arena->release_backing(); }
     if (suspendable.persistent) { suspendable.persistent->release_backing(); }
     for (VmmRegion& region : suspendable.persistent_by_rank) { region.release_backing(); }
@@ -87,6 +89,7 @@ void ProgramImpl::release_device_state_backing() {
 
 void ProgramImpl::restore_device_state_backing() {
     try {
+        if (experts) { experts->restore_device_backing(); }
         if (kv_arena) {
             const RankBinding bound(device, 0);
             kv_arena->restore_backing();

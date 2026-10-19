@@ -49,6 +49,7 @@ struct ExecutorOptions {
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // One checkpoint of every sequence's rings (snapshot/restore), allocated with the caches.
     bool checkpoints = true;
+    std::optional<std::uint64_t> expert_cache_bytes;
 };
 
 // One media item's units in a prompt chunk: consecutive units (an image, or frames of a video) of
@@ -71,6 +72,7 @@ struct ExecutorMemory {
     // the tower owns beside the model's weights (the streamed window and its resident copies).
     std::uint64_t vision_encode_bytes = 0;
     std::uint64_t vision_owned_bytes  = 0;
+    ExpertDeliveryMemory experts;
 };
 
 // A sequence's checkpoint: its sliding-window rings, kept in the executor's checkpoint storage of
@@ -104,6 +106,9 @@ public:
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;
     // Loads the kernels every route reaches, and captures the decode graphs.
     void warm_up();
+    // Check after a stream completion and before output publication.
+    void check_experts() const;
+    [[nodiscard]] ExpertDeliveryStats expert_stats() const;
     // Runs up to prefill_chunk tokens at the sequence's next positions and leaves the logits of the
     // last `logit_rows` (at most kMaxLogitRows) in logits(). The soft tokens of `media` take the
     // place of their rows' placeholder embeddings, and with the vision config's bidirectional

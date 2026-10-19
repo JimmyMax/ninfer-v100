@@ -4,6 +4,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/openai_responses.h"
+#include "serve/structured_output.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -216,7 +217,7 @@ int test_budgets_and_nonsemantic_hints() {
                   {"prompt_cache_retention", "24h"},
                   {"prompt_cache_options",
                    Json{{"mode", "explicit"}, {"ttl", "30m"}, {"future_hint", true}}},
-                  {"safety_identifier", "local-user"},
+                  {"safety_identifier", std::string(128, 'x')},
                   {"service_tier", "auto"},
                   {"stream_options", Json{{"include_obfuscation", false}}},
                   {"text", Json{{"format", Json{{"type", "text"}}}, {"verbosity", "medium"}}},
@@ -227,6 +228,14 @@ int test_budgets_and_nonsemantic_hints() {
         parse_openai_responses_create_request(hints, limits());
     failures += check(accepted.max_tool_calls == 0,
                       "typed nonsemantic hints are accepted without changing generation");
+
+    hints["safety_identifier"] = std::string(129, 'x');
+    failures +=
+        check(api_error([&] {
+                  (void)parse_openai_responses_create_request(hints, limits());
+              }).param == "safety_identifier",
+              "a safety_identifier over 128 characters is rejected, not thrown past the parser");
+    hints["safety_identifier"] = std::string(128, 'x');
 
     hints["client_metadata"] = nullptr;
     failures += check(parse_openai_responses_create_request(hints, limits()).prompt.model == "m",
@@ -586,6 +595,13 @@ int test_assistant_item_boundaries_and_errors() {
              {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", "thought"}}})}};
     const Json call = Json{
         {"type", "function_call"}, {"call_id", "call_1"}, {"name", "lookup"}, {"arguments", "{}"}};
+    const OpenAIResponsesCreateRequest bare_reasoning = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"input",
+              Json::array({Json{{"type", "reasoning"}, {"summary", Json::array()}}, first})}},
+        limits());
+    failures += check(bare_reasoning.prompt.input_turns.size() == 1,
+                      "reasoning Item without optional content is accepted");
     const auto rejected = [&](Json input) {
         return api_error([&] {
             (void)parse_openai_responses_create_request(
@@ -897,10 +913,55 @@ int test_explicit_rejections() {
 
     Json value     = base;
     value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"strict", true}}});
+    const auto strict = parse_openai_responses_create_request(value, limits());
+    failures += check(strict.prompt.generation.tools.at(0).strict,
+                      "a strict function lost its strict flag");
+    failures +=
+        check(api_code([&] {
+                  (void)drop_unavailable_constraints(strict.prompt.generation, false, false);
+              }) == "strict_tools_not_supported",
+              "a strict function ran unenforced on a server without grammar masks");
+
+    value          = base;
+    value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"async", false}}});
+    failures += check(
+        api_code([&] { (void)parse_openai_responses_create_request(value, limits()); }).empty(),
+        "async:false is the neutral synchronous function contract");
+    value["tools"][0]["async"] = true;
     failures += check(api_code([&] {
                           (void)parse_openai_responses_create_request(value, limits());
-                      }) == "strict_tools_not_supported",
-                      "strict function schema is rejected explicitly");
+                      }) == "async_tools_not_supported",
+                      "async:true function tools are rejected explicitly");
+
+    value          = base;
+    value["input"] = Json::array(
+        {Json{{"role", "user"}, {"content", "hi"}},
+         Json{{"type", "function_call"},
+              {"call_id", "call_1"},
+              {"name", "f"},
+              {"arguments", "{}"},
+              {"async", false}},
+         Json{{"type", "function_call_output"}, {"call_id", "call_1"}, {"output", "ok"}}});
+    value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}}});
+    failures += check(
+        api_code([&] { (void)parse_openai_responses_create_request(value, limits()); }).empty(),
+        "a replayed synchronous function_call is accepted");
+    value["input"][1]["async"] = true;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "async_tools_not_supported",
+                      "a replayed asynchronous function_call is rejected explicitly");
+
+    value                    = base;
+    value["access_programs"] = Json{{"cyber", "standard"}};
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "access_programs_not_supported",
+                      "access_programs is a recognized but unsupported request field");
+    value["access_programs"] = nullptr;
+    failures += check(
+        api_code([&] { (void)parse_openai_responses_create_request(value, limits()); }).empty(),
+        "null access_programs is accepted");
 
     value         = base;
     value["text"]         = Json{{"format", Json{{"type", "json_schema"},
@@ -1180,6 +1241,11 @@ int test_response_object() {
                           response.at("output")[1].at("type") == "message",
                       "reasoning and message are emitted as typed output Items");
     failures += check(
+        response.contains("access_programs") && response.at("access_programs").is_null() &&
+            response.at("output")[1].at("content")[0].at("logprobs").is_array() &&
+            response.at("usage").at("input_tokens_details").at("cache_write_tokens") == 0,
+        "the response lacks the required access_programs, logprobs or cache_write_tokens field");
+    failures += check(
         response.at("usage").at("input_tokens_details").at("cached_tokens") == 4 &&
             response.at("usage").at("output_tokens") == 7 &&
             response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
@@ -1444,7 +1510,9 @@ int test_sse_sequence_and_failures() {
         ApiError{.status = 500, .type = "server_error", .message = "stopped", .code = "stopped"}));
     failures += check(failure.at("type") == "response.failed" &&
                           failure.at("response").at("status") == "failed" &&
-                          failure.at("response").at("completed_at").is_null(),
+                          failure.at("response").at("completed_at").is_null() &&
+                          failure.at("response").at("error").at("code") == "server_error" &&
+                          failure.at("response").at("error").at("message") == "stopped (stopped)",
                       "runtime failure uses response.failed with no completion timestamp");
 
     OpenAIResponsesCreateRequest cancelled_request = parse_openai_responses_create_request(
@@ -1458,6 +1526,16 @@ int test_sse_sequence_and_failures() {
     failures += check(cancelled_terminal.at("type") == "response.failed" &&
                           cancelled_terminal.at("response").at("status") == "cancelled",
                       "cancelled generation uses the protocol terminal failure event");
+
+    OpenAIResponsesEventStream image_failure("resp_image", 123, cancelled_request, {});
+    (void)image_failure.start();
+    const Json image_error =
+        parse_event(image_failure.failed(
+                        ApiError{.status = 400, .message = "bad image", .code = "invalid_image"}))
+            .at("response")
+            .at("error");
+    failures += check(image_error == Json{{"code", "invalid_image"}, {"message", "bad image"}},
+                      "a failure code of the wire enum was not kept as it is");
     return failures;
 }
 

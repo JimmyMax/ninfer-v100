@@ -6,7 +6,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_SM70
+#ifdef NINFER_TIER_VOLTA
 
 namespace {
 using S = Fp8VoltaQpnSchedule;
@@ -41,6 +41,6 @@ void fp8_linear_swiglu_volta_qpn_launch(const Tensor& x, const Weight& weight, T
     CUDA_CHECK(cudaGetLastError());
 }
 
-#endif // NINFER_SM70
+#endif // NINFER_TIER_VOLTA
 
 } // namespace ninfer::ops::detail

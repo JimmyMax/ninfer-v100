@@ -45,6 +45,7 @@ struct ExecutionCore {
     ops::RopeYarn rope_yarn;
     bool fast_prefill_kernel = false;
     std::uint32_t mtp_attention_window = 0;
+    NativeExpertRuntime* experts = nullptr;
 };
 
 // The round's logprob gather outputs for a [width, batch] round: I32 and FP32 [kLogprobTopK,

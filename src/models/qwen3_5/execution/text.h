@@ -26,6 +26,8 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
+class NativeExpertRuntime;
+
 using Phase = qwen3_5::TextPhase;
 
 enum class GdnStateAction : std::uint8_t {
@@ -77,6 +79,8 @@ public:
                 const qwen3_5::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr);
     ~TextContext();
+
+    void set_expert_runtime(NativeExpertRuntime* experts) noexcept { experts_ = experts; }
 
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
@@ -183,6 +187,11 @@ private:
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
+
+    // Per-request width of a bound sequence batch; an unbatched call is one row of all columns.
+    [[nodiscard]] std::int32_t row_width(std::int32_t columns) const noexcept {
+        return active_sequence_batch_ != 0 ? active_sequence_width_ : columns;
+    }
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
@@ -252,6 +261,7 @@ private:
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
     DeviceContext& ctx_;
     const Parameters& parameters_;
+    NativeExpertRuntime* experts_ = nullptr;
     const TextConfig& config_;
     WorkspaceArena& work_;
     qwen3_5::PagedKVCacheView kv_;

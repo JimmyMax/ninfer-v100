@@ -1,10 +1,12 @@
 #include "models/qwen4_exp/ngram_table.h"
+#include "core/file_read_error.h"
 
 #include <algorithm>
 #include <bit>
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -153,6 +155,17 @@ struct NgramTableReader::File {
 #endif
     }
 
+    // A row read that failed while the Engine ran; the reader caches no row of a failed batch.
+    [[noreturn]] void fail_read() const {
+#ifdef _WIN32
+        throw FileReadError("n-gram table: cannot read " + path.string() + " (error " +
+                            std::to_string(GetLastError()) + ")");
+#else
+        throw FileReadError("n-gram table: cannot read " + path.string() + ": " +
+                            error_text(errno));
+#endif
+    }
+
     // One positioned read of up to `bytes` at `offset`; 0 at the end of the file.
     std::size_t read_some(std::uint64_t offset, std::uint8_t* destination,
                           std::size_t bytes) const {
@@ -165,14 +178,14 @@ struct NgramTableReader::File {
             DWORD done          = 0;
             if (!ReadFile(handle, destination, static_cast<DWORD>(bytes), &done, &position)) {
                 if (GetLastError() == ERROR_HANDLE_EOF) { return 0; }
-                fail("cannot read");
+                fail_read();
             }
             return done;
 #else
             const ssize_t done =
                 ::pread(descriptor, destination, bytes, static_cast<off_t>(offset));
             if (done < 0 && errno == EINTR) { continue; }
-            if (done < 0) { fail("cannot read"); }
+            if (done < 0) { fail_read(); }
             return static_cast<std::size_t>(done);
 #endif
         }
@@ -187,7 +200,7 @@ struct NgramTableReader::File {
         while (bytes > 0) {
             const std::size_t done = read_some(offset, destination, bytes);
             if (done == 0) {
-                throw std::runtime_error("n-gram table: " + path.string() + " ends early");
+                throw FileReadError("n-gram table: " + path.string() + " ends early");
             }
             destination += done;
             offset += done;
@@ -213,7 +226,7 @@ struct NgramTableReader::File {
         while (have < need) {
             const std::size_t done = read_some(begin + have, bounce + have, end - begin - have);
             if (done == 0) {
-                throw std::runtime_error("n-gram table: " + path.string() + " ends early");
+                throw FileReadError("n-gram table: " + path.string() + " ends early");
             }
             have += done;
         }
@@ -490,6 +503,46 @@ private:
     ReadPool pool_;
 };
 
+// OS hints of many page ranges, one system call each, on a worker thread: a prompt step's rows
+// take over a hundred thousand. A batch that arrives while the worker still hints the previous
+// one is dropped; hints are advisory.
+class NgramTableReader::Hints {
+public:
+    struct Range {
+        std::size_t segment;
+        std::uint64_t begin, bytes;
+    };
+
+    explicit Hints(const NgramTableReader& owner) : owner_(owner), pool_(1) {}
+
+    ~Hints() {
+        try { pool_.finish(); } catch (...) {}
+    }
+
+    void submit(std::vector<Range> ranges) {
+        std::lock_guard lock(mutex_);
+        if (active_ && !complete_.load(std::memory_order_acquire)) { return; }
+        if (active_) { pool_.finish(); }
+        ranges_ = std::move(ranges);
+        complete_.store(false, std::memory_order_relaxed);
+        active_ = true;
+        pool_.start(1, [this](std::size_t) {
+            for (const Range& range : ranges_) {
+                owner_.files_[range.segment]->prefetch(range.begin, range.bytes);
+            }
+            complete_.store(true, std::memory_order_release);
+        });
+    }
+
+private:
+    const NgramTableReader& owner_;
+    std::mutex mutex_;
+    std::vector<Range> ranges_;
+    bool active_ = false;
+    std::atomic<bool> complete_{false};
+    ReadPool pool_;
+};
+
 NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptions& options)
     : layout_(std::move(layout)), options_(options) {
     if (layout_.row_bytes == 0 || layout_.rows == 0 || layout_.segments.empty()) {
@@ -547,6 +600,8 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptio
         ;
     if (options_.residency != NgramResidency::Ram && staged_hints) {
         lookahead_ = std::make_unique<Lookahead>(*this);
+    } else if (options_.residency != NgramResidency::Ram) {
+        hints_ = std::make_unique<Hints>(*this);
     }
     // The profile has served its purpose.
     options_.hot_rows = {};
@@ -831,6 +886,7 @@ void NgramTableReader::prefetch(std::span<const std::uint64_t> row_ids) {
         return;
     }
     // Coalesce ranges that touch the same page, including rows split between artifact parts.
+    std::vector<Hints::Range> ranges;
     std::size_t previous = files_.size();
     std::uint64_t begin = 0, end = 0;
     for (const auto row : rows) {
@@ -846,7 +902,7 @@ void NgramTableReader::prefetch(std::span<const std::uint64_t> row_ids) {
             if (segment == previous && first / kAlign <= end / kAlign) {
                 end = std::max(end, first + count);
             } else {
-                if (previous != files_.size()) { files_[previous]->prefetch(begin, end - begin); }
+                if (previous != files_.size()) { ranges.push_back({previous, begin, end - begin}); }
                 previous = segment;
                 begin = first;
                 end = first + count;
@@ -856,7 +912,12 @@ void NgramTableReader::prefetch(std::span<const std::uint64_t> row_ids) {
             ++segment;
         }
     }
-    if (previous != files_.size()) { files_[previous]->prefetch(begin, end - begin); }
+    if (previous != files_.size()) { ranges.push_back({previous, begin, end - begin}); }
+    if (ranges.size() > kInlineHints) {
+        hints_->submit(std::move(ranges));
+        return;
+    }
+    for (const auto& range : ranges) { files_[range.segment]->prefetch(range.begin, range.bytes); }
 }
 
 NgramTableStats NgramTableReader::counters() const {

@@ -8,7 +8,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_SM70
+#ifdef NINFER_TIER_VOLTA
 
 constexpr std::int32_t kIntermediate = 17408; // Fp8MlpGateUpGeometry::kOutputRows / 2
 
@@ -48,6 +48,6 @@ void fp8_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight, T
     CUDA_CHECK(cudaGetLastError());
 }
 
-#endif // NINFER_SM70
+#endif // NINFER_TIER_VOLTA
 
 } // namespace ninfer::ops::detail

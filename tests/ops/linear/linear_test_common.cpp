@@ -126,12 +126,19 @@ std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::
                 coordinate *= 0x846ca68bU;
                 coordinate ^= coordinate >> 16;
             }
-            const float value =
-                activation_signs == ActivationSigns::Centered
-                    ? static_cast<float>(static_cast<int>(coordinate & 0xffU) - 128) *
-                          (1.0F / 256.0F)
-                    : static_cast<float>(32 + static_cast<int>(coordinate & 0x5fU)) *
-                          (1.0F / 256.0F);
+            float value = activation_signs != ActivationSigns::Biased
+                              ? static_cast<float>(static_cast<int>(coordinate & 0xffU) - 128) *
+                                    (1.0F / 256.0F)
+                              : static_cast<float>(32 + static_cast<int>(coordinate & 0x5fU)) *
+                                    (1.0F / 256.0F);
+            if (activation_signs == ActivationSigns::CenteredWideRange) {
+                const std::size_t index = static_cast<std::size_t>(token) * k + column;
+                if (index % 97 == 0) {
+                    value = std::ldexp(value, -30);
+                } else if (index % 89 == 0) {
+                    value = std::ldexp(value, 20);
+                }
+            }
             result[static_cast<std::size_t>(token) * k + column] = test::f32_to_bf16(value);
         }
     }

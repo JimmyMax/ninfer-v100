@@ -149,7 +149,7 @@ GemmaMarkers GemmaMarkers::from(const Tokenizer& tokenizer) {
 
 bool parse_gemma_call(std::string_view region, GeneratedToolCall& out) {
     Reader reader{region};
-    if (!reader.take("call:")) { return false; }
+    if (!reader.take(kGemmaCallHead)) { return false; }
     const std::size_t brace = region.find('{', reader.at);
     if (brace == std::string_view::npos) { return false; }
     std::string_view name = region.substr(reader.at, brace - reader.at);
@@ -165,6 +165,18 @@ bool parse_gemma_call(std::string_view region, GeneratedToolCall& out) {
     out.name           = std::string(name);
     out.arguments_json = arguments->dump();
     return true;
+}
+
+GemmaToolCallDecoder::GemmaToolCallDecoder(std::string_view forced_tool_name) {
+    if (forced_tool_name.empty()) { return; }
+    // The generation prompt ends with exactly this head, so generation resumes inside the call's
+    // arguments and the region the reader sees has to begin where the prompt left off.
+    region_.append(kGemmaCallHead);
+    region_.append(forced_tool_name);
+    region_.append(kGemmaArgumentsOpen);
+    seeded_bytes_            = region_.size();
+    in_call_                 = true;
+    diagnostics_.marker_seen = true;
 }
 
 std::string GemmaToolCallDecoder::feed(std::string_view text) {
@@ -184,6 +196,7 @@ std::string GemmaToolCallDecoder::feed(std::string_view text) {
             in_call_                 = true;
             diagnostics_.marker_seen = true;
             region_.clear();
+            seeded_bytes_ = 0;
         }
         const std::size_t close = pending_.find(kGemmaCallClose);
         if (close == std::string::npos) {
@@ -201,11 +214,13 @@ std::string GemmaToolCallDecoder::feed(std::string_view text) {
             ++diagnostics_.structured_call_count;
         } else {
             diagnostics_.fallback_reason = ToolCallParseFallbackReason::MalformedStructure;
-            published.append(kGemmaCallOpen);
-            published.append(region_);
+            // Only what the model produced: a forced call's head came from the prompt.
+            if (seeded_bytes_ == 0) { published.append(kGemmaCallOpen); }
+            published.append(region_, seeded_bytes_, std::string::npos);
             published.append(kGemmaCallClose);
         }
         region_.clear();
+        seeded_bytes_ = 0;
     }
 }
 
@@ -217,15 +232,21 @@ GemmaToolCallDecoder::Terminal GemmaToolCallDecoder::finish() {
         if (parse_gemma_call(region_, call)) {
             calls_.push_back(std::move(call));
             ++diagnostics_.structured_call_count;
+            // A forced turn that ends after the arguments closed is a complete call missing only
+            // its closing marker. Supplying that marker invents no argument byte; anything less
+            // complete does not parse and stays text.
+            if (seeded_bytes_ != 0) { diagnostics_.forced_call_closed = true; }
         } else {
-            out.content.append(kGemmaCallOpen);
-            out.content.append(region_);
+            diagnostics_.fallback_reason = ToolCallParseFallbackReason::MalformedStructure;
+            if (seeded_bytes_ == 0) { out.content.append(kGemmaCallOpen); }
+            out.content.append(region_, seeded_bytes_, std::string::npos);
         }
     } else {
         out.content = pending_;
     }
     pending_.clear();
     region_.clear();
+    seeded_bytes_   = 0;
     in_call_        = false;
     out.tool_calls  = std::move(calls_);
     out.diagnostics = diagnostics_;

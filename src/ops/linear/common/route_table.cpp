@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 
 namespace ninfer::ops::detail {
@@ -118,7 +119,13 @@ std::optional<LinearRouteTable> forced_table() {
     if (value == nullptr) return std::nullopt;
     const std::string_view name(value);
     if (name == "legacy") return LinearRouteTable::Legacy;
-    if (name == "unified") return LinearRouteTable::Unified;
+    if (name == "unified") {
+        if (!kUnifiedLinearRoutesBuilt) {
+            throw std::invalid_argument(
+                "NINFER_LINEAR_ROUTES=unified: this build selects the legacy Linear table only");
+        }
+        return LinearRouteTable::Unified;
+    }
     return std::nullopt;
 }
 
@@ -164,21 +171,31 @@ std::optional<LinearRouteTable> forced_route_table() {
 
 } // namespace
 
-LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t) {
-    if (const auto forced = forced_route_table()) return *forced;
+LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t,
+                                    LinearRouteTable wide) {
+    const auto forced = forced_route_table();
+    if (!unified_linear_routes_here()) return LinearRouteTable::Legacy;
+    if (forced) return *forced;
     for (const WidthBand band : family_bands(bands_for(current_device_class()), family)) {
         if (t >= band.first && t <= band.last) return LinearRouteTable::Unified;
     }
-    return LinearRouteTable::Legacy;
+    return t > kRouteBandsMeasuredTo ? wide : LinearRouteTable::Legacy;
 }
 
-LinearRouteTable fused_route_table(std::string_view key, std::int32_t width) {
-    if (const auto forced = forced_route_table()) return *forced;
+LinearRouteTable fused_route_table(std::string_view key, std::int32_t width,
+                                   LinearRouteTable wide) {
+    const auto forced = forced_route_table();
+    if (!unified_linear_routes_here()) return LinearRouteTable::Legacy;
+    if (forced) return *forced;
+    if (width > kRouteBandsMeasuredTo && !device_route_measured(key, width)) return wide;
     return device_route_schedule(key, width) == "unified" ? LinearRouteTable::Unified
                                                           : LinearRouteTable::Legacy;
 }
 
 void force_linear_route_table(std::optional<LinearRouteTable> table) {
+    if (table == LinearRouteTable::Unified && !kUnifiedLinearRoutesBuilt) {
+        throw std::invalid_argument("this build selects the legacy Linear table only");
+    }
     forced_for_tests().store(table ? static_cast<int>(*table) : -1, std::memory_order_relaxed);
 }
 

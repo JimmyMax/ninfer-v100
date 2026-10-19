@@ -31,6 +31,7 @@ namespace ninfer::models::qwen3_5 {
 
 namespace execution {
 class Parameters;
+class NativeExpertRuntime;
 }
 
 namespace detail {
@@ -1228,6 +1229,7 @@ public:
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] ExpertResidencyStats expert_residency_stats() const;
     // Largest output budget for a prompt of `prompt_tokens` whose admission entitlement (main KV and
     // any MTP/DFlash backend KV, draft window included) fits one lane's share of each pool, so that
     // every configured lane can hold such a request at once; clamped to the remaining context. Reads
@@ -1252,7 +1254,8 @@ private:
     std::unique_ptr<detail::ProgramImpl> impl_;
 
     friend std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
-                                                   DeviceContext&, const StartupObserver&);
+                                                   DeviceContext&, const StartupObserver&,
+                                                   std::unique_ptr<execution::NativeExpertRuntime>);
 };
 
 namespace detail {
@@ -1422,5 +1425,9 @@ struct RuntimeContractAccess {
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                                       SequencePlan&& plan, DeviceContext& device,
                                                       const StartupObserver& startup_observer);
+[[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
+                                                      SequencePlan&& plan, DeviceContext& device,
+                                                      const StartupObserver& startup_observer,
+                                                      std::unique_ptr<execution::NativeExpertRuntime> experts);
 
 } // namespace ninfer::models::qwen3_5

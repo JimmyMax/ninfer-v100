@@ -38,7 +38,7 @@ void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, 
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
 
 // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 的 QPN 路线；x_fp16 非空时激活已暂存为 FP16。
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     const void* x_fp16, cudaStream_t stream);
 #endif

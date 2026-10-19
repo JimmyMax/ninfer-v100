@@ -337,7 +337,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // Volta: the chunked and two-stage prefill pipelines both lose to the width-wide recurrent
     // kernel on sm_70 for the same geometry (ninfer_gated_delta_net_bench, cold L2, T=2048:
     // 7.7 ms vs 2.8 ms; T=4096: 15.9 ms vs 5.5 ms). Routing the whole width through

@@ -50,7 +50,8 @@ GenerationOutcome judged(std::vector<std::pair<std::string, double>> alternative
     return out;
 }
 
-bool near(double a, double b) { return std::abs(a - b) < 1e-5; }
+// Not named `near`: the Windows SDK's minwindef.h defines it as an empty macro.
+bool close_to(double a, double b) { return std::abs(a - b) < 1e-5; }
 
 void parsing() {
     const auto jina = parse_rerank_request(RequestJson::parse(
@@ -82,14 +83,14 @@ void parsing() {
 }
 
 void scoring() {
-    expect(near(rerank_score(judged({{"yes", 0.6}, {"no", 0.2}, {"maybe", 0.1}})), 0.75),
+    expect(close_to(rerank_score(judged({{"yes", 0.6}, {"no", 0.2}, {"maybe", 0.1}})), 0.75),
            "P(yes) / (P(yes) + P(no))");
-    expect(near(rerank_score(judged({{"no", 0.5}, {"Yes", 0.2}, {"yes", 0.1}, {"No", 0.1}})),
-                0.3 / 0.9),
+    expect(close_to(rerank_score(judged({{"no", 0.5}, {"Yes", 0.2}, {"yes", 0.1}, {"No", 0.1}})),
+                    0.3 / 0.9),
            "capitalized answers count with their lower-case forms");
-    expect(near(rerank_score(judged({{"yes", 0.9}, {"the", 0.01}})), 0.9 / 0.91),
+    expect(close_to(rerank_score(judged({{"yes", 0.9}, {"the", 0.01}})), 0.9 / 0.91),
            "a missing answer counts as likely as the least likely alternative");
-    expect(near(rerank_score(judged({{"the", 0.5}, {"a", 0.2}})), 0.5),
+    expect(close_to(rerank_score(judged({{"the", 0.5}, {"a", 0.2}})), 0.5),
            "a judgement that answers neither scores one half");
     bool refused = false;
     try {

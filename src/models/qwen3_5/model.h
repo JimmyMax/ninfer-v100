@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "models/qwen3_5/auxiliary_replicas.h"
 #include "models/qwen3_5/config.h"
+#include "models/qwen3_5/expert_sources.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
 #include "ninfer/ops/weight_input.h"
@@ -39,6 +40,8 @@ public:
     [[nodiscard]] const LoadOptions& options() const noexcept { return options_; }
 
     [[nodiscard]] const ModelWeights& weights() const noexcept { return weights_; }
+
+    [[nodiscard]] const NativeExpertSources& expert_sources() const noexcept { return experts_; }
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
@@ -108,7 +111,8 @@ private:
           AuxiliaryReplicas replicas, FrontendResources resources, InstanceInfo info,
           artifact::MaterializedArtifact backing,
           std::optional<VisionOverlayLayout> vision_overlay,
-          std::shared_ptr<const CpuVisionWeights> cpu_vision);
+          std::shared_ptr<const CpuVisionWeights> cpu_vision,
+          NativeExpertSources experts);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     artifact::MaterializedArtifact backing_;
@@ -121,6 +125,7 @@ private:
     InstanceInfo info_;
     std::optional<VisionOverlayLayout> vision_overlay_;
     std::shared_ptr<const CpuVisionWeights> cpu_vision_;
+    NativeExpertSources experts_;
 };
 
 } // namespace ninfer::models::qwen3_5

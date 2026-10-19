@@ -2,6 +2,7 @@
 
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
+#include "serve/structured_output.h"
 #include "serve/translate.h"
 
 #include <cuda_runtime_api.h>
@@ -277,6 +278,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.vision_residency         = options.vision_residency;
     engine_options.vision_max_merged_tokens = options.vision_max_merged_tokens;
     engine_options.use_cuda_graph           = options.use_cuda_graph;
+    engine_options.gpu_clock_floor_mhz      = options.gpu_clock_floor_mhz;
     engine_options.lm_head_q4               = options.lm_head_q4;
     engine_options.lm_head_q6               = options.lm_head_q6;
     engine_options.embedding_q4             = options.embedding_q4;
@@ -416,20 +418,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incomin
                                                 ContextCacheHints context_cache,
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
-    std::optional<GenerationRequest> unconstrained;
-    if (incoming.structured_output.kind != StructuredOutputKind::None &&
-        !options_.structured_output) {
-        if (!options_.unconstrained_response_format) {
-            ApiError error;
-            error.message =
-                "structured output requires the server to start with --structured-output";
-            error.param = "response_format";
-            error.code  = "response_format_not_supported";
-            throw ApiException(std::move(error));
-        }
-        unconstrained.emplace(incoming);
-        unconstrained->structured_output = {};
-    }
+    const std::optional<GenerationRequest> unconstrained = drop_unavailable_constraints(
+        incoming, options_.structured_output, options_.unconstrained_response_format);
     const GenerationRequest& request = unconstrained ? *unconstrained : incoming;
     if (!request.cache_prompt) { cache_participation = CacheParticipation::Disabled; }
     PreparedRequest prepared;

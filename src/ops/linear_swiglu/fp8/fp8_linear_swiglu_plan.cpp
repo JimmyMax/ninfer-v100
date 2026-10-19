@@ -4,7 +4,7 @@
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 
 #include "ops/linear/fp8/fp8_a8_plan.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "core/layout.h"          // 本仓库 V100 增量：WorkspaceLayoutBuilder
 #    include "ops/linear/fp8/fp8_launch.h"
 #    include "ops/linear_swiglu/fp8/fp8_linear_swiglu_cutlass_sm70.h" // 本仓库 V100 增量：宽 T
@@ -71,7 +71,7 @@ static std::size_t fp8_linear_swiglu_workspace_capacity_bytes_own(LinearPolicy p
 
 std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
                                                        std::int32_t max_tokens) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 上 t<=32 走拆分式 QPN（gate/up 的 FP32 暂存
     // 是真实需求，也正是上游 A16 契约要求的"激活前保持 FP32"）。容量来自同一决策而不是
     // route table——测试会强制 unified 表，而钩子不受表影响。
@@ -105,7 +105,9 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 #endif
     return capacity_by_table(
         min_tokens, max_tokens,
-        [](std::int32_t width) { return fused_route_table("unified/fp8_linear_swiglu", width); },
+        [&](std::int32_t width) {
+            return fused_route_table("unified/fp8_linear_swiglu", width, fp8_wide_route_table(policy));
+        },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
                        ? unified::fp8_linear_swiglu_workspace_capacity_bytes(unified_policy(policy),
@@ -117,7 +119,7 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：FP8 SwiGLU 在 sm_70 上 t<=32 走拆分式 QPN
     // （fork 实测拆分快于融合内核；gate/up 的 FP32 暂存是这条路线的一部分），t>=33 走 FP32
     // 出口的 CUTLASS（见 fp8_linear_swiglu_cutlass_sm70.cu）。必须在 route-table 检查之前拦截。
@@ -146,7 +148,8 @@ void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& o
         return;
     }
 #endif
-    if (fused_route_table("unified/fp8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+    if (fused_route_table("unified/fp8_linear_swiglu", x.ne[1], fp8_wide_route_table(policy)) ==
+        LinearRouteTable::Unified) {
         unified::fp8_linear_swiglu_dispatch(x, weight, out, unified_policy(policy), workspace,
                                             stream);
         return;

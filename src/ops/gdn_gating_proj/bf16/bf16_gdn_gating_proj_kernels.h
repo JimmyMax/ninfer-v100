@@ -31,6 +31,12 @@ void bf16_gdn_gating_proj_small_t_split10_launch(const Tensor& x, const Weight& 
                                                  std::size_t workspace_bytes, Tensor& g,
                                                  Tensor& beta, cudaStream_t stream);
 
+// CTAs per SM the current device holds of the cooperative split-K MMA kernel the 27B (geometry35
+// false) or 35B-A3B projection launches with `split_k`: the compiled kernel's occupancy there, zero
+// for a split no route launches or when the device cannot be queried.
+[[nodiscard]] std::int32_t
+bf16_gdn_gating_proj_mma_resident_ctas_per_sm(bool geometry35, std::int32_t split_k) noexcept;
+
 // Cooperative launchers return false without submitting work only when the selected device cannot
 // make one complete token tile resident. The Op wrapper owns the non-cooperative fallback.
 [[nodiscard]] bool bf16_gdn_gating_proj_mma_split8_launch(

@@ -1,6 +1,7 @@
 #include "serve/anthropic_messages.h"
 
 #include "serve/generation_service.h"
+#include "serve/structured_output.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -498,9 +499,17 @@ int test_tools() {
                              rendered["function"]["input_examples"].is_array(),
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
 
-    body["tools"] = Json::array({ordinary_tool(true)});
-    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported",
-                      "active strict tool was accepted without constrained decoding");
+    body["tools"]                  = Json::array({ordinary_tool(true)});
+    const GenerationRequest strict = parse(body).generation;
+    const Json strict_rendered     = Json::parse(prompt(strict).options.tool_jsons.at(0));
+    failures += check(strict.tools.at(0).strict && strict_rendered["function"]["strict"] == true,
+                      "a strict tool did not reach the prompt as strict");
+    failures += check(api_code([&] { (void)drop_unavailable_constraints(strict, false, false); }) ==
+                          "strict_tools_not_supported",
+                      "a strict tool ran unenforced on a server without grammar masks");
+    const auto unenforced = drop_unavailable_constraints(strict, false, true);
+    failures += check(unenforced && !unenforced->tools.at(0).strict,
+                      "--unconstrained-response-format did not drop the strict flag");
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
     body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
@@ -630,6 +639,12 @@ int test_thinking_and_count_tokens() {
     body["thinking"] = Json{{"type", "future"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking mode defaulted to enabled");
+    body["thinking"] = Json{{"type", "between_tools"}};
+    failures += check(parse(body).generation.enable_thinking == false,
+                      "between_tools did not turn off up-front Thinking");
+    body["thinking"] = Json{{"type", "between_tools"}, {"display", "summarized"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "thinking",
+                      "display was accepted with between_tools Thinking");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
     const AnthropicMessagesRequest hidden = parse(body);
     failures += check(hidden.hide_thinking && hidden.generation.enable_thinking == true &&

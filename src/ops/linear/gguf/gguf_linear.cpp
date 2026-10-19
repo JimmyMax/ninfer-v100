@@ -84,12 +84,21 @@ std::size_t fixup_bound() {
     return std::size_t(gguf::multiprocessor_count()) * kFixupTileBytes;
 }
 
+// The destination of rows [first, ...) of an output.
+gguf::VectorOutput from_row(gguf::VectorOutput out, std::int32_t first) {
+    if (out.bf16 != nullptr) { out.bf16 += first; }
+    if (out.f32 != nullptr) { out.f32 += first; }
+    if (out.gate != nullptr) { out.gate += first; }
+    return out;
+}
+
 // Workspace of sm70_project for `products` products of up to `rows` rows over `t` columns.
 std::size_t sm70_project_bytes(std::size_t products, std::int32_t rows, std::int32_t k,
                                std::int32_t t) {
+    const std::size_t slab = static_cast<std::size_t>(detail::sm70::slab_rows(rows, k));
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc_bytes(std::size_t(rows) * t * sizeof(float));
-    (void)layout.alloc_bytes(std::size_t(detail::sm70::slab_rows(rows, k)) * k * sizeof(__half));
+    (void)layout.alloc_bytes(slab * t * sizeof(float));
+    (void)layout.alloc_bytes(slab * k * sizeof(__half));
     for (std::size_t i = 0; i < products; ++i) {
         (void)layout.alloc_bytes(std::size_t(k) * t * 2);
         (void)layout.alloc_bytes(detail::sm70::activation_bytes(k, t));
@@ -99,20 +108,19 @@ std::size_t sm70_project_bytes(std::size_t products, std::int32_t rows, std::int
 
 // sm_70 (ops/linear/sm70): every product converts its activation to FP16 once per input gather,
 // dequantizes its weight to FP16 a slab of rows at a time and multiplies each slab through cuBLAS
-// into the FP32 plane the other routes write.
+// into an FP32 plane of the slab's rows, which the product's epilogue then stores.
 void sm70_project(const Tensor& x, std::span<const GgufProduct> products, WorkspaceArena& workspace,
                   cudaStream_t stream) {
     const std::int32_t k    = x.ne[0];
     const std::int32_t t    = x.ne[1];
     const auto* xb          = static_cast<const __nv_bfloat16*>(x.data);
-    std::int32_t plane_rows = 0;
-    for (const auto& p : products) { plane_rows = std::max(plane_rows, p.weight->n); }
-    auto* plane = static_cast<float*>(
-        workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
-    auto* weights = static_cast<__half*>(
-        workspace
-            .alloc_bytes(std::size_t(detail::sm70::slab_rows(plane_rows, k)) * k * sizeof(__half))
-            .data);
+    std::int32_t widest = 0;
+    for (const auto& p : products) { widest = std::max(widest, p.weight->n); }
+    const std::size_t widest_slab = static_cast<std::size_t>(detail::sm70::slab_rows(widest, k));
+    auto* plane =
+        static_cast<float*>(workspace.alloc_bytes(widest_slab * t * sizeof(float)).data);
+    auto* weights =
+        static_cast<__half*>(workspace.alloc_bytes(widest_slab * k * sizeof(__half)).data);
 
     struct Activation {
         const std::int32_t* columns;
@@ -139,18 +147,21 @@ void sm70_project(const Tensor& x, std::span<const GgufProduct> products, Worksp
             activations.push_back({w.input_columns, converted});
             found = activations.end() - 1;
         }
-        const auto type           = gguf_type(w.qtype);
-        const bool direct         = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
-        float* out                = direct ? p.f32 + p.row : plane;
-        const std::int64_t stride = direct ? p.f32_rows : w.n;
-        const std::int32_t slab   = detail::sm70::slab_rows(w.n, k);
+        const auto type         = gguf_type(w.qtype);
+        const bool direct       = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
+        const std::int32_t slab = detail::sm70::slab_rows(w.n, k);
         for (std::int32_t first = 0; first < w.n; first += slab) {
             const std::int32_t count = std::min(slab, w.n - first);
             gguf::dequantize_rows(type, static_cast<const char*>(w.qdata) + first * row_bytes(w),
                                   row_bytes(w), k, nullptr, count, weights, k, stream);
-            detail::sm70::gemm(weights, count, k, found->data, t, out + first, stride, stream);
+            if (direct) {
+                detail::sm70::gemm(weights, count, k, found->data, t, p.f32 + p.row + first,
+                                   p.f32_rows, stream);
+            } else {
+                detail::sm70::gemm(weights, count, k, found->data, t, plane, count, stream);
+                gguf::store_plane(plane, count, count, t, from_row(output(p, 0), first), stream);
+            }
         }
-        if (!direct) { gguf::store_plane(plane, w.n, w.n, t, output(p, 0), stream); }
     }
 }
 

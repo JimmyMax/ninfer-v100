@@ -5,7 +5,7 @@
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "core/layout.h" // 本仓库 V100 增量：容量必须用与派发同源的 layout 序列
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // 本仓库 V100 增量（docs/v100/PLAN.md）：Volta QPN 的 residual 输出与激活暂存。
 #    include "ops/linear/nvfp4/nvfp4_launch.h"
 #    include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h" // 本仓库 V100 增量：宽 T prefill 路径
@@ -39,7 +39,7 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     return tokens >= first_w4a4 ? Nvfp4LinearAddRoute::W4A4 : Nvfp4LinearAddRoute::A16;
 }
 
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 上 NVFP4 down 的 A16 族宽度（以及 A4 在
 // first_w4a4 以下的宽度，与 fork 的 LinearThenAdd 路线一致）不再走上游的 A16 路线：
 // t <= 32 走 QPN 的融合 residual 输出，更宽走 CUTLASS sm_70 + residual_add。
@@ -112,7 +112,7 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
                                                       std::int32_t input_rows, LinearPolicy policy,
                                                       std::int32_t min_tokens,
                                                       std::int32_t max_tokens) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 的 QPN/CUTLASS 接管发生在表检查之前
     // （见 nvfp4_linear_add_dispatch），所以容量必须在这里就短路——否则会拿 unified 表的
     // 数字去执行 sm70 路径，测试会因“查询不等于执行高水位”而失败。
@@ -138,7 +138,7 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     if (sm70_linear_then_add_route(weight.k, policy, x.ne[1])) {
         if (x.ne[1] > kNvfp4VoltaQpnMaxTokens) {
             // 宽 T（prefill）：一次性解量化 NVFP4 为 FP16，走 CUTLASS sm_70 GEMM 到临时投影，

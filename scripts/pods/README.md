@@ -12,8 +12,9 @@ the guard inherits that exact path. The default record and its retained files re
 
 ```sh
 python3.11 scripts/pods/harness.py inventory
-python3.11 scripts/pods/harness.py offers 'gpu_name=RTX_3090 num_gpus=2 verified=true rentable=true'
-python3.11 scripts/pods/harness.py rent OFFER --hours 3 --disk 180 --image CUDA_DEVEL_IMAGE
+python3.11 scripts/pods/harness.py offers 'gpu_name=RTX_3090 num_gpus=2 verified=true rentable=true' \
+  --hours 3 --disk 180 --download-gb 80
+python3.11 scripts/pods/harness.py rent OFFER --hours 3 --disk 180 --download-gb 80 --image CUDA_DEVEL_IMAGE
 python3.11 scripts/pods/harness.py wait
 python3.11 scripts/pods/harness.py probe
 python3.11 scripts/pods/harness.py deploy
@@ -30,6 +31,27 @@ python3.11 scripts/pods/harness.py collect --job checks
 python3.11 scripts/pods/harness.py collect
 python3.11 scripts/pods/harness.py destroy
 ```
+
+Each Vast host sets its own price per GB of download and upload traffic on top of the hourly
+rate, and a run that downloads models can pay more for traffic than for the GPU: on 2026-10-14 two
+hosts charged $0.026 and $0.039 per GB, $6.15 for 196 GB against $0.27 of GPU time. RunPod bills no
+traffic. Choosing a rental:
+
+- `offers` leaves out hosts that charge more than $0.005 per GB of downloads
+  (`--max-download-cost`, or an `inet_down_cost` term in the query), estimates each remaining offer's
+  whole rental from `--hours`, `--disk`, `--download-gb` and `--upload-gb`, and lists the cheapest
+  ten by that estimate.
+- It quotes the same card on RunPod (the query's `gpu_name`, or `--runpod-gpu`): the community or
+  secure hourly price and the container disk. RunPod is the `choice` when it has the card in stock
+  and quotes no more than the cheapest Vast offer; rent it with the printed `~/runpod/pod-up.sh`
+  command and `attach` the pod.
+- `rent` repeats both checks for the chosen offer, refuses a host over the download price or a card
+  RunPod quotes for no more (`--over-runpod` rents anyway, for example when RunPod's stock does not
+  materialize), and records the estimate in the rental record.
+- Download only the files the jobs read, once per rental: no whole repositories, no second copy of
+  an artifact the rental already holds, and a resumed download (`aria2c --continue`) rather than a
+  fresh one after a failure. Move data between rentals with `copy-from` instead of downloading it
+  again when both sit with the same provider.
 
 Install tmux on a fresh image before dispatching jobs. `attach --host HOST --port PORT` also works
 with an existing SSH host, including a RunPod created with `~/runpod/pod-up.sh`; attached hosts
@@ -89,6 +111,8 @@ retained `model-inputs.json` as job inputs; stage HF authentication first. It om
 `/workspace/ccache` and travels between rentals through the private bucket `WaveCut/ninfer-cache`
 (`ccache/cuda<release>-sm<arch>-<distribution>-<machine>.tar`): `build.sh` pulls it into a new pod
 before the first compile and pushes it after every build (`NINFER_CCACHE_PUSH=0` skips the push).
+`NINFER_CUDA_ARCH` selects the build's target and its cache (default `86`), and `NINFER_BUILD_DIR`
+its tree.
 Both steps need the credential `hf_archive.py --stage-auth` leaves at `/run/ninfer-hf/token`;
 without it, or without a remote cache, the build compiles cold and says so. The Hub stores only the
 chunks that changed since the last push. `build.sh` prints the build's seconds and ccache's hit

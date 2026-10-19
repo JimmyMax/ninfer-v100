@@ -18,10 +18,16 @@ Up to three layers answer, per route key:
 1. **Your profile file.** `$NINFER_DEVICE_PROFILES`, else `$XDG_CACHE_HOME/ninfer/device-profiles.json`,
    else `~/.cache/ninfer/device-profiles.json` (`%LOCALAPPDATA%\ninfer\device-profiles.json` on
    Windows). `--device-profile-path` names another file.
-2. **The built-in table.** Profiles measured on the RTX 3090, RTX 4090, RTX 5090, the RTX PRO 6000
-   Blackwell and the Tesla V100-SXM2-16GB ship inside the binary
-   (`src/runtime/engine/device_profiles.json`). The PRO 6000's Workstation (600 W), Max-Q (300 W)
-   and Server editions report different names, so each has its own entry.
+2. **The built-in table.** Profiles measured on 47 GPU models ship inside the binary
+   (`src/runtime/engine/device_profiles.json`); the Profile column of the
+   [card tables](gpus.md#cards) shows which. Each entry was measured at the card's default power
+   limit by the build that serves it: the image's `75`, `86` and `120a` builds (an Ada card runs the
+   `86` build), CUDA 12.8 `80` and `70` builds for the A100 and V100, a CUDA 12.8 `86` build for
+   the A10, whose host driver (570) predates the image's CUDA 13, and a CUDA 13.1 `120a` build for
+   the RTX 5070 Ti, with the image's route catalog. Variants that report different names have
+   their own entries, such as the PRO 6000's Workstation (600 W), Max-Q (300 W) and Server
+   editions. The Turing entries come from a `75` build, the only build that runs on them; its route
+   catalog lacks the keys a Turing build never selects.
 3. **The compiled route** of each operation, for a key neither names.
 
 For a key both the file and the built-in table name, the file's bands answer up to their last width
@@ -31,8 +37,9 @@ an RTX 3090, 4090 or 5090 replaces the keys calibration measures and keeps every
 the compiled route best is stored with an empty schedule, which overrides a built-in choice for it.
 
 A GPU with neither a file entry nor a built-in one is calibrated once when the engine starts, before
-the weights are loaded. This takes 20 to 40 seconds, and the result is written to the profile file
-for later starts. A `70` build runs its own projection and attention routes, which no profile key
+the weights are loaded. For the built-in table this took 35 to 75 seconds on most Ampere, Ada and
+Blackwell cards with 46 or more SMs, 75 to 132 seconds on smaller ones and 94 to 204 seconds on
+Turing cards, and the result is written to the profile file for later starts. A `70` build runs its own projection and attention routes, which no profile key
 steers, so it calibrates the two-stage GDN switch alone, in about nine seconds on a V100.
 
 An entry applies only to the same hardware class (the GPU name and compute capability) and the same
@@ -95,19 +102,23 @@ survives a second interleaved measurement, and its output matches the compiled r
 | `t2_i8_route` | small-T kernel or prefill GEMM per width, ternary (Bonsai) projections | the GDN layer's projections at widths 16 to 192 |
 | `t2_i8_small/<N>x<K>` | row and column tile of the ternary small-T kernel | every ternary projection shape, widths 1 to 32 |
 | `q4_q5_attn_input/...`, `q4_q5_gdn_input/...`, `q5_linear_add/...`, `q4_linear_swiglu/...` | fused groupwise (Qwen3.6/3.8) projection schedules | the model shapes, widths 1 to 64 |
-| `attn_i8_small/h24/<kv>/w<W>` | warps, CTAs per SM, key block, split QK (`q`) and early fetch (`e`) of the INT8-family small-T attention | query widths 1 to 8, KV windows 8K, 64K and 262K, for `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8` |
+| `attn_i8_small/h24/<kv>/w<W>` | warps, CTAs per SM, key block, split QK (`q`) and early fetch (`e`) of the INT8-family small-T attention; for `int8` also `8x2x32p`, the pipelined kernel that keeps V codes INT8 in shared memory and streams the next 32-key tile through two stages | query widths 1 to 8, KV windows 8K, 64K and 262K, for `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8` |
 | `attn_pv_f16` | FP16 accumulation of the probability-times-value product per key tile | a 1024-token prompt chunk at 32K and a decode step at 131K |
 | `attn_pack_gqa` | the standard INT8 prompt kernel with each KV head's query heads packed into its tiles (PackGQA) | a 1024-token prompt chunk at 32K and 131K |
 | `attn_prompt_fast` | the fast prompt-attention kernel (rows kept in registers, FP16 PV per tile) | a wave-aligned prompt chunk at 32K and 131K |
+| `attn_prompt_split` | whether the fast INT8-family prompt kernel may split a launch's keys over several CTAs per row block and merge their partial rows (`off`), for calls of more than 64 columns whose row blocks alone would leave SMs idle; the split count comes from a cost model over the SM count | a 256-token continuation at 32K and 131K and a wave-aligned chunk at 131K, where the fast kernel serves prompts |
 | `attn_parallel_tiles` | single-row chunked small-T attention over an INT8-family cache as parallel query tiles (one batched append, one split-KV launch over every tile, one reduce) instead of serial fused chunks; widths without an exact 2-8 column tile divisor stay serial; `NINFER_ATTN_PARALLEL_TILES=0\|1` overrides | 16 and 32 verify columns at 32K and 131K |
 | `q4_linear_add/5120x<k>` | the small-T Q4 residual projections (`small_t_c8`, `small_t_c16`, `small_t_c32`) for the attention or GDN output (k = 6144) and the MLP down (k = 17408) of a Q4-output artifact | widths 1 to 32 |
 | `q6_head/248320x5120` | the Q6 vocabulary head's per-row GEMV (`gemv`, widths 1 and 2) or small-T MMA (`small_t`, widths up to 32) | widths 1 to 32 |
+| `q8_ksplit/<rows>x<k>` | the four-K-warp form (`kw4`: at most 128 registers a thread, four CTAs an SM) of the 8-column tile of the Q8 G32 K-split contraction, which MTP heads, DFlash2 drafters and Q8 heads run, instead of the route's own schedule | the eleven contraction shapes of those layers, widths 1 to 8 |
 | `unified/q4_q5_attn_input`, `unified/q4_q5_gdn_input`, `unified/q4_linear_swiglu`, `unified/q4_linear_add`, `unified/q5_linear_add/5120x<k>` | upstream's routes for the fused groupwise projections over the unified Linear templates (`unified`) instead of this line's own | the model shapes, widths 1 to 64 (the small-T launches only where those are all the switch covers) |
-| `unified/q4_linear_topk`, `unified/q8_*`, `unified/fp8_*`, `unified/nvfp4_*`, `unified/bf16_*`, `unified/context_kv_materialize` | the same switch for the Q4 top-k head, the Q8 fused projections (attention and GDN inputs, LinearAdd, pair, SwiGLU, top-k, grouped convolution, context-KV materialization), the FP8 and NVFP4 fused projections (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the FP8 top-k), and the BF16 attention input and LinearAdd | not calibrated: the built-in RTX 3090, 4090 and 5090 profiles carry the widths where each Op's benchmark ran faster on the unified routes over two rounds per table (at least 3 % over the geometric mean, no case more than 3 % slower), and keep them under a calibrated file entry; elsewhere a hand-edited profile entry or `NINFER_LINEAR_ROUTES` sets them |
+| `unified/q4_linear_topk`, `unified/q8_*`, `unified/fp8_*`, `unified/nvfp4_*`, `unified/bf16_*`, `unified/context_kv_materialize` | the same switch for the Q4 top-k head, the Q8 fused projections (attention and GDN inputs, LinearAdd, pair, SwiGLU, top-k, grouped convolution, context-KV materialization), the FP8 and NVFP4 fused projections (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the FP8 top-k), and the BF16 attention input and LinearAdd | not calibrated: the built-in RTX 3090, 4090 and 5090 profiles carry the widths where each Op's benchmark ran faster on the unified routes over two rounds per table (at least 3 % over the geometric mean, no case more than 3 % slower), and keep them under a calibrated file entry; elsewhere a hand-edited profile entry or `NINFER_LINEAR_ROUTES` sets them. Those benchmarks ran to width 1024: a wider FP8 call with A16 activations (every FP8 call of a build other than `120a`, which alone carries the FP8 A8 routes) takes the unified LinearAdd and SwiGLU, and the unified pure Linear, where no profile band reaches its width, because the legacy A16 routes run it in 4-token passes that each read the whole weight |
+| `w4_cublas/<op>`, `w4_cublas/<op>/a8` | with `--prefill-cublas`, whether a prompt call of each projection (`q4_linear_swiglu`, `linear_add/5120x17408`, `linear_add/5120x6144`, `q4_q5_gdn_input`, `q4_q5_attn_input`) takes the cuBLAS route (`on`, `off`): the plain key at widths the integer A8 mainloop cannot take, `/a8` at the multiples of its 128-column tile. Where no band reaches a width, calls of 512 columns and more take the route; no band sends a call of 128 columns or fewer (a decode or verify round) to it | widths 136 to 1,500, and 256 to 2,048 under `/a8` |
 | `gdn_two_stage/h<value heads>` | the two-stage GDN prefill (fused Q/K normalization and control preparation, then one FP32-state recurrence that also writes the output) instead of the WY/state-passing/output pipeline | prompts of 16 to 8192 tokens, 48 and 32 value heads |
 
 `NINFER_SMALLT_PV_F16`, `NINFER_PROMPT_PV_F16`, `NINFER_PROMPT_PACK_GQA`, `NINFER_PROMPT_FAST` and
-`NINFER_GDN_TWO_STAGE` (`0` or `1`) override the profile for their route; `NINFER_LINEAR_ROUTES`
+`NINFER_GDN_TWO_STAGE` (`0` or `1`) override the profile for their route; `NINFER_PROMPT_SPLITS=0`
+turns the prompt key splits off and `N` forces N splits wherever a call may split; `NINFER_LINEAR_ROUTES`
 (`legacy` or `unified`) takes one table for every Linear shape and every `unified/*` switch. `--fast-prefill-kernel` turns the fast prompt kernel on regardless.
 
 ## Batch composition
@@ -136,3 +147,22 @@ Some launch sizes follow the device directly and need no profile:
 - **Wave counts.** The chunked GDN output kernel and the sparse-MoE prefill size their grids from the
   SM count and the kernel's occupancy, and the small-T attention holds its split count to whole waves
   of the device.
+
+## SparseMoe policy keys
+
+SparseMoe, with resident or streamed experts, reads two optional keys outside automatic
+calibration:
+
+- `sparse_moe/prefill/<codec>` (`q4-q5`, `q4-q6`, `q8-q8`, `nvfp4`): a band ending at 1 stores the
+  token count from which calls take the prefill route instead of Small-T. Accepted values are 2 to
+  47 (13 to 47 for NVFP4); anything else keeps the compiled frontier. The workspace query and the
+  launch read the same value.
+- `sparse_moe/prefill-tiles/q4-q5` and `/q4-q6`, with T as the axis: `narrow` or `wide` forces the
+  prefill tile width; an empty schedule keeps the automatic choice.
+
+The built-in profiles use two of them. The V100-SXM2-32GB takes Small-T up to T=32 for Q8 experts
+(frontier 33): eight Qwen3.6-35B-A3B requests with three MTP drafts and 512-token prompts produced
+2.2% more tokens per second with identical outputs. The RTX 5090 takes the narrow Q4+Q5 tile at
+T=1024 (the default prompt chunk): whole generation ran 0.5% faster with identical outputs.
+`ninfer_sparse_moe_bench --candidate` and `ninfer_sparse_moe_test --candidates-only` compare and
+qualify the candidates a profile may name.

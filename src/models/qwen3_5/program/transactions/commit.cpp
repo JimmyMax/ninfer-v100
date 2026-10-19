@@ -132,9 +132,44 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
                        std::to_string(r.host.state_slots) + " host_kv_bytes " +
                        std::to_string(r.host.kv_bytes);
             };
+            // Which StateImages the sequence owns, so a mismatch names the offender instead of
+            // only a count.
+            std::string states_dump;
+            const auto dump_state = [&](const char* role, StateImageHandle handle) {
+                if (!state_store->valid(handle)) {
+                    states_dump += std::string(" ") + role + "=stale";
+                    return;
+                }
+                const char* residency = "none";
+                switch (state_store->residency(handle)) {
+                case StateReplicaResidency::None:
+                    break;
+                case StateReplicaResidency::DeviceOnly:
+                    residency = "device";
+                    break;
+                case StateReplicaResidency::HostOnly:
+                    residency = "host";
+                    break;
+                case StateReplicaResidency::Both:
+                    residency = "both";
+                    break;
+                }
+                states_dump +=
+                    std::string(" ") + role + "{" + residency + ",checkpoint_refs=" +
+                    std::to_string(state_store->checkpoint_references(handle)) +
+                    ",exclusive=" + (state_exclusive_to_sequence(sequence, handle) ? "yes" : "no") +
+                    "}";
+            };
+            if (sequence.state.read.valid()) { dump_state("read", sequence.state.read); }
+            if (sequence.state.write.valid()) { dump_state("write", sequence.state.write); }
+            if (sequence.rewrite_state) { dump_state("rewrite", *sequence.rewrite_state); }
+            if (sequence.reserved_state) { dump_state("reserved", *sequence.reserved_state); }
+            for (const LongAnchorCheckpoint& anchor : sequence.long_anchors) {
+                dump_state("anchor", anchor.state);
+            }
             throw std::logic_error(
                 "materialized sequence does not match its active entitlement (actual: " +
-                describe(actual) + "; expected: " + describe(expected) + ")");
+                describe(actual) + "; expected: " + describe(expected) + ";" + states_dump + ")");
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
@@ -364,7 +399,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 execution::PrefillContext schedule_state{
                     {device, parameters, work, state_images->linear(0),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel},
+                     proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel, mtp_attention_window, experts.get()},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,
@@ -726,6 +761,20 @@ bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& req
             frontier > request.prefill->prompt_tokens) {
             return false;
         }
+        // A DFlash draft context that lags the salvaged frontier cannot be truncated to it on
+        // materialization, so only a caught-up backend can be published.
+        if (speculative_backend == SpeculativeBackend::DFlash &&
+            state.dflash_context_frontier < frontier) {
+            return false;
+        }
+        // The next request reuses this endpoint under MTP only with the tail hidden state and the
+        // MTP KV up to frontier - 1 (request_plan.cpp). A prefill cut before its last chunk has no
+        // tail hidden state, so the lane keeps only the checkpoints it captured
+        // (retain_prefill_progress).
+        if (speculative_backend == SpeculativeBackend::Mtp &&
+            (!state.tail_hidden_valid || state.mtp_kv_valid + 1 < frontier)) {
+            return false;
+        }
         // Staged prefill keeps the committed frontier and rebuild work at the materialization
         // base; bring both to the salvaged cursor before publishing.
         try {
@@ -743,19 +792,6 @@ bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& req
             state.rebuild_tail_begin = tail_begin;
             state.execution_frontier = frontier;
         } catch (...) { return false; }
-        // A DFlash draft context that lags the salvaged frontier cannot be truncated to it on
-        // materialization, so only a caught-up backend can be published.
-        if (speculative_backend == SpeculativeBackend::DFlash &&
-            state.dflash_context_frontier < frontier) {
-            return false;
-        }
-        // The next request reuses this endpoint under MTP only with the tail hidden state and the
-        // MTP KV up to frontier - 1 (request_plan.cpp). A prefill cut before its last chunk has no
-        // tail hidden state, so the conversation resumes from its last captured checkpoint.
-        if (speculative_backend == SpeculativeBackend::Mtp &&
-            (!state.tail_hidden_valid || state.mtp_kv_valid + 1 < frontier)) {
-            return false;
-        }
     } else if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Finishable) {
         frontier = state.execution_frontier;
         if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier) { return false; }
@@ -775,6 +811,142 @@ bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& req
     out.timings     = request.timings;
     out.speculative = std::move(request.speculative_stats);
     out.salvaged    = true;
+    return true;
+}
+
+bool ProgramImpl::retain_prefill_progress(SequenceState& state, RequestControl& request,
+                                          std::uint32_t lane, std::uint32_t continuation_index,
+                                          qwen3_5::AbortResult& out) noexcept {
+    // Everything before the first mutation only inspects. A lane that still holds an open state
+    // fork (its first write after a capture or reuse has not run), an unanswered capture offer or
+    // a live endpoint has no settled exclusive writer to release, so the strict clear takes it.
+    if (request.lifecycle != Lifecycle::Prefilling || !request.publish_continuation ||
+        !request.prefill || request.prefill->pending_capture_offer != 0 || !state.kv ||
+        state.endpoint_valid || state.state.fork_pending || state.state.read != state.state.write ||
+        (state.long_anchors.empty() && !state.rewrite_checkpoint.valid)) {
+        return false;
+    }
+    qwen3_5::TargetKVRequirement retained;
+    try {
+        if (!state_store->valid(state.state.write) ||
+            state_store->role(state.state.write) != StateImageRole::ActiveMutable ||
+            state_store->checkpoint_references(state.state.write) != 0) {
+            return false;
+        }
+        out.summary.long_anchors.reserve(state.long_anchors.size());
+        populate_continuation_summary(state, out.summary);
+        const auto include = [&](const qwen3_5::CheckpointSummary& checkpoint) {
+            retained.main_frontier =
+                std::max(retained.main_frontier, checkpoint.required_kv.main_frontier);
+            retained.backend_frontier =
+                std::max(retained.backend_frontier, checkpoint.required_kv.backend_frontier);
+        };
+        if (out.summary.rewrite) { include(*out.summary.rewrite); }
+        for (const qwen3_5::CheckpointSummary& anchor : out.summary.long_anchors) {
+            include(anchor);
+        }
+        if (retained.main_frontier == 0 || retained.main_frontier > state.ledger.size() ||
+            retained.main_frontier > state.text_kv_valid ||
+            retained.backend_frontier > backend_kv_valid(state)) {
+            return false;
+        }
+        // The continuation's rebuild work ends where its deepest checkpoint does.
+        runtime::PrefillWork rebuild_work =
+            rebuild_work_at_frontier(request.prefill->prompt, retained.main_frontier, prefill_chunk,
+                                     request.prefill->capture_groups,
+                                     request.prefill->prompt.identity.rewrite_execution_frontiers);
+        std::uint32_t tail_begin = 0;
+        for (const CaptureGroup& group : request.prefill->capture_groups) {
+            runtime_support::include_rebuild_boundary(tail_begin, group.frontier,
+                                                      retained.main_frontier);
+        }
+        for (const std::uint32_t boundary :
+             request.prefill->prompt.identity.rewrite_execution_frontiers) {
+            runtime_support::include_rebuild_boundary(tail_begin, boundary, retained.main_frontier);
+        }
+        // Every release below must be known to succeed before the first one runs, so a lane that
+        // cannot be retained reaches the strict clear untouched.
+        const bool reserved_owned_elsewhere =
+            state.reserved_state &&
+            (*state.reserved_state == state.state.write ||
+             (state.rewrite_state && *state.reserved_state == *state.rewrite_state) ||
+             std::any_of(state.long_anchors.begin(), state.long_anchors.end(),
+                         [&](const LongAnchorCheckpoint& anchor) {
+                             return anchor.state == *state.reserved_state;
+                         }));
+        const bool release_reserved =
+            state.reserved_state && !reserved_owned_elsewhere &&
+            state_store->valid(*state.reserved_state) &&
+            state_store->checkpoint_references(*state.reserved_state) == 0;
+        if (!state_store->can_release(state.state.write) ||
+            (release_reserved && !state_store->can_release(*state.reserved_state)) ||
+            !text_kv_addresses->can_deactivate_and_truncate_prefix(state.kv->text,
+                                                                   retained.main_frontier) ||
+            (state.kv->backend && !backend_kv_addresses->can_deactivate_and_truncate_prefix(
+                                      *state.kv->backend, retained.backend_frontier))) {
+            return false;
+        }
+        // Everything fallible was checked above. The KV tail goes first, then the state images
+        // whose release is irreversible, so a failure in either leaves the lane's state handles
+        // valid for the strict clear.
+        text_kv_addresses->set_checkpoint_requirement(state.kv->text, retained.main_frontier);
+        if (state.kv->backend) {
+            backend_kv_addresses->set_checkpoint_requirement(*state.kv->backend,
+                                                             retained.backend_frontier);
+        }
+        release_sequence_growth_entitlement(state);
+        unbind_sequence_kv(state);
+        text_kv_addresses->truncate_inactive_prefix(state.kv->text, retained.main_frontier);
+        if (state.kv->backend) {
+            backend_kv_addresses->truncate_inactive_prefix(*state.kv->backend,
+                                                           retained.backend_frontier);
+        }
+        if (!state_store->release(state.state.write)) { return false; }
+        // can_release held, so this cannot fail short of a Host slot fault; the write image is
+        // already released, so there is nothing to fall back to.
+        if (release_reserved) { (void)state_store->release(*state.reserved_state); }
+        state.reserved_state.reset();
+        // The continuation's identity ends at its deepest checkpoint; the rest of the prompt has
+        // no state behind it.
+        state.ledger.resize(retained.main_frontier);
+        state.prefix_identity.truncate(retained.main_frontier);
+        state.prefix_digests.truncate(retained.main_frontier);
+        state.rebuild_work       = rebuild_work;
+        state.rebuild_tail_begin = tail_begin;
+    } catch (...) { return false; }
+
+    state.state              = {};
+    state.tail_hidden        = {};
+    state.tail_hidden_valid  = false;
+    state.execution_frontier = retained.main_frontier;
+    state.ledger_frontier    = retained.main_frontier;
+    state.text_kv_valid      = retained.main_frontier;
+    state.mtp_draft_count    = 0;
+    if (speculative_backend == SpeculativeBackend::Mtp) {
+        state.mtp_kv_valid = retained.backend_frontier;
+    } else if (is_masked_draft_backend(speculative_backend)) {
+        state.dflash_context_frontier = retained.main_frontier;
+    }
+    try {
+        refresh_state_views(state);
+    } catch (...) {}
+    if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
+    release_active_shared_references(state);
+    request.prefill.reset();
+    request.active_resources                    = {};
+    request.optional_resources                  = {};
+    request.lifecycle                           = Lifecycle::Empty;
+    request.pending                             = {};
+    continuation_slots[continuation_index].role = ContinuationSlotRole::Catalogued;
+    active_continuations[lane]                  = continuation_capacity;
+    out.summary.active_references               = 0;
+    invalidate_lane(lane);
+    out.continuation.emplace(ContractAccess::make_continuation(
+        this, continuation_index, continuation_slots[continuation_index].generation));
+    out.timings     = request.timings;
+    out.speculative = std::move(request.speculative_stats);
+    out.salvaged    = true;
+    advance_resource_revision();
     return true;
 }
 
@@ -812,7 +984,8 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
     }
-    if (salvage_continuation(state, request, lane, continuation_index, out)) {
+    if (salvage_continuation(state, request, lane, continuation_index, out) ||
+        retain_prefill_progress(state, request, lane, continuation_index, out)) {
         out.status = runtime::ConsumeStatus::Consumed;
         return out;
     }

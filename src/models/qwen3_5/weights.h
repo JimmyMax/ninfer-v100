@@ -79,6 +79,8 @@ struct MoeWeights {
     WeightId router, shared_score;
     std::vector<DenseWeights> experts;
     DenseWeights shared;
+    // Absent for a resident bank, including MTP's explicit load-time Q4 storage trade.
+    std::optional<std::size_t> delivery_layer;
 };
 
 struct BlockWeights {

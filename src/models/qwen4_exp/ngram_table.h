@@ -84,8 +84,11 @@ public:
     // Advisory lookahead: OS hints for Linux buffered/mapped and Windows mapped reads;
     // up to depth direct reads (also Windows buffered reads) into
     // bounded staging. Hints do not change demand counters or admit rows to the resident cache.
-    // Like submit/wait, called by the reader's owner, never concurrently with them.
+    // A batch of more than kInlineHints page ranges is hinted by a worker thread and dropped
+    // while the worker still hints the previous one. Like submit/wait, called by the reader's
+    // owner, never concurrently with them.
     void prefetch(std::span<const std::uint64_t> row_ids);
+    static constexpr std::size_t kInlineHints = 256;
 
     // The counters of every finished batch; any thread may read them.
     [[nodiscard]] NgramTableStats counters() const;
@@ -95,6 +98,7 @@ private:
     class Memory;
     class RowCache;
     class Lookahead;
+    class Hints;
 
     // Reads `bytes` of the table at table offset `offset`, across segments, from the files.
     void read(std::uint64_t offset, std::uint8_t* destination, std::size_t bytes) const;
@@ -118,6 +122,7 @@ private:
     std::unique_ptr<FileReadQueue> queue_;
     std::vector<QueuedFileRead> reads_;
     std::unique_ptr<Lookahead> lookahead_;
+    std::unique_ptr<Hints> hints_;
 
     // The batch in flight: the rows the files serve (index into the batch), and its start.
     std::vector<std::uint32_t> misses_;

@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -80,6 +81,7 @@ struct LayerPlan {
                 *k_norm = nullptr;
     // MoE.
     bool moe = false;
+    int delivery_layer = -1;
     const float *router = nullptr, *router_scale = nullptr, *expert_scale = nullptr,
                 *pre_norm = nullptr, *post_norm = nullptr, *mlp_post_norm = nullptr;
     gguf::GgmlType gate_up_type{}, down_type{};
@@ -143,6 +145,9 @@ struct Executor::Impl {
     static constexpr int kKvRows = 8;
     float eps = 1e-6f;
     std::vector<LayerPlan> layers;
+    std::unique_ptr<ExpertDelivery> delivery;
+    mutable std::mutex expert_stats_mutex;
+    ExpertDeliveryStats expert_startup_stats;
     Weight head; // tied token table
     const float* final_norm = nullptr;
     DeviceBuffer inv_freq_sliding, inv_freq_full;
@@ -320,32 +325,42 @@ struct Executor::Impl {
                 p.pre_norm      = fp32(model, mw.pre_norm, hidden);
                 p.post_norm     = fp32(model, mw.post_norm, hidden);
                 p.mlp_post_norm = fp32(model, mw.mlp_post_norm, hidden);
-                const Weight gate_up = matrix(model, {mw.gate_up});
-                const Weight down    = matrix(model, {mw.down});
-                if (!is_gguf(gate_up.qtype) || !is_gguf(down.qtype)) {
-                    throw std::invalid_argument("Gemma 4 experts must be GGUF block matrices");
+                Weight gate_up, down;
+                if (model.expert_residency() == ExpertResidency::Device) {
+                    gate_up = matrix(model, {*mw.gate_up});
+                    down = matrix(model, {*mw.down});
+                    if (!is_gguf(gate_up.qtype) || !is_gguf(down.qtype)) {
+                        throw std::invalid_argument("Gemma 4 experts must be GGUF block matrices");
+                    }
+                    p.gate_up_type = ops::detail::gguf_type(gate_up.qtype);
+                    p.down_type = ops::detail::gguf_type(down.qtype);
+                    p.gate_up_row_bytes = row_bytes(gate_up);
+                    p.down_row_bytes = row_bytes(down);
+                    std::vector<const void*> table(4 * std::size_t(e));
+                    for (int x = 0; x < e; ++x) {
+                        const auto* gu = static_cast<const std::byte*>(gate_up.qdata) +
+                                         std::int64_t(x) * 2 * width * p.gate_up_row_bytes;
+                        table[x] = gu;
+                        table[e + x] = gu + std::int64_t(width) * p.gate_up_row_bytes;
+                        table[2 * e + x] = gu;
+                        table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
+                                           std::int64_t(x) * hidden * p.down_row_bytes;
+                    }
+                    p.tables = DeviceBuffer(table.size() * sizeof(void*));
+                    p.tables.copy_from_host(table.data(), table.size() * sizeof(void*));
+                } else {
+                    const auto& bank = model.expert_banks()[i];
+                    p.delivery_layer = int(i);
+                    p.gate_up_type = ops::detail::gguf_type(bank.gate_up_type);
+                    p.down_type = ops::detail::gguf_type(bank.down_type);
+                    p.gate_up_row_bytes = bank.gate_up_row_bytes;
+                    p.down_row_bytes = bank.down_row_bytes;
                 }
-                p.gate_up_type      = ops::detail::gguf_type(gate_up.qtype);
-                p.down_type         = ops::detail::gguf_type(down.qtype);
                 if (!gguf::moe_matrix_supported(p.gate_up_type, 2 * width, hidden, true) ||
                     !gguf::moe_matrix_supported(p.down_type, hidden, width, true)) {
                     throw std::invalid_argument(
                         "Gemma 4: no integer expert kernel for these expert formats");
                 }
-                p.gate_up_row_bytes = row_bytes(gate_up);
-                p.down_row_bytes    = row_bytes(down);
-                std::vector<const void*> table(4 * std::size_t(e));
-                for (int x = 0; x < e; ++x) {
-                    const auto* gu = static_cast<const std::byte*>(gate_up.qdata) +
-                                     std::int64_t(x) * 2 * width * p.gate_up_row_bytes;
-                    table[x]         = gu;
-                    table[e + x]     = gu + std::int64_t(width) * p.gate_up_row_bytes;
-                    table[2 * e + x] = gu;
-                    table[3 * e + x] = static_cast<const std::byte*>(down.qdata) +
-                                       std::int64_t(x) * hidden * p.down_row_bytes;
-                }
-                p.tables = DeviceBuffer(table.size() * sizeof(void*));
-                p.tables.copy_from_host(table.data(), table.size() * sizeof(void*));
             }
             p.slots       = p.full ? global_slots : ring;
             p.ring        = p.full ? 0 : ring;
@@ -486,6 +501,41 @@ struct Executor::Impl {
             }
         }
         workspace = std::make_unique<WorkspaceArena>(workspace_bytes);
+        if (!model.expert_banks().empty()) {
+            std::vector<ExpertDeliveryLayer> sources;
+            std::vector<std::uint64_t> sizes;
+            for (const auto& bank : model.expert_banks()) {
+                sources.push_back(bank.delivery);
+                for (const auto& expert : bank.delivery.experts) {
+                    sizes.resize(std::max(sizes.size(), expert.size()), 0);
+                    for (std::size_t b = 0; b < expert.size(); ++b) {
+                        sizes[b] = std::max(sizes[b], std::uint64_t(round_up(
+                            expert[b].bytes + expert[b].zero_tail, kAlign)));
+                    }
+                }
+            }
+            // One whole-layer bank at least (the transport adds a second where memory allows).
+            std::uint64_t slot = 0;
+            for (auto bytes : sizes) { slot += bytes; }
+            const auto bank = slot * config.num_experts;
+            const auto metadata = std::uint64_t(options.prefill_chunk) * config.top_k_experts * 8 +
+                std::uint64_t(config.num_hidden_layers) * config.num_experts * 4 * sizeof(void*) +
+                config.num_experts * 4;
+            std::size_t free = 0, total = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free, &total));
+            const auto cache = options.expert_cache_bytes.value_or(0);
+            if (bank + metadata + cache + kGraphReserve > free) {
+                throw InsufficientMemory("Gemma 4: expert delivery needs " +
+                    std::to_string((bank + metadata + cache) >> 20) +
+                    " MiB plus the CUDA Graph reserve after workspace allocation");
+            }
+            ExpertDeliveryOptions transport;
+            transport.pair_capacity = options.prefill_chunk * config.top_k_experts;
+            transport.cache_bytes = options.expert_cache_bytes;
+            transport.keep_free_bytes = kGraphReserve;
+            delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
+                                                        std::move(sources), transport);
+        }
     }
 
     // The startup check's room for the workspace and the CUDA graphs: 1.5 GiB at the full
@@ -501,6 +551,7 @@ struct Executor::Impl {
     }
 
     ~Impl() {
+        if (delivery) { cudaStreamSynchronize(stream); }
         if (media_begin != nullptr) { cudaEventDestroy(media_begin); }
         if (media_end != nullptr) { cudaEventDestroy(media_end); }
     }
@@ -824,7 +875,13 @@ struct Executor::Impl {
                            weights, stream);
             routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
         }
-        const auto* tables = static_cast<const void* const*>(p.tables.p);
+        std::optional<ExpertDelivery::Call> call;
+        if (delivery) {
+            call = delivery->begin(std::size_t(p.delivery_layer), ids, std::uint32_t(pairs), stream);
+            if (t > gguf::kMaxVectorColumns) { delivery->await(stream); }
+        }
+        const auto* tables = delivery ? delivery->tables(std::size_t(p.delivery_layer))
+                                      : static_cast<const void* const*>(p.tables.p);
         const gguf::MoeTable gate{tables, p.gate_up_row_bytes, width, hidden};
         const gguf::MoeTable up{tables + e, p.gate_up_row_bytes, width, hidden};
         const gguf::MoeTable gate_up{tables + 2 * e, p.gate_up_row_bytes, 2 * width, hidden};
@@ -839,18 +896,30 @@ struct Executor::Impl {
                 act = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
                 gguf::quantize_vector_activation(x, hidden, t, nullptr, act, stream);
             }
-            gguf::moe_vector_swiglu(p.gate_up_type, gate, up, routing, max_active, k, act, t,
-                                    middle, chunk, stream, gguf::GateActivation::GeluTanh);
             void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
-            gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
             auto* fixed = static_cast<unsigned long long*>(
                 workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
             gguf::MoeOutput out;
             out.weighted = fixed;
-            out.weights  = weights;
-            gguf::moe_vector_product(p.down_type, down, routing, max_active, 1, k, act2, pairs,
-                                     out, chunk, stream);
+            out.weights = weights;
+            const auto compute = [&](const gguf::MoeRouting& part) {
+                // Quantization reads every pair. Clear absent pairs before each disjoint stage.
+                if (call) { CUDA_CHECK(cudaMemsetAsync(middle, 0, std::size_t(pairs) * width * 2, stream)); }
+                gguf::moe_vector_swiglu(p.gate_up_type, gate, up, part, max_active, k, act, t,
+                                        middle, chunk, stream, gguf::GateActivation::GeluTanh);
+                gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
+                gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
+                                         out, chunk, stream);
+            };
+            if (call) {
+                // Both stages add to the same exact fixed-point sum, zeroed once above.
+                auto cached = gguf::moe_sort_routes(call->cached_ids, pairs, e, routing_space, stream);
+                compute(cached);
+                delivery->await(stream);
+                auto missing = gguf::moe_sort_routes(call->missing_ids, pairs, e, routing_space, stream);
+                compute(missing);
+            } else { compute(routing); }
             combine.moe_fixed = fixed;
             return;
         }
@@ -859,16 +928,16 @@ struct Executor::Impl {
                                              stream);
         auto* gu = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
-        gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, t, true, act,
-                                 gu, stream);
+        gguf::moe_matrix_product(p.gate_up_type, gate_up, routing, max_active, pairs, true, act, gu,
+                                 stream);
         kernels::geglu_rows(gu, pairs, width, middle, stream);
         void* act2 = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(width, pairs)).data;
         gguf::quantize_moe_matrix_activation(p.down_type, middle, width, routing, pairs, 1, act2,
                                              stream);
         auto* rows = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * hidden * 4).data);
-        gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, t, true, act2,
-                                 rows, stream);
+        gguf::moe_matrix_product(p.down_type, down, routing, max_active, pairs, true, act2, rows,
+                                 stream);
         combine.moe_rows    = rows;
         combine.moe_weights = weights;
         combine.top_k       = k;
@@ -1667,6 +1736,13 @@ struct Executor::Impl {
         }
         std::fill(anchored.begin(), anchored.end(), 0);
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (delivery) {
+            // Drained, so warm-up deliveries and their asynchronous prefetches stay out of the
+            // request counters. Runtime readers use the same mutex and report request work only.
+            delivery->drain();
+            std::lock_guard lock(expert_stats_mutex);
+            expert_startup_stats = delivery->stats();
+        }
     }
 
     // A sliding block's ring buffers of one sequence, (start, bytes): F16 K and V, or a quantized
@@ -1807,7 +1883,8 @@ ExecutorMemory Executor::memory() const noexcept {
     return ExecutorMemory{.kv_bytes            = impl_->kv_bytes,
                           .workspace_bytes     = impl_->workspace_bytes,
                           .vision_encode_bytes = tower ? tower->workspace_bytes() : 0,
-                          .vision_owned_bytes  = tower ? tower->owned_bytes() : 0};
+                          .vision_owned_bytes  = tower ? tower->owned_bytes() : 0,
+                          .experts = impl_->delivery ? impl_->delivery->memory() : ExpertDeliveryMemory{}};
 }
 
 std::uint64_t Executor::image_bytes(std::uint32_t position) const {
@@ -1833,7 +1910,14 @@ std::uint32_t Executor::position(std::uint32_t sequence) const {
     return impl_->positions.at(sequence);
 }
 
-void Executor::warm_up() { impl_->warm_up(); }
+void Executor::warm_up() { impl_->warm_up(); check_experts(); }
+
+void Executor::check_experts() const { if (impl_->delivery) { impl_->delivery->check(); } }
+ExpertDeliveryStats Executor::expert_stats() const {
+    if (!impl_->delivery) { return {}; }
+    std::lock_guard lock(impl_->expert_stats_mutex);
+    return impl_->delivery->stats() - impl_->expert_startup_stats;
+}
 
 void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                        std::uint32_t logit_rows, std::span<const ChunkMedia> media) {

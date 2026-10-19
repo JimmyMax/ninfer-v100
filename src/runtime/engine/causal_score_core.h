@@ -100,7 +100,14 @@ public:
         return out;
     }
 
-    [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
+    [[nodiscard]] RuntimeStats runtime_stats() const noexcept {
+        std::scoped_lock lock(execution_mutex_);
+        RuntimeStats out;
+        if constexpr (requires { instance_.program->expert_residency_stats(); }) {
+            out.experts = instance_.program->expert_residency_stats();
+        }
+        return out;
+    }
 
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);

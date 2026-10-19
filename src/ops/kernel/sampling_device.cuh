@@ -8,7 +8,7 @@
 #include "ops/common/math.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/common/score_id_order.cuh"
-#include "ops/common/sm70_emulation.cuh"
+#include "ops/common/pre_sm80.cuh"
 #include "ninfer/ops/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>
@@ -24,8 +24,8 @@ namespace ninfer::ops {
 // The candidate merges reduce over the first kSamplingTileWarps lanes; redux.sync is sm_80.
 template <int Width>
 __device__ __forceinline__ unsigned int sampling_lane_max(unsigned int mask, unsigned int value) {
-#if defined(NINFER_SM70_DEVICE)
-    return ops::sm70::reduce_max<Width>(mask, value);
+#if defined(NINFER_PRE_SM80_DEVICE)
+    return ops::pre_sm80::reduce_max<Width>(mask, value);
 #else
     return __reduce_max_sync(mask, value);
 #endif

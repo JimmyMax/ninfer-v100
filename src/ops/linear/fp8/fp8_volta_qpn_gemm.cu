@@ -6,7 +6,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_SM70
+#ifdef NINFER_TIER_VOLTA
 
 namespace {
 using S = Fp8VoltaQpnSchedule;
@@ -80,6 +80,6 @@ void launch_fp8_volta_qpn_fp16(const Tensor& x, const Weight& w, const void* x_f
         Fp8ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), n}, n, stream);
 }
 
-#endif // NINFER_SM70
+#endif // NINFER_TIER_VOLTA
 
 } // namespace ninfer::ops::detail

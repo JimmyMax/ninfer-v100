@@ -6,7 +6,7 @@
 #include "ops/linear/fp8/fp8_gemv.cuh"
 #include "ops/linear/fp8/fp8_output.cuh"
 #include "ops/linear_add/fp8/fp8_linear_add_epilogue.cuh"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/linear/fp8/fp8_volta_qpn_gemm.cuh" // 本仓库 V100 增量
 #endif
 
@@ -52,7 +52,7 @@ void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor&
     throw std::invalid_argument("fp8 linear_add: unsupported problem");
 }
 
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 内核 + 残差 epilogue（投影结果直接加进 residual）。
 void fp8_linear_add_qpn_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                cudaStream_t stream) {

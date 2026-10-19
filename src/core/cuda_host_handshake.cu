@@ -121,5 +121,6 @@ bool CudaHostHandshake::retired(std::uint32_t sequence) const noexcept {
 void CudaHostHandshake::release(std::uint32_t sequence) noexcept {
     Atomic(static_cast<Mailbox*>(host_)->released).store(sequence, cuda::memory_order_release);
 }
+std::size_t CudaHostHandshake::pinned_bytes() const noexcept { return sizeof(Mailbox); }
 
 } // namespace ninfer

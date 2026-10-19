@@ -31,29 +31,6 @@ namespace a8 = rowsplit_a8;
 
 using Rows = a8::ContiguousRows<1>;
 
-// The padded width a ragged T runs at. Every column tile streams the whole weight, and a wider
-// tile costs less per column: on the RTX 3090 one 128-, 256- and 512-column tile of the text layers
-// take 1 : 1.4 : 2.2 (ninfer_linear_bench, 2026-09-22), so 300 tokens run as one 512-column tile
-// (2.2) rather than three of 128 (3.0), and 600 as three of 256 rather than five of 128.
-std::int32_t padded_tokens(std::int32_t tokens) {
-    struct Tile {
-        std::int32_t columns;
-        std::int32_t cost; // tenths of a 128-column tile
-    };
-
-    constexpr Tile kTiles[] = {{128, 10}, {256, 14}, {512, 22}};
-    std::int32_t best       = 0;
-    std::int32_t best_cost  = 0;
-    for (const Tile& tile : kTiles) {
-        const std::int32_t count = (tokens + tile.columns - 1) / tile.columns;
-        const std::int32_t cost  = count * tile.cost;
-        if (best == 0 || cost < best_cost) {
-            best      = count * tile.columns;
-            best_cost = cost;
-        }
-    }
-    return best;
-}
 
 // NINFER_T2_A8_TILE=off keeps the shared rowsplit_a8_mma.cuh GEMM on the prefill route.
 bool prefill_tile() {
@@ -264,18 +241,10 @@ template <std::int32_t kCols, int NT, class Epilogue>
 void gemm(const Weight& w, Epilogue epilogue, std::int32_t tokens, const std::int8_t* codes,
           const __half* scales, cudaStream_t stream) {
     constexpr int BN       = a8::kWarpsN * NT * 8;
-    const std::size_t smem = a8::shared_bytes<a8::T2Codec, 1, NT, Rows>(kCols);
-    const dim3 grid(w.n / Rows::kRowsPerBlock, padded_tokens(tokens) / BN);
-    auto* kernel = a8::a8_mma_kernel<a8::T2Codec, kCols, 1, NT, Rows, Epilogue>;
-    if (smem > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem));
-        });
-    }
-    kernel<<<grid, a8::kThreads, smem, stream>>>(static_cast<const std::uint8_t*>(w.qdata), nullptr,
-                                                 static_cast<const __half*>(w.scales), codes,
-                                                 scales, tokens, Rows{0}, epilogue, 0);
+    const dim3 grid(w.n / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
+    a8::launch_a8_mma<a8::T2Codec, kCols, 1, NT, Rows, Epilogue>(
+        grid, stream, static_cast<const std::uint8_t*>(w.qdata), nullptr,
+        static_cast<const __half*>(w.scales), codes, scales, tokens, Rows{0}, epilogue, 0);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -284,7 +253,7 @@ void gemm(const Weight& w, Epilogue epilogue, std::int32_t tokens, const std::in
 template <class F>
 void dispatch(std::int32_t input_rows, std::int32_t tokens, F&& f) {
     const auto by_tile = [&]<std::int32_t kCols>() {
-        switch (a8::token_tile(padded_tokens(tokens), 512)) {
+        switch (a8::token_tile(a8::padded_tokens(tokens), 512)) {
         case 512:
             f.template operator()<kCols, 16>();
             return;
@@ -442,8 +411,7 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
                 round(columns * static_cast<std::size_t>(input_rows / T2PrefillI8::kGroupK) *
                       sizeof(__half));
     } else if (max_tokens >= t2_a8_min_tokens()) {
-        // padded_tokens never exceeds the next multiple of 512, whatever T in [1, max_tokens].
-        bytes = a8::activation_workspace_bytes(input_rows, (max_tokens + 511) / 512 * 512);
+        bytes = a8::padded_activation_workspace_bytes(input_rows, max_tokens);
     }
     const SmallBand band = small_band();
     if (band.lo <= band.hi && max_tokens >= band.lo) {
@@ -477,8 +445,7 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
                                                                        T2PrefillI8::kGroupK) *
                                               sizeof(__half)));
         } else if (widest_tile != 0) {
-            bytes = std::max(bytes, a8::activation_workspace_bytes(
-                                        input_rows, (widest_tile + 511) / 512 * 512));
+            bytes = std::max(bytes, a8::padded_activation_workspace_bytes(input_rows, widest_tile));
         }
     }
     return bytes;
@@ -497,8 +464,9 @@ bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input
     const bool tile          = taken == Route::Prefill && prefill_tile();
     const std::size_t groups = static_cast<std::size_t>(input_rows) /
                                (tile ? T2PrefillI8::kGroupK : a8::kGroup);
-    const std::size_t columns = static_cast<std::size_t>(
-        taken == Route::SmallT ? tokens : tile ? tile_columns(tokens) : padded_tokens(tokens));
+    const std::size_t columns = static_cast<std::size_t>(taken == Route::SmallT ? tokens
+                                                         : tile ? tile_columns(tokens)
+                                                                : a8::padded_tokens(tokens));
     const std::size_t scale_columns =
         taken == Route::SmallT ? static_cast<std::size_t>(kT2I8MaxColumns) : columns;
     (void)layout.alloc_bytes(columns * static_cast<std::size_t>(input_rows));
@@ -549,7 +517,7 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
         });
         return {code_data, scale_data, tokens, input_rows};
     }
-    const std::size_t columns = static_cast<std::size_t>(padded_tokens(tokens));
+    const std::size_t columns = static_cast<std::size_t>(a8::padded_tokens(tokens));
     const DeviceSpan codes  = workspace.alloc_bytes(columns * static_cast<std::size_t>(input_rows));
     const DeviceSpan scales = workspace.alloc_bytes(
         columns * (static_cast<std::size_t>(input_rows) / a8::kGroup) * sizeof(__half));

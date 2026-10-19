@@ -18,6 +18,7 @@ namespace ninfer::models::qwen3_5 {
 struct LoadPlan::Impl {
     Config config;
     LoadOptions options;
+    std::filesystem::path artifact_path;
     ModelWeights weights;
     std::vector<loading::PendingWeight> pending;
     artifact::MaterializationPlan materialization;
@@ -50,14 +51,32 @@ std::span<const WeightUse> LoadPlan::uses(WeightId id) const {
     return impl_->pending.at(id.index).uses;
 }
 
-LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
+std::vector<ops::DeviceTier> rank_tiers(const DeviceContext& device) {
+    std::vector<ops::DeviceTier> tiers;
+    tiers.reserve(device.size());
+    for (std::size_t rank = 0; rank < device.size(); ++rank) {
+        tiers.push_back(ops::device_tier(device.rank(rank).device));
+    }
+    return tiers;
+}
+
+LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
+                   std::filesystem::path artifact_path, std::vector<ops::DeviceTier> rank_tiers) {
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
+    out->artifact_path = std::move(artifact_path);
     out->config  = parse_config(reader.directory(), options);
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
-    loading::Bindings bindings(binder);
+    loading::Bindings bindings(binder, options);
     const auto& text = out->config.text;
+    if (options.expert_residency == ExpertResidency::Disk && out->artifact_path.empty()) {
+        throw std::invalid_argument("disk expert residency requires the artifact entry path");
+    }
+    if (options.expert_residency != ExpertResidency::Device &&
+        !std::holds_alternative<MoeConfig>(text.ffn)) {
+        throw std::invalid_argument("--expert-residency host/disk requires a MoE model");
+    }
     if (options.ranks > 1 && options.overlay_vision()) {
         // Overlay borrows weight memory from the primary device's evictable tail; a later stage
         // holds whole layers and nothing a Vision window could take. The two residency schemes are
@@ -115,7 +134,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         if (out->weights.draft) { out->weights.draft->output_head = out->weights.proposal->head; }
     }
     loading::apply_storage_trades(bindings, out->config, out->weights, options);
-    loading::apply_device_layouts(bindings, out->weights);
+    if (rank_tiers.empty()) { rank_tiers.assign(options.ranks, ops::current_device_tier()); }
+    loading::apply_rank_policies(bindings, rank_tiers);
+    loading::apply_device_layouts(bindings, out->weights, rank_tiers);
     if (options.overlay_vision()) {
         loading::apply_vision_overlay_placement(bindings, out->weights, mtp_parameters,
                                                 draft_parameters);
@@ -153,6 +174,7 @@ constexpr std::uint64_t kHeadStageFixedBytes = 1024ULL << 20;
 
 std::uint64_t parameter_bytes(const artifact::Reader& reader, const loading::Bindings& bindings,
                               WeightId id) {
+    if (bindings.at(id).reference.residency != artifact::Residency::Device) { return 0; }
     std::uint64_t total = 0;
     for (const auto& part : bindings.at(id).reference.binding.parts) {
         total += reader.geometry(part.object).bytes;
@@ -174,7 +196,7 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
     const Config config = parse_config(reader.directory(), options);
     const auto& text    = config.text;
     artifact::Binder binder(reader);
-    loading::Bindings bindings(binder);
+    loading::Bindings bindings(binder, options);
     const TextWeights weights =
         loading::bind_text(bindings, text, options, StagePlan(text.num_hidden_layers));
 
@@ -284,9 +306,12 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                             static_cast<std::size_t>(materialization.evictable_tail_bytes),
                     });
     }
-    auto backing = artifact::materialize(*data->materialization.source,
+    const auto& reader = *data->materialization.source;
+    auto backing = artifact::materialize(reader,
                                          std::move(data->materialization), device, observer,
                                          std::move(pool), materialize);
+    auto experts = loading::expert_sources(reader, data->pending, data->weights, backing,
+                                            data->options, data->artifact_path);
     auto bound   = loading::resolve_weights(std::move(data->pending), backing);
     std::optional<VisionOverlayLayout> vision_overlay;
     if (data->options.overlay_vision()) {
@@ -298,13 +323,14 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         new Model(std::move(data->config), data->options, std::move(data->weights),
                   std::move(bound), std::move(replicas), std::move(data->resources),
                   std::move(data->info), std::move(backing), std::move(vision_overlay),
-                  std::move(data->cpu_vision)));
+                  std::move(data->cpu_vision), std::move(experts)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,
                                   DeviceContext& device, const StartupObserver* observer) {
     artifact::Reader reader(path);
-    return materialize_model(plan_load(reader, options), device, observer);
+    return materialize_model(plan_load(reader, options, path, rank_tiers(device)), device,
+                             observer);
 }
 
 } // namespace ninfer::models::qwen3_5

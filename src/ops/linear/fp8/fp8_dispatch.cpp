@@ -4,7 +4,7 @@
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_shapes_unified.h"
 #include "ops/linear/fp8/fp8_format.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "core/layout.h"                 // 本仓库 V100 增量
 #    include "ops/linear/fp8/fp8_cutlass_sm70.h"
 #    include "ops/linear/fp8/fp8_launch.h"   // 本仓库 V100 增量：QPN 声明
@@ -16,7 +16,7 @@
 
 namespace ninfer::ops::detail {
 namespace {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // 本仓库 V100 增量（docs/v100/PLAN.md）：宽 T 的 CUTLASS 路线要把权重整块反量化成 FP16
 // （n*k*2 字节）。当这块暂存会主导 arena 时（1.27 GB 的输出头会变成 2.54 GB，而引擎按最宽
 // 上下文预留它），改用分块 QPN：t <= 32 时它本来就只读一遍权重，而输出头在 prefill 里只算
@@ -47,7 +47,7 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
                                                 std::int32_t min_tokens, std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens)
         throw std::invalid_argument("fp8 linear workspace: invalid token interval");
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 支持的 FP8 形状在 sm_70 上由 QPN（t<=32，
     // 零暂存）与 CUTLASS（t>32，自带暂存；暂存过大的形状仍走分块 QPN）拥有全部宽度。容量
     // 必须来自同一决策而不是 route table——测试会强制 unified 表，而钩子不受表影响。
@@ -67,7 +67,9 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
 #endif
     return capacity_by_table(
         min_tokens, max_tokens,
-        [](std::int32_t width) { return linear_route_table(LinearRouteFamily::Fp8, width); },
+        [&](std::int32_t width) {
+            return linear_route_table(LinearRouteFamily::Fp8, width, fp8_wide_route_table(policy));
+        },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) -> std::size_t {
             const auto& shape = resolve_shape(n, k, policy, table);
             if (!allows_a8(policy) || !shape.uses_a8(first, last)) { return 0; }
@@ -80,7 +82,7 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
                   WorkspaceArena* workspace, cudaStream_t stream) {
     validate_fp8_weight(weight, "fp8 linear");
     if (x.ne[1] <= 0) throw std::invalid_argument("fp8 linear: T must be positive");
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 支持的 FP8 形状在 sm_70 上全部宽度绕过 route
     // table：t<=32 走 QPN（读 BF16 激活，零暂存），t>32 走 CUTLASS 宽 T（按需解量化 + FP16
     // tensor-core GEMM）。必须在 route-table 检查之前拦截。
@@ -140,8 +142,10 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
         return;
     }
 #endif
-    const auto& shape = resolve_shape(weight.n, weight.k, policy,
-                                      linear_route_table(LinearRouteFamily::Fp8, x.ne[1]));
+    const auto& shape =
+        resolve_shape(weight.n, weight.k, policy,
+                      linear_route_table(LinearRouteFamily::Fp8, x.ne[1],
+                                         fp8_wide_route_table(policy)));
     if (!allows_a8(policy) || !shape.uses_a8(x.ne[1], x.ne[1]))
         return shape.a16(x, weight, out, stream);
     if (workspace == nullptr)

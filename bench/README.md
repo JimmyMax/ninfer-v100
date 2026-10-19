@@ -66,6 +66,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--fast-prefill-kernel]
+          [--expert-residency <device|host|disk>] [--expert-cache-mib <N|auto>]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft|--full-draft-head]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -84,6 +85,11 @@ Example:
 Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (K=1..15 for every backend).
 Drafts use the optimized proposal head when the artifact stores one; `--lm-head-draft` requires it
 and `--full-draft-head` keeps the full output head. CUDA Graph decode is enabled by default.
+
+`--expert-residency host|disk` keeps a MoE model's routed experts in pinned host memory or in the
+artifact's files, as the CLI does; `--expert-cache-mib` sizes the device expert cache. The report's
+configuration records the residency, the cache bytes and the delivery counters of the whole run
+(`expert_routes`, `expert_hits`, `expert_admissions`, `expert_transferred_bytes`).
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
@@ -159,7 +165,7 @@ matching test, phase, and roof it reports the measured time change and the fract
 the pre-change gap to the roof that the change closed; a negative value moved the run
 away from the roof. A baseline already at or above a roof reports `n/a` for that roof's
 gap closure. Tests or phases present in only one run are listed as unmatched.
-The tool requires schema v16 or v17 and `--spec none`. It rejects speculative runs because proposals,
+The tool requires schema v16, v17 or v18 and `--spec none`. It rejects speculative runs because proposals,
 verification, and acceptance make output tokens an invalid proxy for executed model work.
 
 Projection compute work is counted as `2 * matrix elements` for each executed text projection.
@@ -1005,10 +1011,14 @@ it is not a mode of Attention input projection. End-to-end target measurement us
 ## 35B sparse-MoE dFlash benchmark
 
 `ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
-Q4+Q5/Q6 profiles and the MTP Q8+Q8 profile. It is a long-lived public Op benchmark: fixture setup
-uses `sparse_moe_workspace_capacity_bytes()`, and every eager or captured measurement calls only
-`ninfer::ops::sparse_moe()`. Production dispatch exclusively owns decode, Small-T, prefill,
-workspace views, launch decomposition, and schedule selection.
+Q4+Q5/Q6 profiles and the MTP Q8+Q8 profile. The default `--candidate auto` uses the public
+workspace query and `ninfer::ops::sparse_moe()`; production dispatch owns its route and schedule.
+An explicit `--candidate` (`decode`, `small-t` for T=2..46, `prefill`, `prefill-narrow`,
+`prefill-wide`) runs the internal laboratory path with the same validation and complete Op, so a
+device profile's `sparse_moe/*` bands ([device profiles](../docs/device-profiles.md)) can be chosen
+by measurement. The two forced tile widths bypass the adaptive prefill dispatch; NVFP4 has one
+prefill tile. `ninfer_sparse_moe_test --candidates-only` holds the candidates a profile may name to
+the FP64 oracle.
 
 CUDA Graph replay is the default and authoritative execution mode. The benchmark eagerly
 materializes the public call, captures it with stable tensor and workspace addresses, instantiates
@@ -1031,8 +1041,8 @@ cmake --build build --parallel --target ninfer_benches
 Each cold sample flushes 256 MiB before the timed interval. `trace-like` is the primary
 single-sequence verification distribution; `independent` and `same` bound zero and complete expert
 overlap. `--execution eager|graph|both` and `--cache cold|warm|both` change only the harness around
-the same public call. The CSV `timed_scope` is `full_sparse_moe_device_body`; it contains no private
-route, candidate, grid, block, or launch-count fields.
+the same selected call. The CSV `timed_scope` is `full_sparse_moe_device_body`, and its `candidate`
+column records the requested route. These are Op measurements, not Engine speedups.
 
 `unique_weight_gbps` counts the router, shared weights, and each selected expert's encoded weights
 once, so it is a distribution-aware useful-traffic lower bound rather than measured DRAM traffic.
@@ -1248,7 +1258,7 @@ closed.
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 17 records the public value objects directly:
+statistics. JSON schema version 18 records the public value objects directly:
 
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
   file/H2D/staging bytes and Device/Host object counts;

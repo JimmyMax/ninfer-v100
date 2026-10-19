@@ -147,18 +147,19 @@ void matrix_product_impl(const void* weight, std::int64_t row_bytes, int rows, i
     throw std::invalid_argument("gguf matrix product: unexpected column tile");
 }
 
-// ggml's tile loop over the experts a router selected: one CTA per (row tile, column tile, active
-// expert), the expert's rows reached through a table of base pointers (a bank, a cache slot or
-// mapped host memory) instead of a fixed stride. Column c of the activation is the routing's c-th
-// pair, and pair p's result row lands at out[p * rows].
+// ggml's tile loop over the experts a router selected: one CTA per row tile and listed (expert,
+// column tile), the expert's rows reached through a table of base pointers (a bank, a cache slot
+// or mapped host memory) instead of a fixed stride. Column c of the activation is the routing's
+// c-th pair, and pair p's result row lands at out[p * rows]. The grid's column dimension bounds
+// the list; the CTAs past its length leave at once.
 template <ggml_type type, int J>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false),
                   ggml_cuda_mmq_get_occupancy(type, J, false)) static __global__
     void moe_mul_mat_q(const void* const* __restrict__ experts, const int* __restrict__ y,
                        const std::int32_t* __restrict__ sorted,
                        const std::int32_t* __restrict__ bounds,
-                       const std::int32_t* __restrict__ active,
-                       const std::int32_t* __restrict__ active_count, float* __restrict__ dst,
+                       const std::int32_t* __restrict__ tiles,
+                       const std::int32_t* __restrict__ tile_count, float* __restrict__ dst,
                        const uint3 blocks_per_row, int rows, int stride_row_x, int ncols_y) {
     if (ggml_cuda_mmq_get_config(type, J, false).type == GGML_TYPE_COUNT) {
         NO_DEVICE_CODE;
@@ -167,13 +168,13 @@ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false),
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, false) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, false);
-    if (int(blockIdx.z) >= *active_count) { return; }
-    const int expert   = active[blockIdx.z];
+    if (int(blockIdx.y) >= *tile_count) { return; }
+    const int tile     = tiles[blockIdx.y];
+    const int expert   = tile & 0xFFFF;
+    const int jt       = tile >> 16;
     const int col_low  = bounds[expert];
     const int col_diff = bounds[expert + 1] - col_low;
-    const int jt       = blockIdx.y;
     const int it       = blockIdx.x;
-    if (jt * J >= col_diff) { return; }
     // The tile's destination pairs head the dynamic shared memory, where the tile loop reads them.
     extern __shared__ int ids_dst_shared[];
 #pragma unroll
@@ -225,7 +226,7 @@ bool moe_matrix_fits_impl(int rows, int k, bool tail) {
 template <ggml_type type, int J>
 void launch_moe_matrix(const MatrixLaunch& launch, const void* const* experts, int stride_row,
                        int rows, int k, const MoeRouting& routing, int max_active, int pairs,
-                       int max_columns, const int* activation, float* out, cudaStream_t stream) {
+                       const int* activation, float* out, cudaStream_t stream) {
     static std::once_flag raised[16];
     int device = 0;
     check(cudaGetDevice(&device), "device");
@@ -235,22 +236,31 @@ void launch_moe_matrix(const MatrixLaunch& launch, const void* const* experts, i
                                    static_cast<int>(launch.shared)),
               "moe matrix shared memory");
     });
-    constexpr int qk = ggml_cuda_type_traits<type>::qk;
-    const dim3 grid(rows / launch.I, (max_columns + J - 1) / J, max_active);
+    constexpr int qk    = ggml_cuda_type_traits<type>::qk;
+    constexpr int width = J == 16 ? 0 : J == 32 ? 1 : J == 64 ? 2 : 3;
+    static_assert(kMatrixColumnTiles[width] == J, "MoeRouting lists tiles of width 16 << w");
+    // Each active expert's tiles hold its pairs, the last one partly: no more than pairs / J
+    // whole tiles and one partial tile per active expert.
+    const int listed = (pairs + J - 1) / J + max_active;
+    if (listed > routing.tile_capacity || listed > 65535) {
+        throw std::invalid_argument("gguf moe matrix product: the routing lists fewer tiles");
+    }
+    const dim3 grid(rows / launch.I, listed, 1);
     const dim3 block(WARP_SIZE, launch.threads / WARP_SIZE, 1);
     moe_mul_mat_q<type, J><<<grid, block, launch.shared, stream>>>(
-        experts, activation, routing.sorted, routing.bounds, routing.active, routing.active_count,
+        experts, activation, routing.sorted, routing.bounds,
+        routing.tiles + std::int64_t(width) * routing.tile_capacity, routing.tile_count + width,
         out, init_fastdiv_values(k / qk), rows, stride_row, pairs);
     check(cudaGetLastError(), "moe matrix product launch");
 }
 
 template <ggml_type type>
 void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes, int rows, int k,
-                             const MoeRouting& routing, int max_active, int pairs, int max_columns,
-                             bool tail, const void* activation, float* out, cudaStream_t stream) {
+                             const MoeRouting& routing, int max_active, int pairs, bool tail,
+                             const void* activation, float* out, cudaStream_t stream) {
     constexpr int block_bytes = ggml_cuda_type_traits<type>::bs;
     constexpr int qk          = ggml_cuda_type_traits<type>::qk;
-    if (max_active <= 0 || pairs <= 0 || max_columns <= 0 || row_bytes % block_bytes != 0 ||
+    if (max_active <= 0 || pairs <= 0 || row_bytes % block_bytes != 0 ||
         row_bytes < std::int64_t(k / qk) * block_bytes) {
         throw std::invalid_argument("gguf moe matrix product: invalid geometry");
     }
@@ -264,16 +274,16 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
     switch (launch.J) {
     case 16:
         return launch_moe_matrix<type, 16>(launch, experts, stride_row, rows, k, routing,
-                                           max_active, pairs, max_columns, y, out, stream);
+                                           max_active, pairs, y, out, stream);
     case 32:
         return launch_moe_matrix<type, 32>(launch, experts, stride_row, rows, k, routing,
-                                           max_active, pairs, max_columns, y, out, stream);
+                                           max_active, pairs, y, out, stream);
     case 64:
         return launch_moe_matrix<type, 64>(launch, experts, stride_row, rows, k, routing,
-                                           max_active, pairs, max_columns, y, out, stream);
+                                           max_active, pairs, y, out, stream);
     case 128:
         return launch_moe_matrix<type, 128>(launch, experts, stride_row, rows, k, routing,
-                                            max_active, pairs, max_columns, y, out, stream);
+                                            max_active, pairs, y, out, stream);
     default:
         break;
     }
@@ -290,4 +300,4 @@ void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes,
     template bool ninfer::ops::gguf::detail::moe_matrix_fits_impl<TYPE>(int, int, bool);           \
     template void ninfer::ops::gguf::detail::moe_matrix_product_impl<TYPE>(                        \
         const void* const*, std::int64_t, int, int, const ninfer::ops::gguf::MoeRouting&, int,     \
-        int, int, bool, const void*, float*, cudaStream_t)
+        int, bool, const void*, float*, cudaStream_t)

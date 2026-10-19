@@ -179,6 +179,68 @@ public:
         if (std::get<MoeConfig>(model_.config().text.ffn).num_experts_per_tok != 8) {
             throw std::invalid_argument("SparseMoe implements top-8 routing");
         }
+        if (moe.delivery_layer) {
+            const auto& source = model_.expert_sources().layers.at(*moe.delivery_layer);
+            const std::array router{model_.input(moe.router), model_.input(moe.shared_score)};
+            ops::SparseMoeWeights out;
+            out.router_shared_gate = ops::prepare_linear_weight(router).weight;
+            out.shared_gate_up = ops::prepare_linear_swiglu_weight(
+                model_.input(moe.shared.gate), model_.input(moe.shared.up)).weight;
+            out.shared_down = ops::prepare_linear_weight(model_.input(moe.shared.down)).weight;
+            out.routed_gate_up.qtype = source.gate_up.format;
+            out.routed_down.qtype = source.down.format;
+            const auto gu = out.routed_gate_up.qtype, down = out.routed_down.qtype;
+            const bool grouped = out.shared_gate_up.qtype == QType::Q8_G32_FP16 &&
+                                  out.shared_down.qtype == QType::Q8_G32_FP16 &&
+                ((gu == QType::Q4_G64_FP16 &&
+                  (down == QType::Q5_G64_FP16 || down == QType::Q6_G64_FP16)) ||
+                 (gu == QType::Q8_G32_FP16 && down == QType::Q8_G32_FP16));
+            const bool nvfp4 = gu == QType::NVFP4 && down == QType::NVFP4 &&
+                                out.shared_gate_up.qtype == QType::NVFP4 &&
+                                out.shared_down.qtype == QType::NVFP4;
+            if ((!grouped && !nvfp4) || out.router_shared_gate.qtype != QType::BF16 ||
+                out.router_shared_gate.n != 257 || out.router_shared_gate.k != 2048 ||
+                moe.experts.size() != 256 || out.shared_gate_up.n != 1024 ||
+                out.shared_gate_up.k != 2048 || out.shared_down.n != 2048 ||
+                out.shared_down.k != 512) {
+                throw std::invalid_argument("streamed SparseMoe native geometry/profile differs");
+            }
+            if (nvfp4) {
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
+                throw std::invalid_argument("SparseMoe NVFP4 expert banks need an sm_120a build");
+#endif
+                std::optional<float> activation_divisor, down_divisor;
+                for (const auto& e : moe.experts) {
+                    for (const auto id : {e.gate, e.up, e.down}) {
+                        const auto& uses = model_.weight(id).uses;
+                        if (uses.size() != 1 || uses[0].policy != ops::LinearPolicy::AllowA4 ||
+                            !uses[0].activation_input_divisor) {
+                            throw std::invalid_argument("streamed NVFP4 experts require AllowA4");
+                        }
+                        if (id == e.down) {
+                            if (!down_divisor) { down_divisor = uses[0].activation_input_divisor; }
+                            if (down_divisor != uses[0].activation_input_divisor) {
+                                throw std::invalid_argument("streamed NVFP4 down activation divisors differ");
+                            }
+                            continue;
+                        }
+                        if (!activation_divisor) { activation_divisor = uses[0].activation_input_divisor; }
+                        if (activation_divisor != uses[0].activation_input_divisor) {
+                            throw std::invalid_argument("streamed NVFP4 gate/up activation divisors differ");
+                        }
+                    }
+                }
+                out.routed_gate_up.input_scale_divisor = *activation_divisor;
+                out.routed_down.input_scale_divisor = *down_divisor;
+                if (model_.input(moe.shared.gate).policy != ops::LinearPolicy::AllowA4 ||
+                    model_.input(moe.shared.up).policy != ops::LinearPolicy::AllowA4 ||
+                    model_.input(moe.shared.down).policy != ops::LinearPolicy::AllowA4 ||
+                    *activation_divisor != out.shared_gate_up.input_scale_divisor) {
+                    throw std::invalid_argument("streamed NVFP4 shared activation profile differs");
+                }
+            }
+            return StreamedMoeParameters{out, *moe.delivery_layer};
+        }
         std::vector<ops::WeightInput> gate_up, down;
         gate_up.reserve(2 * moe.experts.size());
         down.reserve(moe.experts.size());

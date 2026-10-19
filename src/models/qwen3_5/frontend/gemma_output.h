@@ -6,6 +6,7 @@
 
 #include "ninfer/types.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -33,10 +34,18 @@ struct GemmaMarkers {
 inline constexpr std::string_view kGemmaCallOpen  = "<|tool_call>";
 inline constexpr std::string_view kGemmaCallClose = "<tool_call|>";
 inline constexpr std::string_view kGemmaQuote     = "<|\"|>";
+// A call's text between the markers is `call:NAME{...}`: the name follows kGemmaCallHead and the
+// argument object opens with kGemmaArgumentsOpen.
+inline constexpr std::string_view kGemmaCallHead      = "call:";
+inline constexpr std::string_view kGemmaArgumentsOpen = "{";
 
 // Pulls Gemma tool calls out of the content stream: text outside calls is published as it
 // arrives (a possible opener's prefix is held back), each complete call becomes a structured
 // call with JSON arguments. An unterminated or unreadable call returns to content at the end.
+//
+// A forced call is one the prompt already opened: it ends with `<|tool_call>call:NAME{`, so
+// generation resumes inside the call's arguments and the decoder starts in that call. The model
+// never emits those bytes, so they join the call but never the content a failed call returns.
 class GemmaToolCallDecoder {
 public:
     struct Terminal {
@@ -45,13 +54,19 @@ public:
         ToolCallParseDiagnostics diagnostics;
     };
 
+    // `forced_tool_name` is the function the prompt's opener names; empty when the model chooses.
+    explicit GemmaToolCallDecoder(std::string_view forced_tool_name = {});
+
     [[nodiscard]] std::string feed(std::string_view text);
     [[nodiscard]] Terminal finish();
 
 private:
     std::string pending_;
     std::string region_;
-    bool in_call_ = false;
+    // Bytes at the head of region_ that came from the prompt rather than from the model; non-zero
+    // only while the region being read is the forced call.
+    std::size_t seeded_bytes_ = 0;
+    bool in_call_             = false;
     std::vector<GeneratedToolCall> calls_;
     ToolCallParseDiagnostics diagnostics_;
 };

@@ -268,6 +268,13 @@ policy, template instantiation, and launch-error handling. Launcher headers are 
 contract headers, models, product code, permanent tests, and public benchmarks do not include
 them.
 
+A launch with more than 48 KiB of dynamic shared memory first calls
+`raise_dynamic_shared_memory(kernel, bytes)` (`src/core/device.h`), in the function that launches
+the kernel or in a helper templated on the kernel pointer. CUDA 13's nvcc gives every translation
+unit its own copy of a template kernel, each with its own attributes. The pointer that raises the
+limit must therefore be the pointer the launch uses. A once-only flag keyed by a type or held in a
+header's function-local static raises the limit of one copy only.
+
 ### 4.3 Kernel and common facilities
 
 The kernel layer owns `__global__` functions and Op-local `__device__` computation. A kernel may

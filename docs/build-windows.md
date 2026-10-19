@@ -2,21 +2,25 @@
 
 Native Windows builds run the same engine as Linux: one model per server with concurrent
 requests, the context cache, speculative decoding, Vision, and the OpenAI, Anthropic and llama.cpp
-APIs. Pipeline stages over several GPUs (`--devices` with distinct ids) are Linux-only. The
+APIs, and pipeline stages over several GPUs (`--devices`), which exchange their boundary rows
+through pinned host memory under WDDM ([pipeline stages](maintainer/pipeline-stages.md)). The
 README inside a release archive is [`release-archive-windows.md`](release-archive-windows.md);
 this guide is for a checkout.
 
-**Status.** The last full native build and test run was in September 2026: all targets built on
-an RTX 3090 host with Visual Studio 2022 BuildTools (MSVC v143) and CUDA 12.8, and the test suite
-passed. This repository has no Windows test host and CI does not build Windows, so later changes
-are verified on Linux only; the Windows-only build options below compile against Windows headers
-and have not been run.
+**Status.** The last full native build and test run was in October 2026: every target of a `75`
+build and of an `86` build with Visual Studio 2022 (MSVC 14.44) and CUDA 12.8, the test suite on a
+TITAN RTX (TCC, and WDDM for the virtual-memory tests) and an RTX 3060 (WDDM), run by a contributor.
+This repository has no Windows test host. CI compiles the host code of every translation unit with
+MSVC 14.44 for `70` (CUDA 12.9), `75`, `80`, `86`, `89` and `120a` (CUDA 13.4) on each change
+to the build inputs (`scripts/check-host-compile.py`), but builds no device code and runs nothing
+on Windows; the Windows-only build option below compiles against Windows headers and has not been
+run.
 
 ## Requirements
 
 - Windows 11 x64 and a recent NVIDIA driver;
-- Visual Studio 2022 (MSVC v143) with CUDA 12.8 or newer for `86` and `89`, or Visual Studio 2026
-  with CUDA 13.1 or newer for `120a`;
+- Visual Studio 2022 (MSVC v143) with CUDA 12.8 or newer for `75`, `86` and `89`, or Visual Studio
+  2026 with CUDA 13.1 or newer for `120a`;
 - CMake, Ninja and [vcpkg](https://github.com/microsoft/vcpkg), which provides FFmpeg and curl
   through `vcpkg.json`;
 - the Microsoft Visual C++ runtime to run the executables, and a `.ninfer` artifact.
@@ -36,7 +40,7 @@ Ninja generator, and builds into `build-ninja`:
 .\scripts\build.ps1                       # configure and build
 .\scripts\build.ps1 -Test                 # then run the test suite
 .\scripts\build.ps1 -Target ninfer-serve  # one target
-.\scripts\build.ps1 -Arch 89              # another architecture (80, 86 or 89)
+.\scripts\build.ps1 -Arch 89              # another architecture (75, 80, 86 or 89)
 ```
 
 The same build by hand:
@@ -63,11 +67,14 @@ repository root: `nvcc` writes `.exp` and `.lib` files next to the output.
 Windows builds differ from Linux builds in three places: they decode PNG images natively (a
 prebuilt FFmpeg tree may have no PNG decoder), they pass the NVFP4 TMA descriptors through device
 memory, since MSVC cannot pass them by value, and WDDM charges pinned host memory against the
-card's memory. The Windows-only options, both untested:
+card's memory. Every Windows build offers `--wddm-evictable-budget`, which sizes the KV cache against
+the card's memory less the weights and a 512 MiB desktop floor instead of what is free at startup,
+and commits the device arenas at startup. Another process that later takes memory makes WDDM page
+some of this process's memory out, which slows generation until it comes back. The Windows-only
+build option, untested:
 
 | option | effect |
 |---|---|
-| `NINFER_D3D12_RESIDENCY=ON` | `--wddm-evictable-budget`: device arenas from a D3D12 heap held resident at maximum priority |
 | `NINFER_DIRECTSTORAGE=ON` | fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
 
 The other build options are in the [Linux guide](build-linux.md#build-options).
@@ -78,7 +85,7 @@ The other build options are in the [Linux guide](build-linux.md#build-options).
 its size and SHA-256 (`qwen36-27b` and `qwen36-35b-a3b` work the same way), and
 `scripts\run.bat qwen38-27b` serves it with the measured profile; the profiles and their overrides
 are in [launcher profiles](maintainer/launcher-profiles.md). Any other artifact starts with
-`ninfer-serve.exe` and the flags the [README](../README.md#running) gives for it, for example:
+`ninfer-serve.exe` and the flags the [launch recipes](recipes.md) give for it, for example:
 
 ```powershell
 .\build-ninja\apps\ninfer-serve.exe models\qwen3_8_27b.ninfer --model-id qwen3.8-27b `

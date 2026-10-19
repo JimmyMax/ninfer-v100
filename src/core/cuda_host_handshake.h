@@ -3,6 +3,7 @@
 #include "core/device.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <optional>
 
 namespace ninfer {
@@ -34,6 +35,7 @@ public:
     void completed(std::uint32_t sequence) noexcept;
     [[nodiscard]] bool retired(std::uint32_t sequence) const noexcept;
     void release(std::uint32_t sequence) noexcept;
+    [[nodiscard]] std::size_t pinned_bytes() const noexcept;
 
 private:
     void* host_ = nullptr;

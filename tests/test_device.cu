@@ -1,13 +1,17 @@
 #include "core/device.h"
 #include "cuda_availability.h"
+#include "ops/common/device_tier.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -24,6 +28,81 @@ int expect_throws_device(int device_id) {
     } catch (const std::runtime_error&) { return 0; }
     std::cerr << "DeviceContext(" << device_id << ") did not throw\n";
     return 1;
+}
+
+__global__ void store_one(int* value) { *value = 1; }
+
+// Whether this binary's code runs on `device`, by launching a kernel there.
+bool kernel_runs_on(int device) {
+    CUDA_CHECK(cudaSetDevice(device));
+    int* value = nullptr;
+    CUDA_CHECK(cudaMalloc(&value, sizeof(int)));
+    store_one<<<1, 1>>>(value);
+    const cudaError_t launched = cudaGetLastError();
+    const cudaError_t finished = launched == cudaSuccess ? cudaDeviceSynchronize() : launched;
+    CUDA_CHECK(cudaFree(value));
+    return launched == cudaSuccess && finished == cudaSuccess;
+}
+
+// The code tier each device runs: the newest tier this build carries that the device's compute
+// capability reaches, since CUDA loads the newest image a card can run. The current-device
+// predicates and the shape set follow it.
+int check_tiers(int count) {
+    namespace ops = ninfer::ops;
+    using ops::DeviceTier;
+    for (int id = 0; id < count; ++id) {
+        if (!kernel_runs_on(id)) { continue; }
+        cudaDeviceProp props{};
+        CUDA_CHECK(cudaGetDeviceProperties(&props, id));
+        const int capability      = props.major * 10 + props.minor;
+        const DeviceTier expected = ops::kBuildBlackwell && capability >= 120
+                                        ? DeviceTier::Blackwell
+                                    : ops::kBuildAmpere && capability >= 80 ? DeviceTier::Ampere
+                                    : ops::kBuildTuring && capability >= 75 ? DeviceTier::Turing
+                                                                            : DeviceTier::Volta;
+        if (ops::device_tier(id) != expected) {
+            std::cerr << "CUDA device " << id << " (" << props.name << ")\n";
+            return fail("a device runs another tier than its compute capability selects");
+        }
+        CUDA_CHECK(cudaSetDevice(id));
+        if (ops::current_device_tier() != expected ||
+            ops::current_device_volta() != (expected == DeviceTier::Volta) ||
+            ops::current_device_turing() != (expected == DeviceTier::Turing) ||
+            ops::current_device_blackwell() != (expected == DeviceTier::Blackwell) ||
+            ops::turing_shapes_here() != (expected == DeviceTier::Turing)) {
+            return fail("the current-device tier predicates disagree with the device's tier");
+        }
+    }
+    return 0;
+}
+
+// Every visible device in one context: it opens exactly when the build's code runs on each of
+// them, whatever their compute capabilities, and each rank reports its own device's.
+int check_all_devices(int count) {
+    const int ranks = std::min<int>(count, int(ninfer::kMaxRanks));
+    std::vector<int> ids(std::size_t(ranks), 0);
+    bool runs = true;
+    for (int id = 0; id < ranks; ++id) {
+        ids[std::size_t(id)] = id;
+        runs                 = kernel_runs_on(id) && runs;
+    }
+    try {
+        const ninfer::DeviceContext all{std::span<const int>(ids)};
+        if (!runs) { return fail("a context opened on a device this build cannot run"); }
+        for (int id = 0; id < ranks; ++id) {
+            cudaDeviceProp props{};
+            CUDA_CHECK(cudaGetDeviceProperties(&props, id));
+            if (all.rank(std::size_t(id)).compute_capability() != props.major * 10 + props.minor) {
+                return fail("a rank reports another device's compute capability");
+            }
+        }
+    } catch (const std::invalid_argument& error) {
+        if (runs) {
+            std::cerr << error.what() << '\n';
+            return fail("devices this build runs on were refused together");
+        }
+    }
+    return 0;
 }
 
 int check_context(const ninfer::DeviceContext& ctx, const char* label) {
@@ -131,6 +210,10 @@ int main(int argc, char** argv) {
         ++failures;
         std::cerr << "timer elapsed time was negative\n";
     }
+
+    // Last: they switch the calling thread's current device.
+    failures += check_tiers(count);
+    if (count > 1) { failures += check_all_devices(count); }
 
     return failures == 0 ? 0 : fail("device test failed");
 }

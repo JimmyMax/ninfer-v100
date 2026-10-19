@@ -149,8 +149,10 @@ OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body
                         field);
         }
     };
-    require_string_hint("prompt_cache_key", 64U);
-    require_string_hint("safety_identifier", 64U);
+    // The Responses parser allows the longer context-cache session key, so a gateway that
+    // namespaces keys per user is not refused.
+    require_string_hint("prompt_cache_key", ninfer::kMaximumContextCacheSessionKeyBytes);
+    require_string_hint("safety_identifier", 128U);
     require_string_hint("user");
 
     if (body.contains("prompt_cache_retention") && !body.at("prompt_cache_retention").is_null()) {

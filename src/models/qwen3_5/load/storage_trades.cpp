@@ -3,12 +3,14 @@
 #include "artifact/permute_fp8_qpn.h"    // 本仓库 V100 增量：FP8 QPN 加载时重排
 #include "artifact/permute_nvfp4_qpn.h" // 本仓库 V100 增量：NVFP4 QPN 加载时重排
 #include "artifact/permute_row_split.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // 本仓库 V100 增量：加载时预留 GDN 输入投影的 FP16 激活暂存区（图捕获之前）。
 #    include "ops/linear/fp8/fp8_launch.h"
 #endif
 
+#include <span>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <variant>
 
@@ -62,8 +64,14 @@ void apply_storage_trades(Bindings& bindings, const Config& config, const ModelW
     }
 }
 
-void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
-#if defined(NINFER_SM70)
+void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
+                          std::span<const ops::DeviceTier> rank_tiers) {
+    if constexpr (!ops::kBuildVolta) {
+        (void)bindings;
+        (void)weights;
+        (void)rank_tiers;
+        return;
+    }
     // 本仓库 V100 增量：GDN 输入投影的 QPN 路线需要一块固定 FP16 激活暂存区（320 KiB）。
     // 它不向 arena 记账，所以在**这里**（模型加载、任何 CUDA graph 捕获之前）预留一次，
     // 运行期只读指针；捕获中绝不 cudaMalloc（否则捕获被 cudaErrorStreamCaptureInvalidated
@@ -73,9 +81,16 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
     // one 128-byte line holds a k-group's records of four rows: row-major records cost the decode
     // reads 10 to 40% of the card's bandwidth. The text layers' attention, GDN and dense MLP
     // projections and the MTP input projection take it in the formats those routes read in every
-    // Op that consumes them (T2, Q2, Q4, Q5, Q6; Q8 also reaches an Op without them). Experts,
-    // heads, embeddings, the MTP attention and drafter weights keep the stored layout, and so does
-    // an object another parameter also binds.
+    // Op that consumes them (T2, Q2, Q4, Q5, Q6; Q8 also reaches an Op without them), on a rank
+    // whose device runs Volta's code. Experts, heads, embeddings, the MTP attention and drafter
+    // weights keep the stored layout, and so does an object another parameter also binds.
+    const auto volta_rank = [&](std::size_t rank) {
+        if (rank >= rank_tiers.size()) {
+            throw std::logic_error("device layouts: no device tier for pipeline rank " +
+                                   std::to_string(rank));
+        }
+        return rank_tiers[rank] == ops::DeviceTier::Volta;
+    };
     std::vector<bool> selected(bindings.weights.size(), false);
     std::vector<WeightId> projections;
     const auto take = [&](WeightId id) {
@@ -123,7 +138,10 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
     }
     for (const WeightId id : projections) {
         const auto& parameter = bindings.at(id);
-        if (parameter.reference.residency != artifact::Residency::Device) { continue; }
+        if (parameter.reference.residency != artifact::Residency::Device ||
+            !volta_rank(bindings.weights.at(id.index).rank)) {
+            continue;
+        }
         for (const auto& part : parameter.reference.binding.parts) {
             const auto& geometry = bindings.binder.reader().geometry(part.object);
             const bool format =
@@ -173,10 +191,6 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights) {
             }
         }
     }
-#else
-    (void)bindings;
-    (void)weights;
-#endif
 }
 
 } // namespace ninfer::models::qwen3_5::loading

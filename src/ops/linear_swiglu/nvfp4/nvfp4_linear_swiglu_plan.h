@@ -4,7 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/linear/nvfp4/nvfp4_launch.h" // 本仓库 V100 增量：QPN 常量与声明
 #endif
 
@@ -30,7 +30,7 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream);
 
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // 本仓库 V100 增量（docs/v100/PLAN.md）：fork 的 Volta QPN 融合 SwiGLU。
 // 权重是 artifact 原样的 gate_up (34816 x k)；输出是 silu(gate) * up 的 (t, 17408)。
 void nvfp4_linear_swiglu_volta_qpn_launch(const Tensor& x, const Weight& weight, Tensor& out,

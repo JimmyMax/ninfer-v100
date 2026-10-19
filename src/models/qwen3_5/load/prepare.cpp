@@ -4,6 +4,9 @@
 #include "artifact/views.h"
 
 #include <cmath>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::loading {
@@ -43,6 +46,28 @@ bool keeps_permission(const artifact::Reader& reader, const artifact::ParameterR
 
 } // namespace
 #endif
+
+void apply_rank_policies(Bindings& bindings, std::span<const ops::DeviceTier> rank_tiers) {
+    // A build without 120a narrowed these permissions when it bound the weights.
+    if constexpr (!ops::kBuildBlackwell) {
+        (void)bindings;
+        (void)rank_tiers;
+        return;
+    }
+    for (PendingWeight& weight : bindings.weights) {
+        if (weight.rank >= rank_tiers.size()) {
+            throw std::logic_error("rank policies: no device tier for pipeline rank " +
+                                   std::to_string(weight.rank));
+        }
+        if (rank_tiers[weight.rank] == ops::DeviceTier::Blackwell) { continue; }
+        for (WeightUse& use : weight.uses) {
+            if (use.policy == ops::LinearPolicy::AllowA8 ||
+                use.policy == ops::LinearPolicy::AllowA4) {
+                use.policy = ops::LinearPolicy::A16Only;
+            }
+        }
+    }
+}
 
 WeightUseId Bindings::use(WeightId id, std::string_view input) const {
     const auto& parameter = at(id);
@@ -204,12 +229,10 @@ void Bindings::place(WeightId id, std::size_t rank) {
     // Rank 0 is recorded too, so an object shared between a rank-0 layer and a later stage's layer
     // is refused as a conflicting placement instead of silently living on one of them.
     const auto& parameter = at(id);
-    if (parameter.reference.residency != artifact::Residency::Device) {
-        throw artifact::ArtifactError(parameter.reference.name +
-                                      ": only a device parameter can be offloaded to another GPU");
-    }
-    for (const auto& part : parameter.reference.binding.parts) {
-        binder.device_rank(part.object, rank);
+    if (parameter.reference.residency == artifact::Residency::Device) {
+        for (const auto& part : parameter.reference.binding.parts) {
+            binder.device_rank(part.object, rank);
+        }
     }
     weights.at(id.index).rank = rank;
 }
@@ -237,7 +260,11 @@ std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
     std::vector<BoundWeight> out;
     out.reserve(pending.size());
     for (auto& item : pending) {
-        auto view = artifact::bind_view(item.reference, materialized);
+        // Disk expert parameters retain geometry in NativeExpertSources. They have no resident
+        // WeightInput and are never passed to a resident Op preparation routine.
+        auto view = item.reference.residency == artifact::Residency::Values
+                        ? WeightView{item.reference.shape, {}}
+                        : artifact::bind_view(item.reference, materialized);
         out.push_back({std::move(item.reference.name), std::move(item.source_objects),
                        std::move(view), std::move(item.uses), item.rank});
     }

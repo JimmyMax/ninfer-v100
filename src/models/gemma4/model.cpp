@@ -6,6 +6,7 @@
 #include "models/qwen3_5/load/bindings.h"
 
 #include <stdexcept>
+#include <array>
 #include <string>
 #include <utility>
 
@@ -48,6 +49,52 @@ void tail(Bindings& b, WeightId id) {
             b.binder.device_tail(part.object, kRowTail);
         }
     }
+}
+
+// Resolve stored GGUF rows directly. Disk mode validates without materializing the bank.
+// Host mode borrows the materializer's pinned parent. Neither path repacks model weights.
+std::vector<ExpertBlob> expert_blobs(const artifact::Reader& reader,
+                                    const artifact::ParameterReference& reference,
+                                    const artifact::MaterializedArtifact& backing,
+                                    std::uint64_t experts, std::uint64_t rows, std::uint64_t k,
+                                    QType& format, std::uint64_t& row_bytes) {
+    std::vector<ExpertBlob> result;
+    const auto& parts = reference.binding.parts;
+    if (parts.size() != 1) {
+        throw artifact::ArtifactError(reference.name + ": expert bank must be one stored region");
+    }
+    const auto& part = parts.front();
+    const auto& geometry = reader.geometry(part.object);
+    if (!is_gguf(geometry.format) || geometry.shape.size() != 2 || geometry.shape[1] != k ||
+        part.begin % k || part.end - part.begin != experts * rows * k) {
+        throw artifact::ArtifactError(reference.name + ": experts must be stored GGUF block rows");
+    }
+    format = geometry.format;
+    const auto block = gguf_block_shape(format);
+    if (k % block.elements) {
+        throw artifact::ArtifactError(reference.name + ": partial stored quantization block");
+    }
+    row_bytes = k / block.elements * block.bytes;
+    reader.validate_object(part.object);
+    const auto start = part.begin / k * row_bytes;
+    for (std::uint64_t e = 0; e < experts; ++e) {
+        ExpertBlob blob;
+        blob.bytes = rows * row_bytes;
+        blob.zero_tail = kRowTail;
+        const auto offset = start + e * blob.bytes;
+        if (reference.residency == artifact::Residency::Pinned) {
+            const auto* parent = backing.pinned_parent(part.object).data;
+            blob.pinned = parent + offset;
+            blob.pinned_region = reinterpret_cast<std::uintptr_t>(parent);
+        } else {
+            const auto logical = reader.directory().tensor(part.object).offset + offset;
+            for (const auto& segment : reader.segments(logical, blob.bytes)) {
+                blob.extents.push_back({segment.file_index, segment.file_offset, segment.bytes});
+            }
+        }
+        result.push_back(std::move(blob));
+    }
+    return result;
 }
 
 } // namespace
@@ -105,6 +152,11 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     artifact::Binder binder(reader);
     FrontendResources resources = bind_resources(binder, config, vision);
     Bindings b(binder);
+    const bool offload = options.experts != ExpertResidency::Device;
+    if (offload && !config.moe) {
+        throw artifact::ArtifactError("Gemma 4: expert residency requires an MoE model");
+    }
+    std::vector<std::array<artifact::ParameterReference, 2>> expert_references;
     const std::uint64_t h = config.hidden_size;
     TextWeights weights;
     weights.output_head = b.parameter("text/output_head", {config.vocab_size, h},
@@ -146,10 +198,27 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             moe.router        = b.direct(m + "router", {e, h}, QType::FP32);
             moe.router_scale  = b.direct(m + "router_scale", {h}, QType::FP32);
             moe.expert_scale  = b.direct(m + "expert_scale", {e}, QType::FP32);
-            moe.gate_up       = b.parameter(m + "gate_up", {e * 2 * w, h}, {m + "input"});
-            moe.down          = b.parameter(m + "down", {e * h, w}, {m + "product"});
-            tail(b, moe.down);
-            tail(b, moe.gate_up);
+            if (offload) {
+                const auto residency = options.experts == ExpertResidency::Host
+                                           ? artifact::Residency::Pinned : artifact::Residency::Values;
+                expert_references.push_back({
+                    binder.parameter(m + "gate_up", {e * 2 * w, h}, residency),
+                    binder.parameter(m + "down", {e * h, w}, residency)});
+                // Uses still belong to the family contract, even without a resident operand.
+                for (const auto& use : {std::pair{m + "gate_up", m + "input"},
+                                        std::pair{m + "down", m + "product"}}) {
+                    const auto& contract = binder.use(use.first, use.second);
+                    if (!contract.activation_policy || !contract.auxiliaries.empty()) {
+                        throw artifact::ArtifactError(use.first +
+                            ": streamed GGUF experts require an activation policy and no auxiliaries");
+                    }
+                }
+            } else {
+                moe.gate_up = b.parameter(m + "gate_up", {e * 2 * w, h}, {m + "input"});
+                moe.down = b.parameter(m + "down", {e * h, w}, {m + "product"});
+                tail(b, *moe.down);
+                tail(b, *moe.gate_up);
+            }
             layer.moe = moe;
         }
         weights.layers.push_back(std::move(layer));
@@ -253,11 +322,36 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     auto materialization = std::move(binder).finish();
     auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
-    return std::unique_ptr<Model>(new Model(std::move(config), std::move(weights),
+    std::vector<ExpertBanks> expert_banks;
+    for (const auto& reference : expert_references) {
+        ExpertBanks bank;
+        auto gu = expert_blobs(reader, reference[0], backing, config.num_experts,
+                               2 * config.moe_intermediate_size, h,
+                               bank.gate_up_type, bank.gate_up_row_bytes);
+        auto down = expert_blobs(reader, reference[1], backing, config.num_experts,
+                                 h, config.moe_intermediate_size,
+                                 bank.down_type, bank.down_row_bytes);
+        for (std::size_t e = 0; e < gu.size(); ++e) {
+            bank.delivery.experts.push_back({std::move(gu[e]), std::move(down[e])});
+        }
+        bank.delivery.aliases = {{0, 0}, {0, config.moe_intermediate_size * bank.gate_up_row_bytes},
+                                 {0, 0}, {1, 0}};
+        expert_banks.push_back(std::move(bank));
+    }
+    auto model = std::unique_ptr<Model>(new Model(std::move(config), std::move(weights),
                                             std::move(assistant_config), std::move(assistant),
                                             std::move(vision_parts), std::move(bound),
                                             std::move(resources), std::move(info),
                                             std::move(backing)));
+    model->expert_residency_ = options.experts;
+    model->expert_banks_ = std::move(expert_banks);
+    if (options.experts == ExpertResidency::Disk) {
+        for (const auto& file : reader.directory().files) {
+            model->expert_files_.push_back(file.path ? options.artifact.parent_path() / *file.path
+                                                     : options.artifact);
+        }
+    }
+    return model;
 }
 
 } // namespace ninfer::models::gemma4

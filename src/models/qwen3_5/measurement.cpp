@@ -48,6 +48,13 @@ std::string prefill_signature(const Model& model) {
             v.depth,      v.hidden_size,         v.intermediate_size,  v.num_heads,
             v.patch_size, v.temporal_patch_size, v.spatial_merge_size, v.num_position_embeddings};
     }
+    if (!model.expert_sources().layers.empty()) {
+        facts["expert_execution"] = {"native-streamed-grouped", model.options().expert_residency};
+        auto& sources = facts["streamed_expert_formats"] = Json::array();
+        for (const auto& layer : model.expert_sources().layers) {
+            sources.push_back({layer.gate_up.format, layer.down.format});
+        }
+    }
     std::vector<const BoundWeight*> weights;
     // PrefillWork prices primary Text/Vision reconstruction. The coefficients were measured
     // for that work; optional draft/proposal calls do not change the baseline's applicability.

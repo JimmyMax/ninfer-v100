@@ -11,6 +11,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "ops/common/device_tier.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -19,6 +20,7 @@
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
@@ -426,20 +428,22 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last,
                                  bool wide_verification = false) {
-        scratch(layout,
-                execution::rotated_workspace_bytes(
-                    p.hadamard_signs, p.weight.k, last,
-                    ops::linear_add_workspace_capacity_bytes(
-                        p.weight.qtype, p.weight.n, p.weight.k,
-                        execution::residual_projection_policy(p, wide_verification), first, last)));
+        // A round's narrower families may resolve the ordinary policy at the same columns.
+        const auto bytes = [&](bool wide) {
+            return execution::rotated_workspace_bytes(
+                p.hadamard_signs, p.weight.k, last,
+                ops::linear_add_workspace_capacity_bytes(
+                    p.weight.qtype, p.weight.n, p.weight.k,
+                    execution::residual_projection_policy(p, wide), first, last));
+        };
+        scratch(layout, wide_verification ? std::max(bytes(true), bytes(false)) : bytes(false));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
-        const bool wide_verification =
-            wide_residual_verification(phase, batch_size, min_width, max_width);
+        const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
         for (const auto& block : parameters.text.layers) {
             {
                 auto stage = layout.scope();
@@ -489,12 +493,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
-            scratch(layout,
-                    execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                   phase == TextPhase::Verify, wide_verification));
+            const bool verify = phase == TextPhase::Verify;
+            scratch(layout, std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false,
+                                                                    verify, wide_verification),
+                                     execution::ffn_workspace_bytes(block.ffn, first, last, false,
+                                                                    verify, false)));
         }
+        // A prompt chunk projects only its last column through the head; a verify round projects
+        // every column.
         if (!plan.causal_scoring) {
-            linear_scratch(layout, parameters.text.output_head, first, last);
+            const std::int32_t head_last = phase == TextPhase::Prefill ? 1 : last;
+            linear_scratch(layout, parameters.text.output_head, std::min(first, head_last),
+                           head_last);
         }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
@@ -973,6 +983,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
+    // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
+    // would put a weight-sized scratch into every round workspace and change decode numerics -- so
+    // the widest round sits at or below the floor no device profile moves its width gate past.
+    static_assert(kMaximumConcurrency * kMtpDecodeMaximumWidth <=
+                      static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens),
+                  "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size()) {
         throw std::invalid_argument("the model is split into " +
                                     std::to_string(parameters.text.rank_count) +
@@ -1040,12 +1057,26 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared
     // memory per SM. The occupancy and split-k choices are still the sm_86 ones, so the card is
     // supported here in the sense of running correctly, not of being tuned for. 7.0 (Tesla V100)
-    // runs only a build for it, whose kernels emulate the Ampere warp primitives.
-    if (device.compute_capability() != 70 && device.compute_capability() != 80 &&
-        device.compute_capability() != 86 && device.compute_capability() != 89 &&
-        device.compute_capability() != 120) {
-        throw std::invalid_argument(
-            "Qwen3.5 family runtime requires compute capability 7.0, 8.0, 8.6, 8.9 or 12.0");
+    // runs Volta's code, whose kernels emulate the Ampere warp primitives. 7.5 needs Turing's code
+    // (a build with 75 among its architectures), whose kernels avoid the sm_80 instructions and fit
+    // its 64 KiB of shared memory.
+    // Every rank is checked: pipeline stages may mix capabilities (core/device.cu).
+    for (std::size_t rank = 0; rank < device.size(); ++rank) {
+        const RankContext& context = device.rank(rank);
+        const int capability       = context.compute_capability();
+        if (capability == 70 || capability == 80 || capability == 86 || capability == 89 ||
+            capability == 120 ||
+            (capability == 75 && ops::device_tier(context.device) == ops::DeviceTier::Turing)) {
+            continue;
+        }
+        std::string message =
+            "Qwen3.5 family runtime requires compute capability 7.0, 7.5, 8.0, 8.6, 8.9 or 12.0 "
+            "(7.5 needs a build with 75 among CMAKE_CUDA_ARCHITECTURES)";
+        if (device.model_parallel()) {
+            message += "; CUDA device " + std::to_string(context.device) + " has " +
+                       std::to_string(capability / 10) + "." + std::to_string(capability % 10);
+        }
+        throw std::invalid_argument(message);
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
@@ -1086,6 +1117,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->rope_yarn           = inputs.rope_yarn;
     impl->mtp_attention_window = inputs.mtp_attention_window;
     impl->features            = inputs.features;
+    impl->expert_cache_bytes  = inputs.expert_cache_bytes;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->structured_output   = inputs.structured_output;
@@ -1374,6 +1406,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .rope_yarn                  = planned_rope_yarn(parameters, options),
         .mtp_attention_window       = options.speculative.mtp_attention_window,
         .features                   = models::load_options(options),
+        .expert_cache_bytes         = options.expert_cache_bytes,
         .use_cuda_graph             = options.use_cuda_graph,
         .cuda_graph_allowance_bytes = options.cuda_graph_allowance_bytes,
         .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,

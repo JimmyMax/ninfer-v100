@@ -40,8 +40,6 @@ Built and kept experimental, not published:
 
 - the native Q2 recipe (`qwen3_8_flash_next_gsq_q2`): +0.26% held-out perplexity against the GGUF
   artifact and slower scoring;
-- a CPU share of the missing host experts (`--expert-dma-share` below 1): much slower than copying
-  them to the GPU and not numerically qualified;
 - the HF-source Q4/Q5 recipe (`qwen3_8_flash_next`), whose full-model quality is unmeasured, and the
   FP8 n-gram table, rejected for its 80% larger rows.
 

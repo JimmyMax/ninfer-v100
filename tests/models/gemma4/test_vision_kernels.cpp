@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 #include <cstdint>
 #include <iostream>
 #include <random>
@@ -223,7 +224,9 @@ void test_geglu(std::mt19937& rng) {
             const double g = gu[std::size_t(p) * 2 * kWidth + i];
             const double u = gu[std::size_t(p) * 2 * kWidth + kWidth + i];
             const double want =
-                0.5 * g * (1.0 + std::tanh(std::sqrt(2.0 / M_PI) * (g + 0.044715 * g * g * g))) * u;
+                0.5 * g *
+                (1.0 + std::tanh(std::sqrt(2.0 / std::numbers::pi) * (g + 0.044715 * g * g * g))) *
+                u;
             ok &= near_bf16(f(mid[std::size_t(p) * kWidth + i]), want);
         }
     }

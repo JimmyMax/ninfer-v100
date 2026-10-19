@@ -150,11 +150,17 @@ void dequantized_product(GgmlType type, const void* weight, std::int64_t row_byt
 
 // The pairs grouped by expert: `sorted` lists the pairs of expert e at [bounds[e], bounds[e + 1]),
 // and `active` the `*active_count` experts that have any, ascending. Device arrays.
+// moe_sort_routes also lists the matrix kernel's work for each of its column tile widths
+// (16, 32, 64 and 128 pairs, list w for width 16 << w): every (expert, column tile) that holds a
+// pair, expert | tile << 16, ascending, `tile_count[w]` of them at tiles + w * tile_capacity.
 struct MoeRouting {
     const std::int32_t* bounds       = nullptr; // [experts + 1]
     const std::int32_t* sorted       = nullptr; // [pairs]
     const std::int32_t* active       = nullptr; // [experts]
     const std::int32_t* active_count = nullptr; // [1]
+    const std::int32_t* tile_count   = nullptr; // [4]
+    const std::int32_t* tiles        = nullptr; // [4][tile_capacity]
+    int tile_capacity                = 0;
 };
 
 [[nodiscard]] std::size_t moe_routing_bytes(int experts, int pairs);
@@ -295,16 +301,17 @@ void moe_decode_down(GgmlType type, const MoeDecodeDownArgs& args, int chunk, cu
 
 // The matrix kernel over the experts a router selected, for products wide enough for its tiles:
 // pair p's FP32 row lands at out[p * table.rows]. The activation holds the pairs' columns in
-// routing order (quantize_moe_matrix_activation into moe_matrix_activation_bytes), and
-// `max_columns` bounds any one expert's pairs. The kernel reads k in whole 256-value steps: a
+// routing order (quantize_moe_matrix_activation into moe_matrix_activation_bytes); `routing` comes
+// from moe_sort_routes over the same pairs, and `max_active` bounds its active experts. One CTA
+// runs per row tile and listed column tile. The kernel reads k in whole 256-value steps: a
 // geometry whose k is not a whole number of them needs `tail`, the caller's promise that zeros
 // follow each bank's last expert (Binder::device_tail, a zeroed slot pool), since a row's last
 // step reads into the next row. A type without an integer kernel, or a geometry no tile fits
 // (rows a whole number of row tiles), is not supported and stays on moe_vector_product.
 [[nodiscard]] bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail);
 void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
-                        int max_active, int pairs, int max_columns, bool tail,
-                        const void* activation, float* out, cudaStream_t stream);
+                        int max_active, int pairs, bool tail, const void* activation, float* out,
+                        cudaStream_t stream);
 // Column c of the activation is x column routing.sorted[c] / column_group, in the layout of the
 // type's scale/sum schedule (matrix_activation_layout), zero past k up to a whole 256-value step.
 [[nodiscard]] std::size_t moe_matrix_activation_bytes(int k, int pairs);

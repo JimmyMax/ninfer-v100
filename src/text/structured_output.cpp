@@ -6,7 +6,9 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -208,9 +210,54 @@ void schema_check(const Json& s) {
         }
     }
 }
+
+// An EBNF string literal of `text`: the grammar parser reads UTF-8 as is, so only the quote, the
+// backslash and control bytes are escaped.
+std::string ebnf_literal(std::string_view text) {
+    std::string out = "\"";
+    for (const char ch : text) {
+        const auto byte = static_cast<unsigned char>(ch);
+        if (ch == '"' || ch == '\\') {
+            out += '\\';
+            out += ch;
+        } else if (byte < 0x20 || byte == 0x7f) {
+            char escape[5];
+            std::snprintf(escape, sizeof(escape), "\\x%02x", byte);
+            out += escape;
+        } else {
+            out += ch;
+        }
+    }
+    return out + "\"";
+}
+
+// The grammar of a Choice: the response is exactly one of the strings.
+std::string choice_grammar(const std::vector<std::string>& choices) {
+    std::string ebnf = "root ::= ";
+    for (std::size_t index = 0; index < choices.size(); ++index) {
+        if (index != 0) { ebnf += " | "; }
+        ebnf += ebnf_literal(choices[index]);
+    }
+    return ebnf;
+}
+
+const char* kind_name(StructuredOutputKind kind) {
+    switch (kind) {
+    case StructuredOutputKind::Regex:
+        return "regex";
+    case StructuredOutputKind::Choice:
+        return "choices";
+    case StructuredOutputKind::Grammar:
+        return "grammar";
+    default:
+        return "JSON schema";
+    }
+}
 } // namespace
 
 void validate_structured_output(const StructuredOutputOptions& options) {
+    const bool text_grammar = options.kind == StructuredOutputKind::Regex ||
+                              options.kind == StructuredOutputKind::Grammar;
     if (options.kind == StructuredOutputKind::JsonSchema) {
         try {
             const auto normalized_schema = normalize_json_schema(options.schema);
@@ -222,6 +269,33 @@ void validate_structured_output(const StructuredOutputOptions& options) {
     } else if (!options.schema.empty()) {
         throw std::invalid_argument("schema requires JsonSchema mode");
     }
+    if (text_grammar) {
+        if (options.grammar.empty()) {
+            throw std::invalid_argument(std::string(kind_name(options.kind)) + " is empty");
+        }
+        // Parsing needs no vocabulary, so a malformed constraint fails before admission.
+        try {
+            if (options.kind == StructuredOutputKind::Regex) {
+                (void)xgrammar::Grammar::FromRegex(options.grammar);
+            } else {
+                (void)xgrammar::Grammar::FromEBNF(options.grammar, "root");
+            }
+        } catch (const std::exception& e) {
+            throw std::invalid_argument(std::string("invalid ") + kind_name(options.kind) + ": " +
+                                        e.what());
+        }
+    } else if (!options.grammar.empty()) {
+        throw std::invalid_argument("grammar text requires Regex or Grammar mode");
+    }
+    if (options.kind == StructuredOutputKind::Choice) {
+        if (options.choices.empty()) { throw std::invalid_argument("choices are empty"); }
+        if (std::any_of(options.choices.begin(), options.choices.end(),
+                        [](const std::string& choice) { return choice.empty(); })) {
+            throw std::invalid_argument("a choice is empty");
+        }
+    } else if (!options.choices.empty()) {
+        throw std::invalid_argument("choices require Choice mode");
+    }
 }
 
 struct GrammarState::Impl {
@@ -229,16 +303,14 @@ struct GrammarState::Impl {
     int vocab_size;
     std::shared_ptr<const std::vector<std::string>> vocabulary;
     std::shared_ptr<const std::vector<std::uint8_t>> stops;
-    std::size_t longest_token = 0; // bytes
     std::unique_ptr<StringConstraintState> strings;
 
     Impl(xgrammar::GrammarMatcher matcher, int vocab_size,
          std::shared_ptr<const std::vector<std::string>> vocabulary,
-         std::shared_ptr<const std::vector<std::uint8_t>> stops, std::size_t longest_token,
+         std::shared_ptr<const std::vector<std::uint8_t>> stops,
          std::unique_ptr<StringConstraintState> strings)
-        : matcher(std::move(matcher)), vocab_size(vocab_size),
-          vocabulary(std::move(vocabulary)), stops(std::move(stops)), longest_token(longest_token),
-          strings(std::move(strings)) {}
+        : matcher(std::move(matcher)), vocab_size(vocab_size), vocabulary(std::move(vocabulary)),
+          stops(std::move(stops)), strings(std::move(strings)) {}
     std::string_view semantic_bytes(TokenId token) const {
         return (*stops)[token] ? std::string_view{} : std::string_view((*vocabulary)[token]);
     }
@@ -251,18 +323,18 @@ GrammarState& GrammarState::operator=(GrammarState&&) noexcept = default;
 
 std::unique_ptr<GrammarState> GrammarState::fork() const {
     auto strings = impl_->strings ? std::make_unique<StringConstraintState>(*impl_->strings) : nullptr;
-    return std::unique_ptr<GrammarState>(new GrammarState(std::make_unique<Impl>(
-        impl_->matcher.Fork(), impl_->vocab_size, impl_->vocabulary, impl_->stops, impl_->longest_token,
-        std::move(strings))));
+    return std::unique_ptr<GrammarState>(new GrammarState(
+        std::make_unique<Impl>(impl_->matcher.Fork(), impl_->vocab_size, impl_->vocabulary,
+                               impl_->stops, std::move(strings))));
 }
 
 void GrammarState::accept(std::span<const TokenId> tokens) {
     for (TokenId token : tokens) {
         if (token < 0 || token >= impl_->vocab_size || impl_->matcher.IsTerminated())
-            throw std::logic_error("generated token violates the structured output grammar");
+            throw GrammarViolation("generated token violates the structured output grammar");
         auto next = impl_->strings ? std::make_unique<StringConstraintState>(*impl_->strings) : nullptr;
         if ((next && !next->accept(impl_->semantic_bytes(token))) || !impl_->matcher.AcceptToken(token))
-            throw std::logic_error("generated token " + std::to_string(token) +
+            throw GrammarViolation("generated token " + std::to_string(token) +
                                    " violates the structured output grammar");
         if (next) impl_->strings = std::move(next);
     }
@@ -304,10 +376,9 @@ void GrammarState::fill_masks(std::span<std::uint32_t> masks,
         if (impl_->vocab_size % 32)
             masks[(col + 1) * words - 1] &= (1U << (impl_->vocab_size % 32)) - 1;
         auto row = masks.subspan(col * words, words);
-        // Semantic work is absent for ordinary schemas, and for a bounded string far from its
-        // bounds.
+        // Semantic work is absent for ordinary schemas.
         const auto& constraint = column.strings;
-        if (constraint && constraint->needs_scan(impl_->longest_token)) {
+        if (constraint) {
             for (int word = 0; word < words; ++word) {
                 auto candidates = row[word];
                 while (candidates) {
@@ -342,7 +413,6 @@ void GrammarState::fill_masks(std::span<std::uint32_t> masks,
 struct StructuredCompiler::Impl {
     std::shared_ptr<const std::vector<std::string>> vocabulary;
     std::shared_ptr<const std::vector<std::uint8_t>> stops;
-    std::size_t longest_token = 0;
     xgrammar::TokenizerInfo tokenizer;
     xgrammar::GrammarCompiler compiler;
     std::mutex mutex;
@@ -358,7 +428,6 @@ struct StructuredCompiler::Impl {
             (*flags)[token] = 1;
         }
         stops = std::move(flags);
-        for (const auto& token : *vocabulary) longest_token = std::max(longest_token, token.size());
     }
 };
 
@@ -374,24 +443,45 @@ StructuredCompiler::compile(const StructuredOutputOptions& options,
     if (options.kind == StructuredOutputKind::None) { return {}; }
     std::lock_guard lock(impl_->mutex);
     try {
-        const auto normalized_schema = options.kind == StructuredOutputKind::JsonSchema
-            ? normalize_json_schema(options.schema) : std::string("{\"type\":\"object\"}");
-        auto strings = std::make_unique<StringConstraintState>(normalized_schema, envelope.reasoning_close);
-        // The grammar compiles the schema less the string bounds the semantic state enforces.
-        const std::string grammar_schema = strings->grammar_schema();
-        if (!strings->has_constraints()) strings.reset();
-        // strict_mode=false retains JSON Schema defaults for additional properties/items; a
-        // strict JsonSchema request closes undeclared object properties.
-        const bool strict = options.kind == StructuredOutputKind::JsonSchema && options.strict;
-        auto grammar = impl_->compiler.CompileJSONSchema(
-            grammar_schema,
-            true, std::nullopt, std::nullopt, strict, 8);
-        if (!envelope.reasoning_close.empty() || !envelope.alternative_format.empty()) {
-            std::ostringstream ebnf;
-            ebnf << grammar.GetGrammar();
-            Json content{{"type", "grammar"}, {"grammar", ebnf.str()}};
-            // The schema root starts at the JSON value; Qwen's reasoning close is followed by
-            // whitespace (including the canonical budget-control suffix's two newlines).
+        const bool enveloped =
+            !envelope.reasoning_close.empty() || !envelope.alternative_format.empty();
+        const bool json = options.kind == StructuredOutputKind::JsonObject ||
+                          options.kind == StructuredOutputKind::JsonSchema;
+        std::unique_ptr<StringConstraintState> strings;
+        // The final response's grammar on its own, and as a structural-tag format for an envelope.
+        std::optional<xgrammar::CompiledGrammar> grammar;
+        Json content;
+        if (json) {
+            const auto normalized_schema = options.kind == StructuredOutputKind::JsonSchema
+                                               ? normalize_json_schema(options.schema)
+                                               : std::string("{\"type\":\"object\"}");
+            strings = std::make_unique<StringConstraintState>(normalized_schema,
+                                                              envelope.reasoning_close);
+            if (!strings->has_constraints()) strings.reset();
+            // strict_mode=false retains JSON Schema defaults for additional properties/items; a
+            // strict JsonSchema request closes undeclared object properties.
+            const bool strict = options.kind == StructuredOutputKind::JsonSchema && options.strict;
+            grammar = impl_->compiler.CompileJSONSchema(normalized_schema, true, std::nullopt,
+                                                        std::nullopt, strict, 8);
+            if (enveloped) {
+                std::ostringstream ebnf;
+                ebnf << grammar->GetGrammar();
+                content = Json{{"type", "grammar"}, {"grammar", ebnf.str()}};
+            }
+        } else if (options.kind == StructuredOutputKind::Regex) {
+            content = Json{{"type", "regex"}, {"pattern", options.grammar}};
+            if (!enveloped) { grammar = impl_->compiler.CompileRegex(options.grammar); }
+        } else {
+            const std::string ebnf = options.kind == StructuredOutputKind::Choice
+                                         ? choice_grammar(options.choices)
+                                         : options.grammar;
+            content                = Json{{"type", "grammar"}, {"grammar", ebnf}};
+            if (!enveloped) { grammar = impl_->compiler.CompileGrammar(ebnf, "root"); }
+        }
+        if (enveloped) {
+            // The final response's root starts at its first byte; Qwen's reasoning close is
+            // followed by whitespace (including the canonical budget-control suffix's two
+            // newlines), which the output session strips from the content.
             content = Json{
                 {"type", "sequence"},
                 {"elements", Json::array({Json{{"type", "regex"}, {"pattern", "[ \\t\\r\\n]{0,8}"}},
@@ -418,10 +508,36 @@ StructuredCompiler::compile(const StructuredOutputOptions& options,
                 Json{{"type", "structural_tag"}, {"format", content}}.dump());
         }
         return std::shared_ptr<GrammarState>(new GrammarState(std::make_unique<GrammarState::Impl>(
-            xgrammar::GrammarMatcher(grammar), impl_->tokenizer.GetVocabSize(),
-            impl_->vocabulary, impl_->stops, impl_->longest_token, std::move(strings))));
+            xgrammar::GrammarMatcher(*grammar), impl_->tokenizer.GetVocabSize(), impl_->vocabulary,
+            impl_->stops, std::move(strings))));
     } catch (const std::exception& e) {
-        throw std::invalid_argument(std::string("cannot compile JSON schema: ") + e.what());
+        throw std::invalid_argument(std::string("cannot compile ") + kind_name(options.kind) +
+                                    ": " + e.what());
+    }
+}
+
+std::shared_ptr<GrammarState>
+StructuredCompiler::compile_format(const std::string& format,
+                                   const StructuredOutputEnvelope& envelope) {
+    std::lock_guard lock(impl_->mutex);
+    try {
+        Json content = Json::parse(format);
+        if (!envelope.reasoning_close.empty()) {
+            content = Json{
+                {"type", "sequence"},
+                {"elements",
+                 Json::array({Json{{"type", "any_text"},
+                                   {"excludes", Json::array({envelope.reasoning_close})}},
+                              Json{{"type", "const_string"}, {"value", envelope.reasoning_close}},
+                              content})}};
+        }
+        auto grammar = impl_->compiler.CompileStructuralTag(
+            Json{{"type", "structural_tag"}, {"format", content}}.dump());
+        return std::shared_ptr<GrammarState>(new GrammarState(std::make_unique<GrammarState::Impl>(
+            xgrammar::GrammarMatcher(grammar), impl_->tokenizer.GetVocabSize(), impl_->vocabulary,
+            impl_->stops, nullptr)));
+    } catch (const std::exception& e) {
+        throw std::invalid_argument(std::string("cannot compile tool calls: ") + e.what());
     }
 }
 } // namespace ninfer::text

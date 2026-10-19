@@ -4,7 +4,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 
 #include "ops/linear/fp8/fp8_config.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/gdn_input_proj/fp8/fp8_gdn_input_cutlass_sm70.h" // 本仓库 V100 增量
 #    include "ops/linear/fp8/fp8_launch.h"                        // 本仓库 V100 增量：QPN
 #endif
@@ -46,7 +46,7 @@ static std::size_t fp8_gdn_input_workspace_capacity_bytes_own(LinearPolicy polic
 
 std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
                                                    std::int32_t max_tokens) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：本 op 的 16384x5120 在 sm_70 上由 QPN（t<=32，
     // 零暂存）与 CUTLASS（t>=33）拥有全部宽度；容量来自同一决策而不是 route table。
     if (fp8_volta_qpn_takes(policy, Fp8N16384K5120::kOutputRows, Fp8N16384K5120::kInputRows,
@@ -68,7 +68,7 @@ std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int
 
 void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                 cudaStream_t stream) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：预打包过的权重只能由布局感知的路线消费。
     // GDN 输入投影（16384x5120）在解码/验证宽度上走 QPN：上游把 W=4..6 交给物化路线，
     // 其中 5..6 落到只有 ~10% 带宽的 fp8_a16_ksplit_mma（48 层 x 0.89 ms = 42.8 ms/轮，
@@ -103,7 +103,7 @@ void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qk
 
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 上 QPN 支持的 GDN 输入投影 t>=33 走
     // CUTLASS 宽 T，t<=32 走 QPN（零暂存）。必须在 route-table 检查之前拦截。
     if (fp8_volta_qpn_takes(policy, weight.n, weight.k,

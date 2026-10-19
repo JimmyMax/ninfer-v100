@@ -43,10 +43,11 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
             using Shape = CausalPromptRotatedShape<Warps>;
             constexpr auto kernel =
                 causal_attention_prompt_rotated_fast_kernel<G, Metadata, Warps, Split>;
-            configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                            Shape::SmemBytes);
-            });
+            // The nested lambda names the template itself: MSVC 14.44 (with nvcc 13.3) cannot
+            // reach the enclosing lambda's constexpr function pointer from it (C2326, issue #62).
+            raise_dynamic_shared_memory(
+                causal_attention_prompt_rotated_fast_kernel<G, Metadata, Warps, Split>,
+                Shape::SmemBytes);
             const dim3 grid(div_up(width, Shape::Br), G::QHeads, plan.splits);
             kernel<<<grid, Shape::Threads, Shape::SmemBytes, stream>>>(
                 q_data, keys, values, key_scales, value_scales, metadata, pos, scale, out_data,

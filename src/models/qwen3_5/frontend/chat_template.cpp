@@ -1,5 +1,6 @@
 #include "models/qwen3_5/frontend/chat_template.h"
 
+#include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/prompt_layout.h"
 #include "text/unicode.h"
@@ -32,9 +33,26 @@ std::string_view role_name(ChatRole role) {
 
 bool instruction(ChatRole role) { return role == ChatRole::System || role == ChatRole::Developer; }
 
-// Opener of Qwen's call syntax, written into the generation prompt when the caller forced a
-// function: everything after it can only be that call.
-constexpr std::string_view kToolCallOpen = "<tool_call>\n<function=";
+// What the generation prompt ends with when the caller forced a function: the syntax's call opener
+// up to the function name, then what follows the name. Everything the model produces after it can
+// only continue that call.
+struct ForcedCallOpener {
+    std::string head;
+    std::string_view tail;
+};
+
+ForcedCallOpener forced_call_opener(ToolCallSyntax syntax) {
+    switch (syntax) {
+    case ToolCallSyntax::Qwen:
+        return {.head = "<tool_call>\n<function=", .tail = ">\n"};
+    case ToolCallSyntax::Gemma:
+        // <|tool_call> is a special token, which the tokenizer reads here as it does in the
+        // template's own rendering of an earlier call; the name is the only literal text.
+        return {.head = std::string(kGemmaCallOpen) + std::string(kGemmaCallHead),
+                .tail = kGemmaArgumentsOpen};
+    }
+    throw std::invalid_argument("invalid tool call syntax");
+}
 
 struct ContentSource {
     std::uint32_t tag = 0;
@@ -557,14 +575,15 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         }
     }
     if (!options.forced_tool_name.empty()) {
-        // Qwen's call syntax opens with the function name; everything the model produces after
-        // this can only be that call. The name is caller text, so it is a literal span like any
-        // other user-sourced bytes.
-        output.text.append(kToolCallOpen);
+        // The syntax's call opens with the function name; everything the model produces after
+        // this can only continue that call. The name is caller text, so it is a literal span like
+        // any other user-sourced bytes.
+        const ForcedCallOpener opener = forced_call_opener(options.tool_call_syntax);
+        output.text.append(opener.head);
         const std::size_t name_begin = output.text.size();
         output.text.append(options.forced_tool_name);
         output.literal_spans.push_back(text::ByteSpan{name_begin, output.text.size()});
-        output.text.append(">\n");
+        output.text.append(opener.tail);
     }
     result.text          = std::move(output.text);
     result.literal_spans = std::move(output.literal_spans);

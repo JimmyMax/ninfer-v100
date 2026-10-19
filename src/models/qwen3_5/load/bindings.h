@@ -2,8 +2,10 @@
 
 #include "artifact/binder.h"
 #include "models/qwen3_5/config.h"
+#include "models/qwen3_5/expert_sources.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
+#include "ops/common/device_tier.h"
 
 #include <map>
 #include <span>
@@ -23,7 +25,9 @@ struct PendingWeight {
 
 class Bindings {
 public:
-    explicit Bindings(artifact::Binder& binder) : binder(binder) {}
+    explicit Bindings(artifact::Binder& binder, const LoadOptions& options = {})
+        : binder(binder), expert_residency(options.expert_residency),
+          resident_mtp_experts(options.mtp_experts_q4) {}
 
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
                                      std::vector<std::string> inputs   = {},
@@ -49,6 +53,8 @@ public:
     void place(WeightId id, std::size_t rank);
 
     artifact::Binder& binder;
+    ExpertResidency expert_residency;
+    bool resident_mtp_experts;
     std::vector<PendingWeight> weights;
 
 private:
@@ -100,8 +106,13 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& 
 // the load-time transcodes on the selected parameters.
 void apply_storage_trades(Bindings& bindings, const Config& config, const ModelWeights& weights,
                           const LoadOptions& options);
-// sm_70: the panel layout for the projection weights its routes read (storage_trades.cpp).
-void apply_device_layouts(Bindings& bindings, const ModelWeights& weights);
+// The FP8 A8 and NVFP4 A4 permissions a stored weight keeps only on a rank whose device runs the
+// 120a code (`rank_tiers`, one per rank): elsewhere its uses take the A16 routes (prepare.cpp).
+void apply_rank_policies(Bindings& bindings, std::span<const ops::DeviceTier> rank_tiers);
+// sm_70: the panel layout for the projection weights its routes read, on the ranks whose devices
+// run Volta's code (`rank_tiers`, one per rank; storage_trades.cpp).
+void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
+                          std::span<const ops::DeviceTier> rank_tiers);
 // --vision-residency overlay: rank the device weights an exclusive Vision window may borrow.
 // `mtp_parameters` and `draft_parameters` are the half-open WeightId index ranges registered by
 // bind_mtp and bind_draft.
@@ -115,5 +126,12 @@ void apply_vision_overlay_placement(Bindings& bindings, const ModelWeights& weig
 [[nodiscard]] std::vector<BoundWeight>
 resolve_weights(std::vector<PendingWeight>&& pending,
                 const artifact::MaterializedArtifact& materialized);
+
+[[nodiscard]] NativeExpertSources expert_sources(const artifact::Reader& reader,
+                                                  std::span<const PendingWeight> pending,
+                                                  ModelWeights& weights,
+                                                  const artifact::MaterializedArtifact& backing,
+                                                  const LoadOptions& options,
+                                                  const std::filesystem::path& artifact_path);
 
 } // namespace ninfer::models::qwen3_5::loading

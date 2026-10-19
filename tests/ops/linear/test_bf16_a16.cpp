@@ -86,6 +86,7 @@ std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
         return result;
     }
     std::vector<std::int32_t> result{0, 1, tokens / 2, tokens - 2, tokens - 1};
+    if (tokens > 8192) { result.insert(result.end(), {8191, 8192}); }
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
@@ -310,6 +311,12 @@ int run_general_bf16_linear() {
                 failures += run_bf16_linear_case(weight, tokens, false, true);
             }
         }
+    }
+    // A Qwen3.5 Vision item of 16,384 tokens projects 65,536 patches at once; sm_70's wide route
+    // takes such a call in passes of kWideColumns columns. Two passes, the second partial.
+    for (const auto& [n, k] : std::vector<std::pair<int, int>>{{4304, 1152}, {1152, 4304}}) {
+        DeviceWeight weight(make_patterned(n, k, 425U));
+        failures += run_bf16_linear_case(weight, 8192 + 263);
     }
     // A registered shape with an FP32 result takes the runtime-shape GEMM.
     DeviceWeight registered(make_patterned(256, 5120, 423U));

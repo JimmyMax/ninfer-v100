@@ -212,6 +212,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         print_metric("thinking control tokens", std::to_string(result.thinking.injected_tokens));
         print_metric("thinking control", result.thinking.applied ? "applied" : "not applied");
     }
+    if (result.thinking.loop_detected) {
+        print_metric(
+            "reasoning loop",
+            "after " + std::to_string(result.thinking.loop_thinking_tokens) + " thinking tokens (" +
+                std::to_string(static_cast<int>(result.thinking.loop_coverage * 100.0F + 0.5F)) +
+                "% repeated), " + (result.thinking.applied ? "concluded" : "stopped"));
+    }
     print_metric("model elapsed", format_seconds(model_seconds));
     print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
                                               result.timings.prefill_seconds));
@@ -239,7 +246,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
-    print_metric("CUDA Graph used", format_bytes(memory.cuda_graph_measured_bytes));
+    print_metric("CUDA Graph used", memory.cuda_graph_measured_bytes
+                                        ? format_bytes(*memory.cuda_graph_measured_bytes)
+                                        : std::string("unmeasured (no free device memory left)"));
     print_metric("planned device total", format_bytes(reserved));
     if (memory.expert_cache_bytes != 0) {
         print_metric("gpu expert cache", format_bytes(memory.expert_cache_bytes));
@@ -356,6 +365,7 @@ int main(int argc, char** argv) {
         request.execution.structured_output       = cli.structured_output;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;
+        request.execution.thinking.loop           = cli.reasoning_loop;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
         request.output.raw                        = cli.raw_output;
@@ -379,6 +389,7 @@ int main(int argc, char** argv) {
         engine_options.vision_residency         = cli.vision_residency;
         engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;
         engine_options.use_cuda_graph           = cli.use_cuda_graph;
+        engine_options.gpu_clock_floor_mhz      = cli.gpu_clock_floor_mhz;
         engine_options.lm_head_q4               = cli.lm_head_q4;
         engine_options.lm_head_q6               = cli.lm_head_q6;
         engine_options.embedding_q4             = cli.embedding_q4;

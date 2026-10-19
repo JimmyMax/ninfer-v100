@@ -1,12 +1,12 @@
 # Hybrid prefix cache
 
-The hybrid prefix cache (HPC) is the opt-in prefix-cache mode `ninfer-serve --use-alt-prefix-caching`
-selects (`ContextCacheOptions::mode = ContextCacheMode::Hybrid`). It reuses prompt prefixes through
-content-addressed 64-token KV blocks and sparse recurrent-state snapshots, kept on the Device and in
-one pinned Host tier. The checkpoint catalog
+The hybrid prefix cache (HPC) is the default prefix-cache mode of `ninfer-serve`
+(`ContextCacheOptions::mode = ContextCacheMode::Hybrid`; `--use-alt-prefix-caching` names it). It
+reuses prompt prefixes through content-addressed 64-token KV blocks and sparse recurrent-state
+snapshots, kept on the Device and in one pinned Host tier. The checkpoint catalog
 ([Resource scheduling and context cache](resource-scheduling-and-context-cache.md),
-`ContextCacheMode::Legacy`) is the default of the server and the Engine, and
-`--use-original-prefix-caching` names it; the two modes coexist. Ian Ranson designed and built the
+`ContextCacheMode::Legacy`) is the Engine's default and serves what the hybrid cache does not;
+`--use-original-prefix-caching` selects it in the server. The two modes coexist. Ian Ranson designed and built the
 mode in [Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom).
 
 This document is the authority for the Hybrid mode. §0–§11 describe the design as implemented,
@@ -28,13 +28,15 @@ author's on an RTX 5090.
 
 Coexistence rules:
 
-- The mode is fixed at Engine construction. Legacy-only options (`--device-state-slots`,
-  `--host-state-slots`, `--host-kv-mib`, `--max-private-continuations`, `--max-shared-prefixes`,
-  `--max-long-anchors-per-continuation`, `--long-anchor-spacing`) require
-  `--use-original-prefix-caching`; Hybrid-only options are rejected with it. `--host-cache-mib`
-  applies to both modes (in Hybrid mode it sizes the Host slab pool); `--no-prefix-reuse`
-  disables the cache and is rejected with `--use-original-prefix-caching` and with every
-  mode-specific option.
+- The mode is fixed at Engine construction. `ninfer-serve` selects Hybrid unless
+  `--use-original-prefix-caching` is given or an option only the catalog serves selects the
+  catalog: its capacities (`--device-state-slots`, `--host-state-slots`, `--host-kv-mib`,
+  `--max-private-continuations`, `--max-shared-prefixes`, `--max-long-anchors-per-continuation`),
+  anchors and policies, the disk tier, slot files, pipeline `--devices`, `--no-prefix-reuse` or a
+  `--graft`. With `--use-alt-prefix-caching` named, those options are rejected instead; Hybrid-only
+  options are rejected with the catalog. `--host-cache-mib` applies to both modes (in Hybrid mode
+  it sizes the Host slab pool). Gemma 4 and Qwen3.8-Flash-Next run context caches of their own,
+  and their Engine reports the Legacy mode.
 - Hybrid mode reuses the active-execution machinery unchanged: `LogicalKVPageStore`,
   `KVAddressSpaceStore`, execution rows, the active `StateStore` images, prefill/decode/speculative
   paths. It replaces only admission-source selection, retention, capture and pressure. Tree nodes
@@ -1228,7 +1230,7 @@ struct HybridPrefixCacheOptions {                           // used only when mo
 };
 
 struct ContextCacheOptions {                  // existing struct, extended
-    ContextCacheMode mode = ContextCacheMode::Legacy; // --use-alt-prefix-caching selects Hybrid
+    ContextCacheMode mode = ContextCacheMode::Legacy; // the Engine's default; ninfer-serve selects Hybrid
     HybridPrefixCacheOptions hybrid;
     // Hybrid mode: host_cache_budget_bytes (--host-cache-mib) sizes the one slab pool.
     // ... existing Legacy fields unchanged ...

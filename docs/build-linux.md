@@ -10,15 +10,18 @@ This guide runs NInfer on Linux from the published container image, or builds it
 | `120a` | RTX 50 series and RTX PRO 6000 Blackwell | CUDA 13.1 or newer (configure refuses 12.8 and 12.9, which miscompile `sm_120a` kernels) |
 | `80` | A100 class (GA100), an unmeasured compatibility target | CUDA 12.8 or newer |
 | `70` | Tesla V100 (Volta) | CUDA 12.8 or 12.9 (CUDA 13 no longer compiles `sm_70`) |
+| `75` | TITAN RTX and RTX 20 series (Turing), through the [Turing tier](maintainer/build-system.md#turing-tier-75) | CUDA 12.8 or newer |
 
-An `89` or `120a` build does not run on an RTX 3090, and only a `70` build runs on a V100. See
-[Tesla V100](#tesla-v100-sm_70) for what that build changes.
+An `89` or `120a` build does not run on an RTX 3090, only a `70` build runs on a V100, and only
+a `75` build on a Turing card. See [Turing](#turing-sm_75) and [Tesla V100](#tesla-v100-sm_70) for
+what those builds change.
 
 ## Container image
 
+
 `ghcr.io/jimmymax/ninfer-v100:latest` is the Tesla V100 build: `70`, CUDA 12.8 on Ubuntu 24.04, from
 [Dockerfile.sm70](../Dockerfile.sm70). `:<version>` pins a release, `sm70` is an alias, and
-`sha-<commit>` names one commit. No entrypoint, so the command names `ninfer-serve` first:
+`sha-<commit>` names one commit. No entrypoint, so the command names `ninfer-serve` first:er
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
@@ -33,6 +36,7 @@ Docker can access the GPU first:
 docker run --rm --gpus all nvidia/cuda:12.8.1-base-ubuntu24.04 nvidia-smi
 ```
 
+
 The other build, `ghcr.io/jimmymax/ninfer-v100:sm86-sm120a`, is the CUDA 13.4 image for the RTX 30, 40
 and 50 line (`sm_86` and `sm_120a`, from the upstream [Dockerfile](../Dockerfile)). A V100 cannot run
 it; the [README](../README.md#docker) covers its commands, volumes and compose file.
@@ -43,7 +47,7 @@ The published image is this build, so a container needs no extra step. To assemb
 a locally built binary, put an `sm_70` `ninfer-serve` in an empty directory and
 `docker build -f Dockerfile.sm70 -t ninfer:v100 <directory>`; the image has no entrypoint, so a
 compose `command:` list names `ninfer-serve` first, as [the example](../deploy/compose.gemma-v100.example.yml)
-does.
+does.er
 
 ## Native Ubuntu 24.04 build
 
@@ -94,6 +98,73 @@ build-sm86/apps/ninfer-calibrate
 build-sm86/apps/ninfer-perplexity
 ```
 
+## Turing (sm_75)
+
+A `75` build runs on the TITAN RTX and the RTX 20 series. The container image carries one; a native
+build needs CUDA 12.8 or newer and `-DCMAKE_CUDA_ARCHITECTURES=75`:
+
+```bash
+cmake -S . -B build-sm75 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+  -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+  -DCMAKE_CUDA_ARCHITECTURES=75 \
+  -DNINFER_BUILD_APPS=ON
+
+cmake --build build-sm75 --parallel
+```
+
+Turing's tensor cores multiply FP16 and INT8 but not BF16 or TF32, it has no `cp.async`, and a
+block has 64 KiB of shared memory. A `75` build runs the kernels of the other targets with Turing
+forms of those instructions and Turing shapes of the kernels that do not fit
+([Turing tier](maintainer/build-system.md#turing-tier-75)):
+
+- Integer routes (the T2 ternary projections, A8 activations, INT8-family attention, GGUF `dp4a`
+  and MMQ kernels) and FP16 routes run on the native tensor cores.
+- BF16 products run on FP16 tensor cores for every output whose operands are FP16 values, and in
+  FP32 for the others; no value is narrowed. BF16-cache attention multiplies Q, K and V as their
+  FP16 roundings, and every attention PV product with BF16 values rounds the probabilities to
+  FP16.
+- Every model, KV format and drafter runs. The Linear routes come from the legacy table only, and
+  `NINFER_LINEAR_ROUTES=unified` is refused.
+
+Device route profiles of the TITAN RTX and the other Turing cards the
+[card table](gpus.md#turing-75-build-75) marks are built in; another Turing part calibrates at first
+start (see [device profiles](device-profiles.md)). What runs and how fast is in the
+[TITAN RTX measurements](performance/titan-rtx-2026-10.md).
+
+## Cards of several architectures in one pipeline
+
+`CMAKE_CUDA_ARCHITECTURES` may list several architectures. The binary then carries device code for
+each, so a layer pipeline (`--devices`, `--stage-layers`) can span cards of different
+architectures: for example a Tesla V100, a TITAN RTX and RTX 30 or 40 series cards with CUDA 12.8,
+or a TITAN RTX, RTX 30 and 40 series cards and an RTX 50 series card with CUDA 13.1:
+
+```bash
+cmake -S . -B build-cu128-multi -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
+  -DCMAKE_CUDA_HOST_COMPILER="$CUDAHOSTCXX" \
+  "-DCMAKE_CUDA_ARCHITECTURES=70;75;80;86;89" \
+  -DNINFER_BUILD_APPS=ON
+
+cmake --build build-cu128-multi --parallel
+```
+
+- `70` needs CUDA 12.x and `120a` needs CUDA 13.1 or newer, so no build holds both.
+- Each card runs the code of the newest listed architecture it can run, with the kernels, routes,
+  route catalog and built-in device profile of its own single-architecture build
+  ([code tiers](maintainer/build-system.md#code-tiers)). On one card the binary gives the same
+  tokens as that card's own build.
+- Each card computes its own layers with its own arithmetic (for example, Turing attention rounds
+  BF16 values and probabilities to FP16), so greedy output across a mixed pipeline may diverge from
+  any one card's after some tokens.
+- Compile time and binary size grow with the number of architectures.
+
+A build of one architecture also pipelines cards of different compute capabilities when its code
+runs on each of them, for example an `86` build across RTX 30 and RTX 40 series cards.
+
 ## Tesla V100 (sm_70)
 
 A `70` build runs on Tesla V100 (16 or 32 GB). It needs CUDA 12.8 or 12.9: CUDA 13 no longer
@@ -122,7 +193,8 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   row-split group's FP32 products are scaled when the group ends. Up to eight columns read the BF16
   activations directly; wider calls convert them to FP16 once. From 65 columns
   (`NINFER_SM70_CUBLAS_MIN`) the weights are dequantized to FP16 32 MiB at a time and multiplied by
-  cuBLAS with FP32 accumulation. Activations beyond +-65504 saturate there.
+  cuBLAS with FP32 accumulation; a call of more than 8,192 columns (a Vision item's patches) passes
+  over them 8,192 at a time.
 - **T2 projections at one to eight columns** (decode, two requests, an MTP or DFlash2 verify round)
   take an integer route where the projection's policy admits integer activations, as the other
   targets' T2 A8 route does: the activations are quantized to int8 with one scale per 64 values,
@@ -138,19 +210,27 @@ speed, and the kernels written for Ampere everywhere else, on emulated warp prim
   route.
 - **Attention** of every KV format runs on Volta's tensor cores with FP32 accumulation. Decode and
   verification use a Volta kernel that decodes each format's keys and values to FP16 as it loads
-  them, with the same fused append, splits and reducers as the other targets. Prompt attention
-  gives a CTA 64 query rows of one KV head and decodes each 32-key tile of the visible pages into
-  shared memory once for all of them; it reads the pages where they are and needs no workspace.
+  them (32 dimensions of a quantized row a load), with the same fused append, splits and reducers
+  as the other targets. Prompt attention gives a CTA 64 query rows of one KV head and decodes each
+  32-key tile of the visible pages into shared memory once for all of them; it reads the pages
+  where they are and needs no workspace.
+- **BF16 values beyond FP16's range.** Volta's tensor cores take FP16 operands, which saturate at
+  +-65504. Where a BF16 activation of a dense projection, or a query, key or value of attention
+  over a BF16 cache, is beyond that (magnitude 2^16 or more), the conversion flags its 64-value
+  chunk, column or key tile, and the product adds in FP32 what the saturation took: a projection
+  adds the weights times the excess, and attention forms the tile's scores again from the BF16
+  values and adds the probabilities times the values' excess. Data within FP16's range takes the
+  tensor-core paths unchanged. Values below FP16's normal range keep FP16's absolute precision
+  (2^-25), and the queries of a quantized cache, which are rotated in FP16, still saturate.
 - FP8 A8 and NVFP4 W4A4 activations are not available, as on `sm_86`; those weights run their A16
   routes.
 
 On a 16 GB card the official Qwen3.8-27B artifact loads with `--embedding-q4 --lm-head-q4` (its
-Q8 embedding and output head stored as Q4 while loading, 14.7 GiB of weights), and the GSQ-RCO
-IQ3_S with DFlash2 needs `--prefill-chunk 512`. What else fits is in the
-[measurements](performance/tesla-v100-2026-10.md#models-on-a-16-gb-card).
+Q8 embedding and output head stored as Q4 while loading, 14.7 GiB of weights). What else fits is in
+the [measurements](performance/tesla-v100-2026-10.md#models-on-a-16-gb-card).
 
-The V100-SXM2-16GB's device route profile is built in; another V100 part calibrates at first start,
-in about nine seconds (see [device profiles](device-profiles.md)).
+The V100-SXM2-16GB and V100-SXM2-32GB device route profiles are built in; another V100 part
+calibrates at first start, in about nine seconds (see [device profiles](device-profiles.md)).
 
 ## Optional vcpkg dependencies
 
@@ -188,10 +268,9 @@ CMake configure command as `-DNAME=VALUE`.
 | `NINFER_TMA_STAGING=ON` | passes the NVFP4 TMA descriptors through device memory with a capturable staging kernel, as Windows builds must, so that path can be tested on Linux (`120a`) |
 | `NINFER_MULTICALL=ON` | Linux: links `ninfer`, `ninfer-serve`, `ninfer-calibrate` and `ninfer-perplexity` into one executable, `apps/ninfer-multicall`, with the four names as symlinks to it, so the kernel image (about 0.5 GB per architecture) is there once instead of four times; the container image is built this way |
 | `NINFER_MEDIA_NATIVE_PNG=ON` | decodes PNG images natively instead of through FFmpeg, as Windows builds do by default, so that decoder can be tested on Linux |
-| `NINFER_D3D12_RESIDENCY=ON` | Windows: offers `--wddm-evictable-budget`, device arenas from a D3D12 heap held resident |
 | `NINFER_DIRECTSTORAGE=ON` | Windows: fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
 
-The Windows options compile against Windows headers but have not been run on this line.
+The Windows option compiles against Windows headers but has not been run on this line.
 At run time, `NINFER_CUDA_SYNC=spin|blocking|yield|auto` selects the CUDA synchronization schedule
 (unset keeps CUDA's default) and `NINFER_T2_A8_TILE=off` returns the ternary prefill route to its
 64-row kernel.

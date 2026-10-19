@@ -320,7 +320,10 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
-    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
 }
 
 std::optional<AdmissionCandidate> Program::inspect_admission(
@@ -450,7 +453,10 @@ bool Program::wait_context_transfer() noexcept { return impl_->wait_context_tran
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
                                          runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->advance_prefill(sequence, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
 }
 
 CaptureAssessment
@@ -527,7 +533,10 @@ runtime::ContextTransactionReserveStatus Program::reserve_active_capture_with_pr
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
                              std::span<const runtime::RoundBudget> budgets,
                              runtime::ExecutionTiming* failed_timing) {
-    return impl_->decode(sequences, budgets, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->decode(sequences, budgets, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
 }
 
 runtime::ExecutionTiming
@@ -535,8 +544,11 @@ Program::append_forced_tokens(std::span<const SequenceHandle> sequences,
                               std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
                               std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
                               runtime::ExecutionTiming* failed_timing) {
-    return impl_->append_forced_tokens(sequences, row_major_tokens, row_stride,
-                                       prefix_execution_splits, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->append_forced_tokens(sequences, row_major_tokens, row_stride,
+                                               prefix_execution_splits, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
 }
 
 CommitResult Program::commit(PendingBatch&& pending,
@@ -688,6 +700,20 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->p
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 
+ExpertResidencyStats Program::expert_residency_stats() const {
+    ExpertResidencyStats out;
+    if (!impl_->experts) { return out; }
+    const auto stats = impl_->experts->stats() - impl_->expert_startup_stats;
+    out.routes = stats.pairs;
+    out.hits = stats.pair_hits;
+    out.admitted = stats.admissions;
+    out.transferred_bytes = stats.copied_bytes;
+    for (std::size_t rank = 0; rank < impl_->device.size(); ++rank) {
+        out.slots += impl_->experts->memory(rank).cache_slots;
+    }
+    return out;
+}
+
 std::uint32_t Program::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
     return impl_->concurrent_output_budget(prompt_tokens);
 }
@@ -739,18 +765,34 @@ std::size_t prepare_vision_overlay(const execution::Parameters& parameters, Devi
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer) {
+    return create_program(parameters, std::move(plan), device, startup_observer, {});
+}
+
+std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
+                                        SequencePlan&& plan, DeviceContext& device,
+                                        const StartupObserver& startup_observer,
+                                        std::unique_ptr<execution::NativeExpertRuntime> experts) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->parameters != &parameters) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
     }
-    auto impl =
-        std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
+    if (!experts && !parameters.model.expert_sources().layers.empty()) {
+        std::vector<std::uint64_t> reserved{plan.impl_->device_reservation_bytes};
+        reserved.insert(reserved.end(), plan.impl_->extra_rank_reservation_bytes.begin(),
+                         plan.impl_->extra_rank_reservation_bytes.end());
+        experts = std::make_unique<execution::NativeExpertRuntime>(
+            parameters.model, device, reserved, plan.impl_->expert_cache_bytes);
+    }
+    auto impl = std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device,
+                                                      startup_observer, std::move(experts));
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }
 
 void Program::inject_graft(const PromptGraft& graft) {
+    if (impl_->experts) { impl_->experts->check(); }
     inject_direct_graft(*impl_, graft);
+    if (impl_->experts) { impl_->experts->check(); }
 }
 
 std::vector<Program::GraftCatalogEntry> Program::graft_catalog_entries() {

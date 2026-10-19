@@ -26,13 +26,14 @@ their source commit, so `git log` is the complete record; this page keeps the cr
 | Source | Contribution |
 | --- | --- |
 | [TertiumOrganum1/ninfer-3090](https://github.com/TertiumOrganum1/ninfer-3090) | the `rk4v4-e8` KV cache, the 128x64 int8 tile for ternary prefill, tool-call recovery, shared-capture surplus handling, `sm_120a` on the `mma.sync` path |
-| [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) (UDPSendToFailed, Daniel Parker, Matt Anderson, keylimesoda, Sergiusz Michalik) | the E8-lattice KV codecs and `rk2v4-e8`, the whole-program CUDA build, shared-memory scale reads in INT8 attention, keys past 262,144 and four times the native window with YaRN, SFU sigmoid/SiLU/softplus, `TCP_NODELAY`, D3D12-resident arenas and DirectStorage restores on Windows, MTP windows up to 15, `/metrics`, `/slots` and `/props`, the compiled-in WebUI, split compilation |
+| [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) (UDPSendToFailed, Daniel Parker, Matt Anderson, keylimesoda, Sergiusz Michalik) | the E8-lattice KV codecs and `rk2v4-e8`, the whole-program CUDA build, shared-memory scale reads in INT8 attention, keys past 262,144 and four times the native window with YaRN, SFU sigmoid/SiLU/softplus, `TCP_NODELAY`, the WDDM evictable budget and DirectStorage restores on Windows, MTP windows up to 15, `/metrics`, `/slots` and `/props`, the compiled-in WebUI, split compilation |
 | [IMGillusion/ninfer-disk-kv](https://github.com/IMGillusion/ninfer-disk-kv) | the disk KV tier and `--context-cache-policy rolling` |
 | [kido5217/frinfer](https://github.com/kido5217/frinfer) (Fedor Suchkov) | token log probabilities on Chat Completions and Responses |
 | [MirkoCovizzi/ninfer-rtx5090-mobile](https://github.com/MirkoCovizzi/ninfer-rtx5090-mobile) | adaptive MTP |
-| [Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom) (Ian Ranson, Duncan Betts) | the fast INT8 and NVFP4 prompt-attention kernels, the hybrid prefix cache, n-gram copy drafting (with remesis), recency eviction, Device KV lease growth, the Host cache budget, automatic long anchors, `--assistant-prefill`, grouped `--help`, levelled logs, programmatic dependent launches, split-KV attention for short prefill steps, ModelOpt and Quasar NVFP4/FP8 conversion, a native Windows build |
+| [Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom) and its successor [Infernix](https://github.com/wallawalla47/infernix) (Ian Ranson, Duncan Betts, Fedor Suchkov) | the fast INT8 and NVFP4 prompt-attention kernels, the hybrid prefix cache, n-gram copy drafting (with remesis), recency eviction, Device KV lease growth, the Host cache budget, automatic long anchors, `--assistant-prefill`, grouped `--help`, levelled logs, programmatic dependent launches, split-KV attention for short prefill steps, ModelOpt and Quasar NVFP4/FP8 conversion, a native Windows build, the reasoning-loop guard |
 | [gzenz/ninfer](https://github.com/gzenz/ninfer) (Gideon Zenz, David Oelfke) | thorough admission search, value-aware demotion, concurrent prefill, worker out-of-memory recovery, the MTP attention window, post-thinking sampling, `GET /stats` and the `tools/monitor` dashboard, request-log rotation, derived session keys, CPU Vision, RoPE position interpolation, branch anchors, PackGQA |
 | [tmark00/ninfer](https://github.com/tmark00/ninfer) | table-decoded E8 roots, the SM-count RMSNorm cutoff, the WebUI MCP proxy |
+| [quardex/ninfer-all](https://github.com/quardex/ninfer-all) (A. Ugryumov) | the Turing (`sm_75`) build: its MMA forms, BF16-cache attention on FP16 tensor cores, every KV coding in 64 KiB of shared memory, the Turing path of the Q8 K-split contraction and the TITAN RTX profile |
 | pelebel, natpate | openable server URLs and CORS preflight echoes |
 | Matt Anderson | wide Q5 split tiles and an idle Engine that fails only the request it cannot place |
 | hyz615, lededev, NikolaFC | schema assertions in constrained decoding; the disk tier persisted on an orderly stop and MSVC-safe test builtins; Q8_0 `ssm_alpha`/`ssm_beta` in GGUF conversion |
@@ -69,6 +70,9 @@ two-stage GDN prefill, parallel query tiles, MX FP8 MMA and Minnnn's column-band
 - Qwen3.8-Flash-Next support was designed against the transformers, vLLM and llama.cpp
   implementations of the model and [Strata](https://github.com/Niko1221/Strata) (MIT, copyright
   2026 Niko1221 and contributors), whose transcription served as a reference for the n-gram
-  hash, the expert cache and its measured pitfalls.
+  hash, the expert cache and its measured pitfalls, and whose CPU-computed expert misses led to
+  the CPU share.
+- The SiLU shared by the GPU's GGUF expert kernels and the CPU's expert products evaluates e^x with
+  the single-precision polynomial of Stephen L. Moshier's Cephes Math Library.
 - llama.cpp's GGUF block kernels are vendored unmodified in `third_party/ggml-quants` under their
   MIT license.

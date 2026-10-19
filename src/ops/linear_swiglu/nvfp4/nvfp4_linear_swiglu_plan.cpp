@@ -8,7 +8,7 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h" // 本仓库 V100 增量：宽 T prefill 路径
 #endif
 
@@ -107,7 +107,7 @@ std::size_t fused_workspace_bytes(std::int32_t tokens) {
     return layout.peak_bytes(1);
 }
 
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // 本仓库 V100 增量：sm_70 的 NVFP4 gate_up QPN 拆分暂存（t <= 32）——gate fp32 + 激活 fp16。
 // 容量用与派发相同的 layout 序列算出，保证“查询即执行高水位”。
 std::size_t sm70_split_workspace_bytes(std::int32_t tokens) {
@@ -145,7 +145,7 @@ static std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes_own(LinearPolicy
     (void)resolve_route(policy, min_tokens);
     (void)resolve_route(policy, max_tokens);
     if (!allows_a4(policy)) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
         // 本仓库 V100 增量：A16 族在 t <= 32 上由 QPN 拆分接管（见公共容量函数）；
         // 更宽的宽度不会调用到本函数。
         return sm70_split_workspace_bytes(
@@ -187,7 +187,7 @@ static std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes_own(LinearPolicy
 std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
                                                          std::int32_t min_tokens,
                                                          std::int32_t max_tokens) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 的 A16 族在 t <= 32 上被 QPN 拆分接管
     // （表检查之前），容量必须在这里短路；更宽的 prefill 宽度仍走上游路线与上游容量。
     if (min_tokens <= 0 || max_tokens < min_tokens) {
@@ -220,7 +220,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
                                   cudaStream_t stream) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：解码/校验宽度（t = 1..32）上的 NVFP4 gate_up
     // （34816 x 5120，每层 178 M 参数，占模型 NVFP4 质量的三分之二）走 fork 的 QPN 拆分路线：
     // 两个独立 QPN2 pass（gate / up 各半）写 fp32 暂存，再由合并内核做 silu(gate)*up。

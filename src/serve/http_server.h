@@ -28,6 +28,13 @@
 namespace ninfer::serve {
 
 void write_openai_error(httplib::Response& response, const ApiError& error);
+
+// Whether a request must carry the configured API key (none configured: never). Every API route
+// does, the MCP relay included: the WebUI sends this server's key as its own Authorization and the
+// MCP server's headers prefixed (mcp_proxy.h). /health, CORS preflights and the WebUI's pages do
+// not.
+[[nodiscard]] bool requires_api_key(const std::string& api_key, bool webui_enabled,
+                                    const httplib::Request& request);
 void write_anthropic_error(httplib::Response& response, const ApiError& error,
                            const std::string& request_id);
 

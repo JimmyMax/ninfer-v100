@@ -3,7 +3,7 @@
 #include "core/tensor.h"
 #include <cuda_runtime.h>
 
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // 本仓库 V100 增量（docs/v100/PLAN.md）：fork 的 Volta NVFP4 QPN 路径。
 #    include "core/arena.h"
 #    include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
@@ -12,7 +12,7 @@
 namespace ninfer::ops::detail {
 using Nvfp4Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 // Quadpair-split-N form (nvfp4_volta_qpn_gemm.cuh), the fourth sibling of the q4/w8/fp8 QPN
 // kernels. The tile height is mirrored here because dispatch is host code and cannot see the
 // device header; the launcher static_asserts the two agree.

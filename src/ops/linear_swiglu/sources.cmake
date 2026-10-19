@@ -6,6 +6,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q4a8/q4a8_linear_swiglu.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4a8/a8_linear_add.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4cublas/w4_cublas_prefill.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q4cublas/cublas_prefill_gate.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_decode_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t.cu"

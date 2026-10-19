@@ -79,7 +79,11 @@ void attention(const AttentionCase& c, std::mt19937& rng) {
                     const std::int64_t at = r * seq_stride + kv * head_stride + std::int64_t(j) * d;
                     for (int i = 0; i < d / 2; ++i) {
                         float co = 1.0f, si = 0.0f;
-                        if (inv_freq[i] != 0.0f) { sincosf(float(j) * inv_freq[i], &si, &co); }
+                        if (inv_freq[i] != 0.0f) {
+                            const float angle = float(j) * inv_freq[i];
+                            co                = std::cos(angle);
+                            si                = std::sin(angle);
+                        }
                         const double n0 = double(__half2float(vc[at + i])) * k_norm[i];
                         const double n1 = double(__half2float(vc[at + i + d / 2])) * k_norm[i + d / 2];
                         kc[at + i]         = __float2half(float(n0 * co - n1 * si));

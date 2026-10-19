@@ -10,6 +10,7 @@
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_weight_view.h"
 
+#include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
@@ -400,7 +401,8 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
     // Both parents split into a query/gate half and a key/value half, and both read the same
     // activations, so the cuBLAS route materialises each parent once and shares one quantisation
     // across all four destinations.
-    if (allows_cublas_prefill(policy) && x.ne[1] >= kCublasPrefillMinTokens) {
+    if (allows_cublas_prefill(policy) &&
+        detail::cublas_prefill_takes(detail::kCublasAttnInput, x.ne[1])) {
         const std::int32_t q_rows  = q.ne[0];
         const std::int32_t kv_rows = k.ne[0];
         const detail::CublasProjectionDestination qk_dests[] = {
@@ -449,10 +451,14 @@ std::size_t split_route_bytes(QType query_key_qtype, std::int32_t query_key_rows
     if (!allows_a8_int(policy) || !registered) { return 0; }
     const std::size_t a8 = detail::q4_q5_attn_input_a8_workspace_capacity_bytes(min_tokens,
                                                                                 max_tokens);
-    if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
-        return std::max(a8, detail::w4_cublas_projection_workspace_capacity_bytes(
-                                std::max(query_key_rows, gate_value_rows), input_rows,
-                                std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
+    const std::int32_t first =
+        allows_cublas_prefill(policy)
+            ? detail::cublas_prefill_first_width(detail::kCublasAttnInput, min_tokens, max_tokens)
+            : 0;
+    if (first != 0) {
+        return std::max(
+            a8, detail::w4_cublas_projection_workspace_capacity_bytes(
+                    std::max(query_key_rows, gate_value_rows), input_rows, first, max_tokens));
     }
     return a8;
 }

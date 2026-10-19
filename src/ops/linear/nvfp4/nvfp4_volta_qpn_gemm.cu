@@ -6,7 +6,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_SM70
+#ifdef NINFER_TIER_VOLTA
 
 namespace {
 using S = Nvfp4VoltaQpnSchedule;
@@ -56,6 +56,6 @@ void launch_nvfp4_volta_qpn_fp16_residual(const Tensor& x, const void* x_fp16, c
         inverse_weight_divisor, stream);
 }
 
-#endif // NINFER_SM70
+#endif // NINFER_TIER_VOLTA
 
 } // namespace ninfer::ops::detail

@@ -337,12 +337,27 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             out << ", control " << product::format_pretty_count(outcome.thinking.injected_tokens);
         }
     }
+    if (outcome.thinking.loop_detected) {
+        out << " | reasoning loop after "
+            << product::format_pretty_count(outcome.thinking.loop_thinking_tokens)
+            << " thinking tokens ("
+            << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated), "
+            << (outcome.thinking.applied ? "concluded" : "stopped");
+    }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
 
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
+    if (outcome.tool_call_parse.recovered_from_reasoning) {
+        return OperationalRecord{
+            .severity = OperationalSeverity::Info,
+            .message  = "req#" + std::to_string(context.id) +
+                        " tool calls recovered from unclosed thinking | calls=" +
+                        std::to_string(outcome.tool_call_parse.structured_call_count),
+        };
+    }
     if (!outcome.tool_call_parse.marker_seen ||
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;
@@ -616,13 +631,16 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                    product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
                    product::format_pretty_bytes(memory.planned_slack_bytes),
                    product::format_pretty_bytes(memory.cuda_graph_allowance_bytes),
-                   product::format_pretty_bytes(memory.cuda_graph_measured_bytes));
-    if (memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+                   memory.cuda_graph_measured_bytes
+                       ? product::format_pretty_bytes(*memory.cuda_graph_measured_bytes)
+                       : std::string("unmeasured (no free device memory left)"));
+    if (memory.cuda_graph_measured_bytes &&
+        *memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
         // The KV pool was sized against the allowance, so the excess came out of the slack left
         // beside it; with no headroom the next allocation can fail.
         logger_->warn("CUDA graphs used {} but the KV sizing allowed {}; leave more room with "
                       "--kv-headroom-mib or --cuda-graph-allowance-mib, or a smaller --kv-capacity",
-                      product::format_pretty_bytes(memory.cuda_graph_measured_bytes),
+                      product::format_pretty_bytes(*memory.cuda_graph_measured_bytes),
                       product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
     }
     logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",

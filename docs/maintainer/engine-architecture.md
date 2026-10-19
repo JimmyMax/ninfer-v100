@@ -556,8 +556,11 @@ Worker 捕获的 host 侧异常（CUDA 错误直接终止进程，不会到达�
 物理状态，二者都必须先等待已发出的工作），再尝试恢复而不是永久锁存：执行同样的 Program cleanup 与
 ResourceManager 清空，以错误完成 active lanes 与 materializing request，保留尚未触及物理状态的 FIFO
 队列。只有 cleanup 后 Program 没有打开的 transaction、`physical_usage()` 的 Device/Host State 与 KV
-占用全部为零时才继续服务；否则，或第三次连续失败（其间没有未取消的请求发布成功结果）时，才锁存为
-Engine-wide failure，`is_available()` 此后为 false。
+占用全部为零时才继续服务；否则，或连续八次恢复之后的下一次失败时，才锁存为 Engine-wide failure，
+`is_available()` 此后为 false。连续指其间没有 work unit（control batch、prefill step、decode round）
+完成，且相邻两次失败相隔不到 30 秒（`runtime/engine/worker_recovery.h` 的 `RecoveryStreak`）：每次恢复
+都经过验证，相隔更久的失败不是该上限要阻止的紧密循环，例如一个客户端反复重发同一个在 admission 时
+耗尽内存的请求。
 恢复清空整个 context cache 而不是把不变量错误解释成 cache miss；启动时 pinned 的 prompt graft 随之
 释放，因此在确认物理占用为零之后按启动时的同一路径重新注入并登记为 external shared prefix，失败则锁存；`RuntimeStats::engine_recoveries`
 计数每次恢复。修复后的缺陷不再能从公开 API 触发，因此 `runtime/engine/worker_fault.h` 提供验证

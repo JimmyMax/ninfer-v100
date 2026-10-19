@@ -414,7 +414,11 @@ void run(const Case& c, std::mt19937& rng) {
                     key.assign(d, 0.0);
                     for (int i = 0; i < d / 2; ++i) {
                         float co = 1.0f, si = 0.0f;
-                        if (inv_freq[i] != 0.0f) { sincosf(float(j) * inv_freq[i], &si, &co); }
+                        if (inv_freq[i] != 0.0f) {
+                            const float angle = float(j) * inv_freq[i];
+                            co                = std::cos(angle);
+                            si                = std::sin(angle);
+                        }
                         const double v0 = __half2float(__float2half(float(v[i])));
                         const double v1 = __half2float(__float2half(float(v[i + d / 2])));
                         const double n0 = v0 * k_norm[i], n1 = v1 * k_norm[i + d / 2];

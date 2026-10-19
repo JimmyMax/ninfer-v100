@@ -4,7 +4,7 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "ops/linear/fp8/fp8_a8_plan.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "core/layout.h"                // 本仓库 V100 增量：WorkspaceLayoutBuilder
 #    include "ninfer/ops/residual_add.h"    // 本仓库 V100 增量
 #    include "ops/linear/fp8/fp8_cutlass_sm70.h"
@@ -77,7 +77,7 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
                                                     std::int32_t input_rows, LinearPolicy policy,
                                                     std::int32_t min_tokens,
                                                     std::int32_t max_tokens) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 支持的两个残差形状在 sm_70 上由 QPN 残差
     // （t<=32，零暂存）与 CUTLASS（t>32，projected 平面 + 按需解量化 GEMM）拥有全部宽度；
     // 容量来自同一决策而不是 route table（测试会强制 unified 表）。
@@ -92,7 +92,9 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 #endif
     return capacity_by_table(
         min_tokens, max_tokens,
-        [](std::int32_t width) { return fused_route_table("unified/fp8_linear_add", width); },
+        [&](std::int32_t width) {
+            return fused_route_table("unified/fp8_linear_add", width, fp8_wide_route_table(policy));
+        },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
                        ? unified::fp8_linear_add_workspace_capacity_bytes(
@@ -104,7 +106,7 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：sm_70 上 QPN 支持的残差形状全部宽度绕过 route
     // table——t<=32 走 QPN 残差内核（零暂存），t>32 走 CUTLASS 宽 T + residual_add。必须在
     // route-table 检查之前拦截。
@@ -121,7 +123,8 @@ void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& resi
         return;
     }
 #endif
-    if (fused_route_table("unified/fp8_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
+    if (fused_route_table("unified/fp8_linear_add", x.ne[1], fp8_wide_route_table(policy)) ==
+        LinearRouteTable::Unified) {
         unified::fp8_linear_add_dispatch(x, weight, residual, unified_policy(policy), workspace,
                                          stream);
         return;

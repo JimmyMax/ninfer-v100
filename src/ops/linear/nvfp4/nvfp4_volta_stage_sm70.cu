@@ -1,7 +1,7 @@
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
 
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include <cuda_bf16.h>
 #    include <cuda_fp16.h>
 

@@ -12,7 +12,7 @@ using Fp8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 // 本仓库 V100 增量（docs/v100/PLAN.md）：FP8 的 Volta QPN（quadpair-split-N）路线。
 // QPN 在 sm_70 上拥有受支持形状的全部宽度（宽 T 分块成 32 列）；预打包布局见
 // fp8_prepack_sm70.h。
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 inline constexpr std::int32_t kFp8VoltaQpnRowsPerTile = 8;
 inline constexpr std::int32_t kFp8VoltaQpnMaxTokens   = 32;
 void fp8_stage_bf16_activation_sm70(const Tensor& x, void* fp16_out, cudaStream_t stream);

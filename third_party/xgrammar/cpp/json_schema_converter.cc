@@ -2552,29 +2552,28 @@ int32_t JSONSchemaConverter::GenerateString(const StringSpec& spec, const std::s
   }
   // Check for length constraints
   if (spec.min_length != 0 || spec.max_length != -1) {
-    // One FSM atom represents one decoded Unicode scalar, irrespective of JSON spelling.
-    int32_t character = RegexExpression(R"([\u0000-\u{10ffff}])", true);
-    if (spec.max_length == -1) {
-      int32_t body = Repeat(rule_name + "_characters", character, spec.min_length, -1);
-      return Sequence({ByteString("\""), body, ByteString("\"")});
+    if (spec.max_length == 0) {
+      return ByteString("\"\"");
     }
-    // NInfer: a bounded string is a chain of rules, one per count still allowed, instead of a
-    // counted repetition. A position inside a counted repetition has no cacheable token mask, so
-    // every mask re-parsed the whole vocabulary with a cost growing with the count (seconds per
-    // token for a 262,144-token vocabulary at maxLength 200); each chain rule's start is an
-    // ordinary rule position whose mask the compiler caches.
-    int32_t tail = Empty();
-    for (int remaining = 1; remaining <= spec.max_length - spec.min_length; ++remaining) {
-      tail = RuleRef(builder_.AddRuleWithHint(
-          rule_name + "_up_to_" + std::to_string(remaining),
-          Choice({Empty(), Sequence({character, tail})})
-      ));
+    // NInfer: one rule holds both quotes around a counted repetition of one decoded Unicode scalar
+    // in any JSON spelling, a unit every length-bounded string of the grammar shares. The unit is a
+    // deterministic, prefix-free byte language and the quote after it cannot start one, so the
+    // matcher decides most tokens inside the string from the repetitions left
+    // (PopulateRepeatMasks) instead of replaying each against the parse.
+    if (!json_string_scalar_rule_id_.has_value()) {
+      const int32_t scalar = RegexExpression(R"([\u0000-\u{10ffff}])", true);
+      json_string_scalar_rule_id_ = builder_.AddRuleWithHint(
+          "json_string_scalar", builder_.AddChoices({builder_.AddSequence({scalar})})
+      );
     }
-    std::vector<int32_t> parts{ByteString("\"")};
-    parts.insert(parts.end(), spec.min_length, character);
-    parts.push_back(tail);
-    parts.push_back(ByteString("\""));
-    return Sequence(parts);
+    const int32_t upper = spec.max_length == -1 ? INT32_MAX : spec.max_length;
+    const int32_t repeat = builder_.AddRepeat(*json_string_scalar_rule_id_, spec.min_length, upper);
+    return RuleRef(builder_.AddRuleWithHint(
+        rule_name + "_bounded",
+        builder_.AddChoices(
+            {builder_.AddSequence({ByteString("\""), repeat, ByteString("\"")})}
+        )
+    ));
   }
   // Default string
   return Sequence({ByteString("\""), RegexExpression(R"([\u0000-\u{10ffff}]*)", true), ByteString("\"")});

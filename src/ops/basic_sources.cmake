@@ -1,6 +1,7 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/add_bias.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/argmax.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/cast.cu"
@@ -74,24 +75,38 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pos_embed.cpp"
 )
 
+# The GGUF CPU expert products read ggml's i-quant grids (ggml-common.h only) and reproduce the
+# GPU's products bit for bit, so no compiler may fuse their multiplies and adds.
+set(gguf_cpu_no_contract "")
+if(NOT MSVC)
+  set(gguf_cpu_no_contract "-ffp-contract=off")
+endif()
+set_source_files_properties(
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_avx2.cpp"
+  PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
+  PROPERTIES COMPILE_OPTIONS "${gguf_cpu_no_contract}")
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   set(cpu_expert_dir "${CMAKE_CURRENT_LIST_DIR}/moe_experts")
   target_sources(ninfer_ops PRIVATE
     "${cpu_expert_dir}/moe_expert_cpu_avx2.cpp"
     "${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
-    "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
-    "${cpu_expert_dir}/gguf_expert_cpu_avx512.cpp")
+    "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp")
   set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu.cpp" "${cpu_expert_dir}/gguf_expert_cpu.cpp"
     PROPERTIES COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
   if(MSVC)
     set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp" "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
       PROPERTIES COMPILE_OPTIONS /arch:AVX2 COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
-    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp" "${cpu_expert_dir}/gguf_expert_cpu_avx512.cpp"
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
       PROPERTIES COMPILE_OPTIONS /arch:AVX512 COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
   else()
-    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp" "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp"
       PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
-    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp" "${cpu_expert_dir}/gguf_expert_cpu_avx512.cpp"
+    set_source_files_properties("${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
+      PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
       PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512dq;-mf16c;-mfma"
       COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
   endif()

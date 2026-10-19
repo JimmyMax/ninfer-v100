@@ -60,15 +60,23 @@ enum class LinearPolicy : std::uint8_t {
            policy == LinearPolicy::AllowPrefillCublas;
 }
 
-/// The cuBLAS prefill route. Only ever admitted above `kCublasPrefillMinTokens`, because its
-/// dequantise pass is weight-sized and has to be amortised over the tokens in the call.
+/// The cuBLAS prefill route. Only ever admitted past a width gate, because its dequantise pass is
+/// weight-sized and has to be amortised over the tokens in the call.
 [[nodiscard]] constexpr bool allows_cublas_prefill(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowPrefillCublas;
 }
 
-/// Below this width the route loses to the integer mainloop it replaces: the dequantise pass costs
-/// the same whatever the token count, so a narrow call pays for it without the GEMM to amortise it.
+/// The route's width gate where the device profile names none: from here it beats the integer
+/// mainloop it replaces on every card measured. The dequantise pass costs the same whatever the
+/// token count, so a narrow call pays for it without the GEMM to amortise it; where the narrower
+/// gate lies depends on the card and on whether the width is a multiple of the integer route's
+/// 128-column tile, so a calibrated profile places it per Op (`w4_cublas/...` keys).
 inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
+
+/// No profile moves the gate to this width or below it: a decode or verify round runs up to
+/// kMaximumConcurrency lanes of a 16-token window, 8 x 16 = 128 columns, through the same Ops and
+/// policies, and those rounds stay off the route.
+inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
 
 /**
  * Returns the caller-owned transient capacity required by Linear for every T in the inclusive

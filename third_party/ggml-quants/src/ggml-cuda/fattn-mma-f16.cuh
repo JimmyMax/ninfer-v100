@@ -1781,7 +1781,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        // NInfer: backport llama.cpp 1bb2b9fcbe85c35c4e3b787e1c868ef05ca702f3.
+        if (np > 1 || nbatch_combine != DKQ/2) {
             __syncthreads();
         }
     }

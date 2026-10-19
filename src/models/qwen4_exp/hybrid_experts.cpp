@@ -29,6 +29,9 @@ HybridExpertOptions validated(HybridExpertOptions options) {
         options.cpu_threads > 256) {
         throw std::invalid_argument("hybrid experts: DMA share must be 0..1 and CPU threads 0..256");
     }
+    if (options.dma_share_auto) {
+        throw std::invalid_argument("--expert-dma-share auto needs GGUF experts");
+    }
     return options;
 }
 

@@ -17,6 +17,13 @@ ROOT = Path(__file__).resolve().parents[2]
 STATE = Path(os.environ.get("NINFER_POD_STATE", ROOT / ".local/pods/pod.json")).expanduser().resolve()
 REMOTE = "/workspace/ninfer-work"
 SSH_KEY = Path(os.environ.get("NINFER_POD_SSH_KEY", str(Path.home() / ".ssh/id_ed25519")))
+# Vast hosts set their own per-GB prices for download and upload traffic on top of the hourly
+# rate; on 2026-10-14 two hosts charged $0.026 and $0.039 per GB, 23 times the GPU time of the run.
+# Offers above this download price are left out unless a query or option names another.
+MAX_DOWNLOAD_COST = 0.005
+# RunPod bills no traffic and its container disk at $0.10 per GB-month while the pod runs
+# (docs.runpod.io/pods/pricing).
+RUNPOD_DISK_HOURLY = 0.10 / 730
 
 
 def run(argv, **kwargs):
@@ -78,6 +85,53 @@ def vast(*args):
     if args[0] == "start" and isinstance(parsed, dict) and parsed.get("success") is False:
         raise provider_rejection("start", parsed.get("msg", ""))
     return parsed
+
+
+def with_download_cap(query, cap):
+    return query if "inet_down_cost" in query else f"{query} inet_down_cost<={cap}"
+
+
+def vast_cost(offer, hours, download_gb, upload_gb):
+    # dph_total already includes the disk the offer search priced (--storage).
+    return (offer["dph_total"] * hours + download_gb * (offer.get("inet_down_cost") or 0) +
+            upload_gb * (offer.get("inet_up_cost") or 0))
+
+
+def runpod_catalog():
+    # Prices and stock of every RunPod GPU type; None when the CLI is missing or fails.
+    try:
+        result = subprocess.run(["runpodctl", "gpu", "list", "--include-unavailable", "-o", "json"],
+                                capture_output=True, text=True)
+        return json.loads(result.stdout) if result.returncode == 0 else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def runpod_quote(catalog, name, gpus, hours, disk):
+    # The RunPod type whose display name or GPU id names the same card ("RTX 3090" matches
+    # "NVIDIA GeForce RTX 3090", not "... RTX 3090 Ti"); pod-up.sh rents on the community cloud
+    # unless given --secure.
+    wanted = name.lower()
+    gpu = next((g for g in catalog or () if g["displayName"].lower() == wanted or
+                g["gpuId"].lower() == wanted or g["gpuId"].lower().endswith(" " + wanted)), None)
+    if gpu is None:
+        return None
+    secure = not (gpu.get("communityCloud") and gpu.get("communityPricePerHr"))
+    hourly = gpu["securePricePerHr"] if secure else gpu["communityPricePerHr"]
+    if not hourly:
+        return None
+    command = f"~/runpod/pod-up.sh --gpu '{gpu['gpuId']}' --gpus {gpus} --disk {disk}"
+    return {"gpu": gpu["gpuId"], "available": bool(gpu.get("available")),
+            "cloud": "secure" if secure else "community", "hourly": hourly * gpus,
+            "cost": round((hourly * gpus + disk * RUNPOD_DISK_HOURLY) * hours, 3),
+            "command": command + (" --secure" if secure else "")}
+
+
+def preferred(vast_total, runpod):
+    # RunPod wins a tie: no traffic billing and no per-host price surprises.
+    if runpod and runpod["available"] and (vast_total is None or runpod["cost"] <= vast_total):
+        return "runpod"
+    return "vast" if vast_total is not None else None
 
 
 def save(state):
@@ -274,13 +328,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("inventory")
+
+    def cost_options(command):
+        command.add_argument("--disk", default=180, type=int)
+        command.add_argument("--download-gb", default=0, type=float,
+                             help="data the jobs will download, for the traffic cost")
+        command.add_argument("--upload-gb", default=0, type=float)
+        command.add_argument("--max-download-cost", default=MAX_DOWNLOAD_COST, type=float,
+                             help="highest download price in $/GB")
+
     offers = sub.add_parser("offers")
     offers.add_argument("query")
+    offers.add_argument("--hours", default=1, type=float, help="planned rental time")
+    offers.add_argument("--runpod-gpu", help="RunPod GPU type to compare (default: the gpu_name)")
+    cost_options(offers)
     rent = sub.add_parser("rent")
     rent.add_argument("offer", type=int)
     rent.add_argument("--hours", required=True, type=float)
-    rent.add_argument("--disk", default=180, type=int)
     rent.add_argument("--image", required=True)
+    rent.add_argument("--over-runpod", action="store_true",
+                      help="rent on Vast although RunPod quotes the same card for no more")
+    cost_options(rent)
     attach = sub.add_parser("attach")
     attach.add_argument("--host", required=True)
     attach.add_argument("--port", required=True, type=int)
@@ -331,11 +399,23 @@ def main():
         print(json.dumps([{k: p.get(k) for k in keys} for p in vast("show", "instances")], indent=2))
         return
     if args.command == "offers":
-        offers = vast("search", "offers", args.query, "--storage", 180,
-                      "--limit", 10, "-o", "dph_total")
+        # The cheapest offers by the estimate of the whole rental, hours and traffic, against
+        # RunPod's price for the same card.
+        offers = vast("search", "offers", with_download_cap(args.query, args.max_download_cost),
+                      "--storage", args.disk, "--limit", 40, "-o", "dph_total")
         keys = ("id", "gpu_name", "num_gpus", "cpu_name", "cpu_cores_effective", "cpu_ram",
-                "dph_total", "disk_space", "disk_bw", "inet_down", "cuda_max_good", "geolocation")
-        print(json.dumps([{k: p.get(k) for k in keys} for p in offers], indent=2))
+                "dph_total", "inet_down_cost", "inet_up_cost", "disk_space", "disk_bw",
+                "inet_down", "cuda_max_good", "gpu_max_power", "geolocation")
+        rows = sorted(({**{k: p.get(k) for k in keys},
+                        "cost": round(vast_cost(p, args.hours, args.download_gb, args.upload_gb), 3)}
+                       for p in offers), key=lambda p: p["cost"])[:10]
+        name = re.search(r"gpu_name=(\S+)", args.query)
+        gpus = re.search(r"num_gpus=(\d+)", args.query)
+        name = args.runpod_gpu or (name and name.group(1).replace("_", " "))
+        runpod = name and runpod_quote(runpod_catalog(), name, int(gpus.group(1)) if gpus else 1,
+                                       args.hours, args.disk) or None
+        print(json.dumps({"vast": rows, "runpod": runpod,
+                          "choice": preferred(rows[0]["cost"] if rows else None, runpod)}, indent=2))
         return
     if args.command == "_guard":
         print(json.dumps({"guard": "armed", "instance": args.instance,
@@ -404,6 +484,22 @@ def main():
         if STATE.exists() and not state().get("destroyed"):
             raise ValueError("a pod is already attached; finish it before renting another")
         vast("show", "instances")  # Fresh inventory before creation.
+        # The search matches an offer by ask_contract_id; "id=" finds nothing.
+        listed = vast("search", "offers", f"ask_contract_id={args.offer} verified=any",
+                      "--storage", args.disk)
+        if not listed:
+            raise ValueError("the offer is no longer listed")
+        offer = listed[0]
+        download_cost = offer.get("inet_down_cost") or 0
+        if download_cost > args.max_download_cost:
+            raise ValueError(f"the offer bills ${download_cost:.4f}/GB of downloads, over "
+                             f"--max-download-cost {args.max_download_cost}")
+        cost = vast_cost(offer, args.hours, args.download_gb, args.upload_gb)
+        runpod = runpod_quote(runpod_catalog(), offer["gpu_name"], offer.get("num_gpus") or 1,
+                              args.hours, args.disk)
+        if preferred(cost, runpod) == "runpod" and not args.over_runpod:
+            raise ValueError(f"RunPod quotes ${runpod['cost']} against ${cost:.3f} here; rent there "
+                             f"({runpod['command']}, then attach) or pass --over-runpod")
         public = SSH_KEY.with_suffix(".pub").read_text().strip()
         keys = vast("show", "ssh-keys")
         if not any(public.split()[1] in str(key) for key in keys):
@@ -421,7 +517,9 @@ def main():
         if not result.get("success"):
             raise RuntimeError("provider did not create an instance")
         pod = {"provider": "vast", "id": result["new_contract"],
-               "deadline": time.time() + args.hours * 3600}
+               "deadline": time.time() + args.hours * 3600,
+               "estimate": {"hourly": offer["dph_total"], "inet_down_cost": download_cost,
+                            "download_gb": args.download_gb, "cost": round(cost, 3)}}
         save(pod)
         arm_guard(pod, args.hours)
         return

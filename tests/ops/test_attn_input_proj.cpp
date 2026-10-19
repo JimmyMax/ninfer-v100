@@ -7,7 +7,7 @@
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/linear/sm70/sm70_project.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/attn_input_proj/fp8/fp8_attn_input_cutlass_sm70.h"
 #endif
 
@@ -545,7 +545,7 @@ int run_fp8_target() {
         }
         const auto interval = ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, policy, 1, 128);
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
         // 本仓库 V100 增量：FP8 的注意力投影在 sm_70 上由 QPN（t<=32，零暂存）与 CUTLASS
         // （t>=33）拥有全部宽度，所以 A16 区间的容量是 CUTLASS 路线在 128 列上的需要。
         const std::size_t a16_interval =

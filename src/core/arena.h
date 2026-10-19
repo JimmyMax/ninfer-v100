@@ -43,11 +43,11 @@ private:
 };
 
 namespace core {
-// WDDM residency (Windows builds with NINFER_D3D12_RESIDENCY, --wddm-evictable-budget): owning
-// DeviceArenas come from a D3D12 heap held resident at maximum priority, so WDDM evicts other
-// allocations on the adapter rather than paging the arena out. Elsewhere enabling it throws.
-void set_wddm_residency_lock_enabled(bool enabled);
-[[nodiscard]] bool wddm_residency_lock_enabled() noexcept;
+// The WDDM evictable budget (Windows builds, --wddm-evictable-budget): every owning DeviceArena
+// commits its pages when it is created, so WDDM makes room for them at startup rather than at the
+// first launch that touches them. Other builds refuse to enable it.
+void set_wddm_evictable_budget(bool enabled);
+[[nodiscard]] bool wddm_evictable_budget() noexcept;
 } // namespace core
 
 class DeviceArena {

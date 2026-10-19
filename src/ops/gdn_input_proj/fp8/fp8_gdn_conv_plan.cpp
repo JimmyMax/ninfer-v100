@@ -51,7 +51,7 @@ Fp8GdnConvPlan b1_a16_plan(std::int32_t width) {
     // （t<=32）与 CUTLASS（t>=33）读得对；融合核按行主序读，所以 sm_70 上这个形状一律走
     // 物化路线：投影由 fp8_gdn_input_a16_dispatch 分派到 QPN，卷积由独立的 projected-conv
     // 核完成。
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     (void)width;
     const bool fused = false;
 #else

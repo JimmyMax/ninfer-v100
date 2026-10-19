@@ -17,7 +17,7 @@
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
 #    include "ops/linear/nvfp4/nvfp4_launch.h" // 本仓库 V100 增量：QPN 常量/声明
 #    include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h" // 本仓库 V100 增量：宽 T 容量
 #endif
@@ -31,6 +31,7 @@
 #include <string>
 
 #include "ops/linear_swiglu/q4a8/q4a8_linear_swiglu.h"
+#include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 
 namespace ninfer::ops {
@@ -110,12 +111,16 @@ std::size_t grouped_integer_workspace_bytes(std::size_t a16, std::int32_t output
                                             std::int32_t min_tokens, std::int32_t max_tokens) {
     const bool integer_shape = output_rows == 5120 && (input_rows == 17408 || input_rows == 6144);
     if (!allows_a8_int(policy) || !integer_shape) { return a16; }
-    // See linear_swiglu: where the cuBLAS route is admitted it is the widest claimant, so any
-    // interval reaching its width gate must reserve for it.
-    if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
-        return std::max(a16, detail::w4_cublas_prefill_workspace_capacity_bytes(
-                                 output_rows, input_rows,
-                                 std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
+    // See linear_swiglu: an interval the cuBLAS route takes any width of reserves for it from the
+    // narrowest such width, on top of the integer routes it admits as well.
+    if (allows_cublas_prefill(policy)) {
+        const std::size_t integer = grouped_integer_workspace_bytes(
+            a16, output_rows, input_rows, LinearPolicy::AllowA8Int, min_tokens, max_tokens);
+        const std::int32_t first = detail::cublas_prefill_first_width(
+            *detail::cublas_linear_add_family(input_rows), min_tokens, max_tokens);
+        if (first == 0) { return integer; }
+        return std::max(integer, detail::w4_cublas_prefill_workspace_capacity_bytes(
+                                     output_rows, input_rows, first, max_tokens));
     }
     if (min_tokens == max_tokens) {
         return detail::a8_add_tokens_supported(min_tokens)
@@ -212,7 +217,7 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return linear_add_route_workspace_bytes(qtype, output_rows, input_rows, policy, lo, hi);
     };
     // Every width of a dense format takes an sm_70 route there.
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量：NVFP4 down 的两个形状在 sm_70 上整段交给 nvfp4 plan 决定
     // （t <= 32 走 QPN residual，更宽走 CUTLASS），不再经过 sm70 路线——所以容量也必须完全
     // 由 plan 给出，才能保持“查询即执行高水位”。
@@ -247,7 +252,7 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     }
 
     if (detail::sm70::covers(w, t)
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
         // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 down 在 sm_70 上全宽度交给
         // nvfp4_linear_add_dispatch——t <= 32 走 QPN residual，更宽走 CUTLASS sm_70 + residual_add。
         && !(w.qtype == QType::NVFP4 && w.n == 5120 && (w.k == 6144 || w.k == 17408))
@@ -299,7 +304,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
                 "linear_add: Q4 requires 16-byte x/residual/code/scale alignment");
         }
         // The same prefill routes as Q5 below, in the same order.
-        if (allows_cublas_prefill(policy) && t >= kCublasPrefillMinTokens &&
+        const auto* cublas_family = detail::cublas_linear_add_family(w.k);
+        if (allows_cublas_prefill(policy) && cublas_family != nullptr && w.n == 5120 &&
+            detail::cublas_prefill_takes(*cublas_family, t) &&
             detail::w4_cublas_prefill_supported(w, t)) {
             detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
             return;
@@ -324,8 +331,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         // About 1.9x the integer route at 4096 tokens; below the width gate it loses, because the
         // dequantise pass costs the same whatever the token count. The shape was checked above and
         // the route takes any token count, so unlike the integer route below it is not gated on a
-        // 128-token tile -- an unaligned final chunk is where it is furthest ahead.
-        if (allows_cublas_prefill(policy) && t >= kCublasPrefillMinTokens &&
+        // 128-token tile -- an unaligned final chunk is where it is furthest ahead. The device
+        // profile places the gate (cublas_prefill_gate.h).
+        if (allows_cublas_prefill(policy) &&
+            detail::cublas_prefill_takes(*detail::cublas_linear_add_family(w.k), t) &&
             detail::w4_cublas_prefill_supported(w, t)) {
             detail::w4_cublas_add_launch(x, w, residual_out, ws, stream);
             return;

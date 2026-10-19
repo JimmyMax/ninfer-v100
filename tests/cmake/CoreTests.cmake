@@ -30,6 +30,10 @@ ninfer_add_test(ninfer_device_buffer_visibility_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device_buffer_visibility.cu"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_expert_delivery_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_delivery.cu"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_vmm_graph_remap_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_vmm_graph_remap.cu"
   LIBRARIES ninfer_core CUDA::cuda_driver)
@@ -64,8 +68,8 @@ ninfer_add_test(ninfer_disk_kv_bridge_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_bridge.cpp"
   LIBRARIES ninfer_core)
 
-ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
-  LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cu"
+  LIBRARIES ninfer_ops)
 
 set_tests_properties(ninfer_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:")

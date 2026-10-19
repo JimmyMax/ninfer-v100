@@ -12,6 +12,7 @@
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
+#include "models/qwen3_5/execution/expert_runtime.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/graft_injection.h"
 
@@ -301,6 +302,8 @@ struct CapturePressureCandidateImpl : ResourceCandidateState {};
 struct HybridQuoteImpl {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
+    std::shared_ptr<text::GrammarState> grammar;
+    bool logprobs                             = false;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -581,11 +584,16 @@ struct RequestControl {
 
     std::optional<Prefill> prefill;
 
-    // Returns the request slot to Empty once its lane's resources have been released.
+    // Returns the request slot to Empty once its lane's resources have been released. Nothing of
+    // the request survives into the lane's next one: its grammar and its logprob switch belong to
+    // the request, whichever admission path installs the next.
     void retire() noexcept {
         prefill.reset();
         lifecycle            = Lifecycle::Empty;
         pending              = {};
+        mask_cost            = {};
+        next_mask_frontier   = 0;
+        logprobs             = false;
         active_resources     = {};
         optional_resources   = {};
         publish_continuation = true;
@@ -593,6 +601,8 @@ struct RequestControl {
         lease_space_limited  = false;
         lease_minimum_target = {};
         lease_ceiling        = 0;
+        grammar.reset();
+        next_mask.reset();
     }
 };
 
@@ -631,7 +641,8 @@ public:
     };
 
     ProgramImpl(const execution::Parameters& parameters, const SequencePlanImpl& plan,
-                DeviceContext& device, const StartupObserver& startup_observer);
+                DeviceContext& device, const StartupObserver& startup_observer,
+                std::unique_ptr<execution::NativeExpertRuntime> experts);
     ~ProgramImpl() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -862,8 +873,9 @@ public:
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     // Free device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
-    // launch of every executable), for comparison with graph_allowance_bytes.
-    std::size_t graph_measured_bytes = 0;
+    // launch of every executable), for comparison with graph_allowance_bytes; empty when no free
+    // memory was left to measure it by.
+    std::optional<std::size_t> graph_measured_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     // Overlay Vision residency only: the persistent arena is VMM-backed so free KV granules can be
@@ -948,6 +960,9 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
 
+    // Declared before Graphs so all graph users die before the delivery tables and service.
+    std::unique_ptr<execution::NativeExpertRuntime> experts;
+    ExpertDeliveryStats expert_startup_stats;
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
@@ -1633,6 +1648,13 @@ private:
                                      qwen3_5::ContinuationSummary& summary) noexcept;
     bool salvage_continuation(SequenceState& state, RequestControl& request, std::uint32_t lane,
                               std::uint32_t continuation_index, qwen3_5::AbortResult& out) noexcept;
+    // Keeps the checkpoints a cancelled prefill has already captured when its live state cannot
+    // be salvaged as an endpoint: they are published as a continuation without one, truncated to
+    // the deepest checkpoint. Declines, leaving the lane untouched for the strict clear, unless
+    // the lane holds a retained checkpoint and a settled exclusive writer.
+    bool retain_prefill_progress(SequenceState& state, RequestControl& request, std::uint32_t lane,
+                                 std::uint32_t continuation_index,
+                                 qwen3_5::AbortResult& out) noexcept;
     [[nodiscard]] detail::PhysicalResources
     release_checkpoint_reference(StateImageHandle checkpoint) noexcept;
     [[nodiscard]] bool can_release_shared_prefix_state(std::uint32_t index,

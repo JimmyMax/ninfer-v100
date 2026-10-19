@@ -162,13 +162,15 @@ int main(int argc, char** argv) {
         engine_options.prefill_a8            = options.prefill_a8;
         engine_options.prefill_cublas        = options.prefill_cublas;
         engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
+        engine_options.expert_residency      = options.expert_residency;
+        engine_options.expert_cache_bytes    = options.expert_cache_bytes;
 
         ninfer::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;
         env.artifact_file_size_bytes = ninfer::bench::file_size_or_zero(options.artifact_path);
         env.max_context              = max_context;
         env.rope_yarn_factor         = options.rope_yarn_factor;
-        env.prefill_chunk            = options.prefill_chunk;
+        env.expert_residency         = options.expert_residency;
         env.fast_prefill_kernel      = options.fast_prefill_kernel;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;
@@ -189,6 +191,7 @@ int main(int argc, char** argv) {
         fill_cuda_environment(env, options.device);
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();
+        env.prefill_chunk = engine.options().prefill_chunk;
 
         prime_decode_graph(engine, env, corpus);
 
@@ -224,6 +227,7 @@ int main(int argc, char** argv) {
             results.push_back(std::move(result));
         }
 
+        env.experts = engine.runtime_stats().experts;
         std::string report;
         switch (options.output) {
         case ninfer::bench::OutputFormat::Table:
