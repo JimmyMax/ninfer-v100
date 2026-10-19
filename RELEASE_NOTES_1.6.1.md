@@ -52,22 +52,23 @@ token than it saves.
 
 ## Changed: the V100 container image
 
-The V100 build is published as **`ghcr.io/jimmymax/ninfer-v100:sm70`** (`:<version>-sm70` pins a
-release), built from the new `Dockerfile.sm70`: CUDA 12.8 on Ubuntu 24.04, about 3 GB.
+The V100 build is **`ghcr.io/jimmymax/ninfer-v100:latest`** (`:<version>` pins a release, `sm70` is an
+alias), built from the new `Dockerfile.sm70`: CUDA 12.8 on Ubuntu 24.04, about 3 GB. The CUDA 13 image
+for the RTX 30/40/50 line stays at `:sm86-sm120a`.
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
-  -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100:sm70 \
+  -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100:latest \
   ninfer-serve /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model \
   --max-context 200000 --prefill-chunk 2048 --kv-dtype int8 \
   --spec mtp --draft-tokens 4 --lm-head-draft --ngram-draft-tokens 0
 ```
 
-`latest` stays the `sm_86`/`sm_120a` image, which no V100 can run; on this card use `:sm70`.
+`sm86-sm120a` stays the `sm_86`/`sm_120a` image, which no V100 can run.
 
 ## Fixed in the image, before anything else shipped
 
-The first `sm70` image set `ENTRYPOINT ["ninfer-serve"]`, so a compose `command:` list -- which names
+The first image this release published set `ENTRYPOINT ["ninfer-serve"]`, so a compose `command:` list -- which names
 the program itself, as every ninfer compose file does -- started `ninfer-serve ninfer-serve
 /models/x.ninfer` and the server stopped with
 
@@ -76,7 +77,7 @@ ninfer-serve: unknown argument: /workspace/models/x.ninfer
 ```
 
 The image now sets no entrypoint, like the other ninfer images, and the commands above name
-`ninfer-serve` first. `1.6.1-sm70` and `sm70` are rebuilt with that fix: the binaries are the same,
+`ninfer-serve` first. `1.6.1`, `latest` and `sm70` are rebuilt with that fix: the binaries are the same,
 and nothing else in this release changed.
 
 ## Assets

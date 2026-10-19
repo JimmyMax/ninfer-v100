@@ -202,19 +202,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # `sm70` moves with each release the way `latest` does for the sm_86/sm_120a image. The pinned
-      # tag drops the leading v, so 1.6.1-sm70 matches the release it came from.
-      - name: Build and push
+      # This repository builds one thing, so the V100 build owns the plain tags: `latest` and the
+      # version. `sm70` stays as an alias for instructions that already name it.
+      - name: Build, check and push
         run: |
           set -euo pipefail
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           version="${{ needs.build.outputs.version }}"
           docker build -f Dockerfile.sm70 \
-            -t "$image:${version#v}-sm70" \
-            -t "$image:sm70" \
-            image
-          docker push "$image:${version#v}-sm70"
-          docker push "$image:sm70"
+            -t "$image:${version#v}" -t "$image:latest" -t "$image:sm70" image
+
+          # A compose file names the program in its `command:` list, so an ENTRYPOINT here would pass
+          # `ninfer-serve` twice and the service would restart forever. v1.6.1 shipped that bug once.
+          entrypoint="$(docker inspect --format '{{json .Config.Entrypoint}}' "$image:${version#v}")"
+          if [ "$entrypoint" != "null" ]; then
+            echo "::error::Dockerfile.sm70 must not set an ENTRYPOINT (found $entrypoint): a compose command would pass ninfer-serve twice"
+            exit 1
+          fi
+          docker run --rm --entrypoint /bin/sh "$image:${version#v}" -c 'test -x /usr/local/bin/ninfer-serve'
+
+          for tag in "${version#v}" latest sm70; do
+            docker push "$image:$tag"
+          done
 
   release:
     name: Publish GitHub Release

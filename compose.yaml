@@ -7,7 +7,7 @@
 # Every NINFER_* variable scripts/run.sh documents can be set under `environment`.
 services:
   ninfer:
-    image: ghcr.io/jimmymax/ninfer-v100:latest
+    image: ghcr.io/jimmymax/ninfer-v100:sm86-sm120a
     command: ["run", "qwen38-27b"]
     ports:
       - "8080:8080"

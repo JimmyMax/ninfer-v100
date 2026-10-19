@@ -517,32 +517,38 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 
 ## Docker
 
-`ghcr.io/jimmymax/ninfer-v100:latest` is built from the newest `main` commit that passes CI, on
-CUDA 13.4 and Ubuntu 26.04; a commit that changes only documentation or tooling the image does not
-carry keeps the image before it. It carries two builds and starts the one that matches the GPU: `sm_86` for
-the RTX 30 and RTX 40 series, `sm_120a` for the RTX 50 series and the RTX PRO 6000 Blackwell.
-
-The Tesla V100 is not in that image: CUDA 13 no longer compiles `sm_70`, so the release build
-publishes the Volta build under its own tag, from `Dockerfile.sm70`. `ghcr.io/jimmymax/ninfer-v100:sm70`
-follows the newest release and `:<version>-sm70` pins one. It is CUDA 12.8 on Ubuntu 24.04 and, like
-the other ninfer images, sets no entrypoint, so the command names `ninfer-serve` first:
+`ghcr.io/jimmymax/ninfer-v100:latest` **is the Tesla V100 build**: sm_70, CUDA 12.8 on Ubuntu 24.04,
+packed by the release pipeline from [Dockerfile.sm70](Dockerfile.sm70). `:<version>` pins a release
+(`1.6.1`), and `sm70` is kept as an alias. Like the other ninfer images it sets no entrypoint, so the
+command names `ninfer-serve` first:
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
-  -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100:sm70 \
+  -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100:latest \
   ninfer-serve /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model \
   --max-context 32768 --kv-dtype int8
 ```
 
-- **Host.** An NVIDIA driver of the CUDA 13 branch (580 or newer) and the
+- **Host.** An NVIDIA driver of the CUDA 12 branch or newer and the
   [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-- **Tags.** `latest`, `sha-<commit>` and the `VERSION` for the `sm_86`/`sm_120a` image; `sm70` and
-  `<version>-sm70` for the V100. The image is 1.6 GB compressed, the V100 one about 3 GB.
+- **Tags.** `latest`, `<version>` and `sm70`; `sha-<commit>` for a single commit. About 3 GB compressed.
+- **Volumes.** `/models` holds the artifacts.
+
+[deploy/compose.gemma-v100.example.yml](deploy/compose.gemma-v100.example.yml) is the same service in
+a compose file; its `command:` list names `ninfer-serve`, which is what the V100 image expects.
+
+### The CUDA 13 image (RTX 30, 40 and 50)
+
+`ghcr.io/jimmymax/ninfer-v100:sm86-sm120a` is the other build, from the upstream [Dockerfile](Dockerfile):
+`sm_86` for the RTX 30 and RTX 40 series, `sm_120a` for the RTX 50 series and the RTX PRO 6000
+Blackwell, CUDA 13.4 on Ubuntu 26.04. **No V100 can run it** — on this card use `latest`.
+
+- **Tags.** `sm86-sm120a` and `sha-<commit>`; 1.6 GB compressed.
 - **Volumes.** `/models` holds artifacts, `/cache` the device profile measured on first start, and
   `/grafts/<model>/` optional [prompt grafts](docs/serving.md#prompt-grafts).
 - **Checked** on an RTX 3090 and an RTX 5090 with driver 580.159.03.
 
-The container's command chooses what runs:
+Its command chooses what runs:
 
 | command | runs |
 |---|---|
@@ -553,16 +559,16 @@ The container's command chooses what runs:
 The official Qwen3.8-27B with the measured `tuned` profile, on http://localhost:8080/v1:
 
 ```bash
-docker run --rm -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100 download qwen38-27b
+docker run --rm -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100:sm86-sm120a download qwen38-27b
 docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
   -v "$PWD/models:/models" -v ninfer-cache:/cache \
-  ghcr.io/jimmymax/ninfer-v100 run qwen38-27b
+  ghcr.io/jimmymax/ninfer-v100:sm86-sm120a run qwen38-27b
 ```
 
-[compose.yaml](compose.yaml) wires the GPU, the port and the volumes for the same:
+[compose.yaml](compose.yaml) wires that image's GPU, port and volumes:
 `docker compose run --rm ninfer download qwen38-27b`, then `docker compose up -d`.
-`NINFER_IMAGE_ARCH=sm86|sm120a` overrides the GPU detection, and `docker build -t ninfer .` builds
-the image from source (`--build-arg ARCHS=86` for one architecture).
+`NINFER_IMAGE_ARCH=sm86|sm120a` overrides the GPU detection, and `docker build -t ninfer .` builds it
+from source (`--build-arg ARCHS=86` for one architecture).
 
 ## Building
 
