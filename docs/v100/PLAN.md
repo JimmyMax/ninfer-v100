@@ -65,24 +65,26 @@ Gemma 只有上游能跑。加速增量应当往上游线上做。
 | 分支 | 基座 | 角色 |
 |---|---|---|
 | `master`（原仓库） | geoffwatts/ninfer-v100 + 本地 72 提交 | **Qwen 生产线**，V100 专精实现，继续调优 |
-| **`gemma`（本分支）** | `iamwavecut/master`（`fcc4928a`） | **Gemma + gguf 家族线**，在其上做 V100 加速增量 |
+| **`main`（本分支）** | `origin/main`（`JimmyMax/ninfer-v100`，v1.6.1，`12a74bd`） | **Gemma + gguf 家族线**，在其上做 V100 加速增量 |
+| `backup/imported-gemma` | 2026-10-20 重建前的导入快照 | 仅作回退参照，不再推进 |
+
+`main` 的真实血缘：`origin/main` 是上游 `fcc4928a`（2026-10-12，上游 PR #58）的后代，此后
+**没有再次 merge 上游**，因此相对 `iamwavecut/master` 落后 148 个提交（其中 39 个触及 V100 关键
+路径）。`git merge-base origin/main upstream/master` = `fcc4928a`，所以可以直接 merge。
 
 跟进上游：
 
 ```bash
-git fetch iamwavecut master
-git switch gemma && git merge iamwavecut/master     # 本分支有自己的提交后，用普通 merge
-```
-
-推送（首次需要指定目标远端，因为本地分支默认跟踪 `iamwavecut/master`）：
-
-```bash
-git push -u origin gemma
+git fetch origin main && git switch main                 # origin = JimmyMax/ninfer-v100
+git fetch https://github.com/iamwavecut/ninfer-all.git master:refs/remotes/upstream/master
+git merge --no-ff upstream/master                       # 2026-10-20 试合并：12 个冲突 / 459 自动
 ```
 
 * 不修改上游已存在的文件（除非该文件正是加速补丁的目标）；新增能力优先落在**新文件**里，
   把合并冲突压到最小。
 * 每阶段的性能结论写回本目录，不改上游的 `docs/performance.md`。
+* 2026-10-20 的冲突清单与解决取舍见
+  [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md) §3–§4。
 
 ## 5. 路线图
 
@@ -381,10 +383,11 @@ GGUF 转制制品）。
 sm_70 的 FP16 范围饱和(上游 `67778be`+`2d69547`)。
 
 * [x] 拷贝草稿改为显式启用(默认 0),`speculative.*` 只统计神经行(`f0ee4fe`、`edcb69d`)
-* [x] 逐条核实基线 `fcc4928a` 之后上游在 sm_70/注意力路径上的提交,列出缺失清单与移植顺序
-* ☐ 移植 `ddacb96`(验证 KV 按 tile 窗口切分)+ 其 bit-identical Op 用例
-* ☐ 移植 `6428248`/`c5f855b`/`f98d88a`(sm_70 解码注意力吞吐)
-* ☐ 评估 `67778be`+`2d69547`(BF16 范围正确性)
+* [x] 工作树重建到 `origin/main`(真实历史、与上游 `fcc4928a` 有 merge-base);核实 `main` 落后上游 148 个提交,其中 39 个触及 V100 关键路径
+* [x] 试合并 `upstream/master`:冲突 12 个文件 / 459 自动合并 → 策略定为**一次 merge**而非串行 cherry-pick
+* ☐ 解决 12 个冲突完成 merge(5 处 sm_70 钩子 vs 上游 unified 路由)
+* ☐ 合并后回归 + 逐位一致(`--spec mtp --draft-tokens 1..7` vs `--spec none`)
+* ☐ 27K A/B 确认 prefill 不回退、纯神经接受率 ≥ 58%
 * 详见 [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md)。
 
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
