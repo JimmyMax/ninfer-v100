@@ -6,17 +6,27 @@ a model quantization mode, or a change to thinking settings.
 
 ## Defaults
 
-Copy drafting is on whenever a drafter is: with `--spec mtp|dflash|dflash2` the CLI, the server
-and `ninfer_bench` default to `--ngram-draft-tokens 15 --ngram-min-match 12`. Fifteen is the
-widest copy a multi-request batch verifies, so the default holds at every `--max-concurrency`.
-`--ngram-draft-tokens 0` turns it off; without `--spec` it stays off.
+Copy drafting is opt-in. `--ngram-draft-tokens N` names its width (1..63 at one active request,
+1..15 with several), the default is 0, and `--ngram-min-match` defaults to 12 — so
+`--spec mtp|dflash|dflash2` alone runs the neural drafter by itself. On the V100 line fifteen
+copies measured slower than the same neural drafter alone on a 27K request over the native nvfp4
+artifact (64.2 against 78.3 tok/s, `docs/v100/PLAN.md` S0.12), and the copy columns folded into the
+reported MTP acceptance, which made the drafter look worse than it is
+([JimmyMax/ninfer-v100#2](https://github.com/JimmyMax/ninfer-v100/issues/2)).
 
 ```sh
 build/apps/ninfer-serve /path/to/model.ninfer \
   --spec mtp --draft-tokens 3 --lm-head-draft
 ```
 
-runs MTP with three neural drafts and fifteen-token copies, and
+runs MTP with three neural drafts and no copies, while
+
+```sh
+build/apps/ninfer-serve /path/to/model.ninfer --spec mtp --draft-tokens 3 --lm-head-draft \
+  --ngram-draft-tokens 15
+```
+
+adds fifteen-token copies beside them, and
 
 ```sh
 build/apps/ninfer-serve /path/to/model.ninfer \

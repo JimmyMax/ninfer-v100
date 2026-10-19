@@ -125,8 +125,8 @@ int main() {
                           "ngram with concurrency>1 was not admitted");
         const auto defaulted = parse({"ninfer-serve", "model.ninfer", "--spec", backend,
                                       "--draft-tokens", "3", "--max-concurrency", "8"});
-        failures += check(defaulted.speculative.ngram_draft_tokens == 15,
-                          "ngram drafting is not on by default beside a drafter");
+        failures += check(defaulted.speculative.ngram_draft_tokens == 0,
+                          "ngram drafting is on by default beside a drafter");
         const auto disabled = parse({"ninfer-serve", "model.ninfer", "--spec", backend,
                                      "--draft-tokens", "3", "--ngram-draft-tokens", "0"});
         failures += check(disabled.speculative.ngram_draft_tokens == 0,

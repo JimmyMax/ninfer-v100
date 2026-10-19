@@ -318,8 +318,7 @@ std::string usage_text(std::string_view program) {
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP, DFlash and DFlash2 1..15\n"
         << "  --adaptive-mtp              verify an adaptive 3..K drafts per MTP round\n"
-        << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 15 with "
-           "--spec, 0 without)\n"
+        << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
         << "  --ngram-min-match <n>      copy admission 4..64 (default: 12)\n"
         << "  --lm-head-draft             use the optimized proposal head (the default when the "
            "artifact stores one); requires a speculative backend\n"
@@ -343,7 +342,6 @@ std::string usage_text(std::string_view program) {
 BenchOptions parse_args(int argc, char** argv) {
     BenchOptions options;
     bool saw_artifact         = false;
-    bool ngram_width_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);
         auto value = [&](const char* flag) -> std::string {
@@ -401,7 +399,6 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value("--ngram-draft-tokens"), "ngram-draft-tokens", true);
-            ngram_width_explicit = true;
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match =
                 parse_u32(value("--ngram-min-match"), "ngram-min-match");
@@ -436,7 +433,6 @@ BenchOptions parse_args(int argc, char** argv) {
     if (options.prefill_chunk % kPrefillChunkAlignment != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
-    product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
     product::validate_speculative_cli_options(options.speculative);
     return options;
 }

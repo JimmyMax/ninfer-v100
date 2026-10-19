@@ -108,8 +108,8 @@ int run_tests() {
                   "CLI admitted unsupported ngram width");
         failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", backend,
                                  "--draft-tokens", "3"})
-                                  .speculative.ngram_draft_tokens == 15,
-                          "CLI ngram drafting is not on by default beside a drafter");
+                                  .speculative.ngram_draft_tokens == 0,
+                          "CLI turned ngram drafting on beside a drafter by default");
     }
     failures += check(
         parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).speculative.ngram_draft_tokens == 0,

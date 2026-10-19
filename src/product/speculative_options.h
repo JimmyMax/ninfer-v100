@@ -30,16 +30,12 @@ namespace ninfer::product {
     return "unknown";
 }
 
-// Copy drafting rides along with every drafter unless the command line sets its width. Fifteen
-// drafts is the widest a multi-request batch verifies, so the default holds at any concurrency.
-inline constexpr std::uint32_t kDefaultNgramDraftTokens = 15;
-
-inline void apply_default_ngram_draft_tokens(SpeculativeOptions& options,
-                                             bool width_explicit) noexcept {
-    if (!width_explicit && options.backend != SpeculativeBackend::None) {
-        options.ngram_draft_tokens = kDefaultNgramDraftTokens;
-    }
-}
+// Copy drafting is opt-in: a round that carries a copy proposal verifies at the copy width instead
+// of the drafter's own, so the width comes only from --ngram-draft-tokens. Upstream enables fifteen
+// copies beside every --spec; on this line that measured 64.2 tok/s against 78.3 for the same
+// neural drafter over the same 27K request (docs/v100/PLAN.md S0.12), costs a second CUDA Graph
+// family at the copy width, and folded copy proposals into the reported MTP acceptance, which made
+// the neural drafter look worse than it is (JimmyMax/ninfer-v100#2).
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     if (!std::isfinite(options.draft_min_p) || options.draft_min_p < 0 ||

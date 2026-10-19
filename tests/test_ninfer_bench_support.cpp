@@ -135,8 +135,8 @@ int test_cli_contract() {
     for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
         failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--spec",
                                            backend, "--draft-tokens", "3"})
-                                   .speculative.ngram_draft_tokens == 15,
-                           "ngram rides along with every drafter by default");
+                                   .speculative.ngram_draft_tokens == 0,
+                           "ngram stays off beside a drafter unless asked");
     }
     for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
         for (unsigned width = 0; width <= 63; ++width) {

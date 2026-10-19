@@ -549,7 +549,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool host_cache_budget_explicit   = false;
     bool host_cache_reserve_explicit  = false;
     bool long_anchor_spacing_explicit = false;
-    bool ngram_width_explicit         = false;
     bool vision_max_merged_explicit   = false;
     std::optional<std::size_t> kv_headroom_mib;
     // Last flag seen that belongs to only one prefix-cache mode, for the cross-mode error.
@@ -1084,7 +1083,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
-            ngram_width_explicit = true;
             continue;
         }
         if (arg == "--ngram-min-match") {
@@ -1660,7 +1658,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument(
             "--unconstrained-response-format conflicts with --structured-output");
     }
-    product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency != VisionResidency::Resident && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay or cpu requires --vision");

@@ -209,8 +209,8 @@ std::string usage_text(const char* argv0) {
            "  --ngram-draft-tokens 0..63    copy up to that many tokens per round from\n"
            "                                earlier prompt, tool-result or output text that\n"
            "                                the last --ngram-min-match tokens match,\n"
-           "                                verified alongside --spec; on with 15 whenever\n"
-           "                                --spec is set, 0 disables it\n"
+           "                                verified alongside --spec; off unless set, and\n"
+           "                                needs --spec (default 0)\n"
            "  --ngram-min-match N           shortest match a copy is drawn from, 4..64\n"
            "                                (default 12)\n"
            "  --lookup-ngram N              context-lookup drafting alongside --spec: the\n"
@@ -324,7 +324,6 @@ Options parse_options(int argc, char** argv) {
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
     bool device_explicit      = false;
-    bool ngram_width_explicit       = false;
     bool vision_max_merged_explicit = false;
     std::optional<std::size_t> kv_headroom_mib;
 
@@ -398,7 +397,6 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value(arg), "ngram-draft-tokens", true);
-            ngram_width_explicit = true;
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = parse_u32(value(arg), "ngram-min-match");
         } else if (arg == "--lm-head-draft") {
@@ -588,7 +586,6 @@ Options parse_options(int argc, char** argv) {
         options.kv_capacity.explicit_tokens < options.max_context) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
-    product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency != VisionResidency::Resident && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay or cpu requires --vision");
