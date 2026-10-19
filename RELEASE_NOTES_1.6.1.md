@@ -65,6 +65,20 @@ docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
 
 `latest` stays the `sm_86`/`sm_120a` image, which no V100 can run; on this card use `:sm70`.
 
+## Fixed in the image, before anything else shipped
+
+The first `sm70` image set `ENTRYPOINT ["ninfer-serve"]`, so a compose `command:` list -- which names
+the program itself, as every ninfer compose file does -- started `ninfer-serve ninfer-serve
+/models/x.ninfer` and the server stopped with
+
+```text
+ninfer-serve: unknown argument: /workspace/models/x.ninfer
+```
+
+The image now sets no entrypoint, like the other ninfer images, and the commands above name
+`ninfer-serve` first. `1.6.1-sm70` and `sm70` are rebuilt with that fix: the binaries are the same,
+and nothing else in this release changed.
+
 ## Assets
 
 | File | Contents |
