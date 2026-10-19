@@ -374,6 +374,19 @@ GGUF 转制制品）。
   （无 MTP）/ 41.8 tok/s（assistant，4 drafts，接受率 24.1%）** ✓，回答正确 ✓。
 * 详见 [gemma4-wide-rows-2026-10-16.md](gemma4-wide-rows-2026-10-16.md)。
 
+### S0.21 v1.5 → v1.6 差距的归因与收敛 ◐(2026-10-20)
+
+外部报告([#2](https://github.com/JimmyMax/ninfer-v100/issues/2)):同制品同参数下 1.5 线 MTP 接受率
+~75%、1.6 线 60–68%。拆成三条独立原因:度量口径(已修)、验证端 KV 切分(上游 `ddacb96`)、
+sm_70 的 FP16 范围饱和(上游 `67778be`+`2d69547`)。
+
+* [x] 拷贝草稿改为显式启用(默认 0),`speculative.*` 只统计神经行(`f0ee4fe`、`edcb69d`)
+* [x] 逐条核实基线 `fcc4928a` 之后上游在 sm_70/注意力路径上的提交,列出缺失清单与移植顺序
+* ☐ 移植 `ddacb96`(验证 KV 按 tile 窗口切分)+ 其 bit-identical Op 用例
+* ☐ 移植 `6428248`/`c5f855b`/`f98d88a`(sm_70 解码注意力吞吐)
+* ☐ 评估 `67778be`+`2d69547`(BF16 范围正确性)
+* 详见 [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md)。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。

@@ -15,6 +15,7 @@
 | [volta-flash-prefill-2026-10-15.md](volta-flash-prefill-2026-10-15.md) | Flash attention prefill 换核（vendored sm_70 mma）：41.1→25.1 ms，27K TTFT 30.1→27.2s |
 | [fp8-swiglu-wide-t-2026-10-16.md](fp8-swiglu-wide-t-2026-10-16.md) | 混合量化制品 prefill 慢 2× 的真因：FP8 SwiGLU 宽 T 落在 SIMT 阶梯；改走 FP32 出口的 CUTLASS |
 | [v2-direct-read-2026-10-16.md](v2-direct-read-2026-10-16.md) | v2 制品直读：清单在内存里归一化成 v3 形态，权重原地读 |
+| [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md) | 外部报告的 1.5→1.6 接受率落差：度量口径、验证端 KV 切分、FP16 范围饱和三条原因与收敛计划 |
 
 相关资产：
 
