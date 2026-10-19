@@ -44,12 +44,13 @@ section the command for each published artifact.
 CUDA 13 no longer compiles `sm_70`, so the `latest` image cannot carry the V100 build. The release
 pipeline publishes it separately, from [Dockerfile.sm70](../Dockerfile.sm70):
 `ghcr.io/jimmymax/ninfer-v100:sm70` follows the newest release and `:<version>-sm70` pins one. It is
-CUDA 12.8 on Ubuntu 24.04, and its entrypoint is `ninfer-serve`, so the artifact comes first:
+CUDA 12.8 on Ubuntu 24.04, and like the other ninfer images it has no entrypoint: the command
+names `ninfer-serve` first, which is also what an orchestration file's `command:` list does.
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
   -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100:sm70 \
-  /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model --max-context 32768 --kv-dtype int8
+  ninfer-serve /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model --max-context 32768 --kv-dtype int8
 ```
 
 To build it yourself, put an `sm_70` `ninfer-serve` in an empty directory and

@@ -9,9 +9,9 @@
 #   tar xzf ninfer-serve-sm70.tar.gz --strip-components=1 -C image   # or from a local sm_70 build
 #   docker build -f Dockerfile.sm70 -t ninfer:v100-sm70 image
 #
-# The entrypoint is the server itself, so the artifact is the first argument:
+# There is no ENTRYPOINT: name the program first, as an orchestration file does:
 #   docker run --rm --gpus all -p 8000:8000 -v "$PWD/models:/models" ninfer:v100-sm70 \
-#     /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model
+#     ninfer-serve /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model
 
 ARG UBUNTU_VERSION=24.04
 FROM ubuntu:${UBUNTU_VERSION}
@@ -52,5 +52,7 @@ ENV NVIDIA_VISIBLE_DEVICES=all \
 WORKDIR /workspace
 EXPOSE 8000
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["ninfer-serve"]
-CMD ["--help"]
+# No ENTRYPOINT, like every other ninfer image: an orchestration file passes the program as the
+# first word of its command (`command: [ninfer-serve, /models/x.ninfer, ...]`), and an ENTRYPOINT
+# would prepend a second `ninfer-serve` and turn the artifact into an unknown argument.
+CMD ["ninfer-serve", "--help"]

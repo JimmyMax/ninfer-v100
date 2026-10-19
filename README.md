@@ -524,13 +524,13 @@ the RTX 30 and RTX 40 series, `sm_120a` for the RTX 50 series and the RTX PRO 60
 
 The Tesla V100 is not in that image: CUDA 13 no longer compiles `sm_70`, so the release build
 publishes the Volta build under its own tag, from `Dockerfile.sm70`. `ghcr.io/jimmymax/ninfer-v100:sm70`
-follows the newest release and `:<version>-sm70` pins one; it is CUDA 12.8 on Ubuntu 24.04, and its
-entrypoint is `ninfer-serve` itself, so the artifact is the first argument:
+follows the newest release and `:<version>-sm70` pins one. It is CUDA 12.8 on Ubuntu 24.04 and, like
+the other ninfer images, sets no entrypoint, so the command names `ninfer-serve` first:
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 --ulimit memlock=-1 \
   -v "$PWD/models:/models" ghcr.io/jimmymax/ninfer-v100:sm70 \
-  /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model \
+  ninfer-serve /models/model.ninfer --host 0.0.0.0 --port 8000 --model-id model \
   --max-context 32768 --kv-dtype int8
 ```
 
