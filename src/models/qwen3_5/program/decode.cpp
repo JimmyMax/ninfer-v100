@@ -862,9 +862,15 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             }
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
+            // The neural counters stay the neural drafter's own. A copy row proposes its copy at the
+            // copy width, so folding those columns into `rounds`/`drafted_tokens` made a measured
+            // drafter look worse than it is (JimmyMax/ninfer-v100#2); copies are counted below in
+            // `ngram_*`, and a copy round still counts here for the rows that carried a neural
+            // proposal inside it.
+            const bool copy_row = !matches[row].tokens.empty();
             if (pcur == 0) {
                 request.speculative_stats.fallback_steps += 1;
-            } else {
+            } else if (!copy_row) {
                 request.speculative_stats.rounds += 1;
                 request.speculative_stats.drafted_tokens += pcur;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);

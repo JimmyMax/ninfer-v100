@@ -2086,9 +2086,10 @@ as full-precision JSON numbers. Its `speculative` object contains `backend`, `dr
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`, and under
 `--adaptive-mtp` also `window_transitions` and `rounds_per_window`. Rates can be derived downstream
 from raw token counts and seconds instead of rounded stderr strings. `ngram_rounds`,
-`ngram_drafted_tokens`, and `ngram_accepted_tokens` are the part of `rounds`, `drafted_tokens`, and
-`accepted_tokens` whose proposal came from n-gram copy drafting, and `ngram_archive_rounds`,
-`ngram_archive_drafted_tokens`, and `ngram_archive_accepted_tokens` the part of those whose copy
+`ngram_drafted_tokens`, and `ngram_accepted_tokens` count the rounds whose proposal came from
+n-gram copy drafting, kept apart from the neural `rounds`, `drafted_tokens`, and
+`accepted_tokens` so the reported acceptance stays the neural drafter's own; `ngram_archive_rounds`,
+`ngram_archive_drafted_tokens`, and `ngram_archive_accepted_tokens` are the part of those whose copy
 source was the retained draft archive (see [n-gram drafting](ngram.md)). The
 `speculative.ngram_archive` object reports that archive at the end of the request: `enabled` when
 the server has one (`--ngram-archive-mib`), `bound` when the request was bound to a draft session,
