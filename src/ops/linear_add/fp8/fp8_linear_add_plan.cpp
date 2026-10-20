@@ -83,7 +83,9 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
     // 容量来自同一决策而不是 route table（测试会强制 unified 表）。
     if (fp8_volta_qpn_takes(policy, output_rows, input_rows,
                                 std::min(max_tokens, kFp8VoltaQpnMaxTokens))) {
-        if (max_tokens <= kFp8VoltaQpnMaxTokens) { return 0; }
+        if (max_tokens <= kFp8VoltaQpnMaxTokens) {
+            return fp8_qpn_stage_bytes(input_rows, max_tokens);
+        }
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::BF16, {output_rows, max_tokens});
         return layout.peak_bytes(1) +
@@ -113,6 +115,18 @@ void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& resi
     if (fp8_volta_qpn_takes(policy, weight.n, weight.k,
                                 std::min<std::int32_t>(x.ne[1], kFp8VoltaQpnMaxTokens))) {
         if (x.ne[1] <= kFp8VoltaQpnMaxTokens) {
+            // 激活先暂存成 FP16：kernel 级剖析显示 k=6144 的残差形状上，暂存版 47.4 us/次
+            // 对未暂存版 62.9 us/次。
+            const std::size_t stage_bytes = fp8_qpn_stage_bytes(weight.k, x.ne[1]);
+            const std::size_t aligned_used = (workspace.used() + 255) / 256 * 256;
+            if (workspace.capacity() >= aligned_used &&
+                workspace.capacity() - aligned_used >= stage_bytes) {
+                auto scope             = workspace.scope();
+                const DeviceSpan stage = workspace.alloc_bytes(stage_bytes, 256);
+                fp8_stage_bf16_activation_sm70(x, stage.data, stream);
+                fp8_linear_add_qpn_fp16_launch(x, stage.data, weight, residual, stream);
+                return;
+            }
             fp8_linear_add_qpn_launch(x, weight, residual, stream);
             return;
         }
