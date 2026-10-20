@@ -162,7 +162,19 @@ bool covered_format(QType format, std::int32_t k) {
 }
 
 bool covers(const Weight& w, std::int32_t tokens) {
-    return enabled() && tokens >= 1 && covered_format(w.qtype, w.k) && dequantizable(w);
+    if (!enabled() || tokens < 1 || !covered_format(w.qtype, w.k) || !dequantizable(w)) {
+        return false;
+    }
+#if defined(NINFER_TIER_VOLTA)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：解码宽度上 Q8/Q4 各有专用解码核
+    // （q8_rowsplit_gemm_simt / q4_rowsplit_gemv），kernel 级剖析（nsys，同一张 V100）显示
+    // 它们比 sm_70 的通用 small_project 快得多：Q8 150 us 对 282 us，并直接决定 MTP 层
+    //（全 W8G32）每轮 4 次草稿的成本。让出窄宽度。
+    if (tokens <= 8 && (w.qtype == QType::Q8_G32_FP16 || w.qtype == QType::Q4_G64_FP16)) {
+        return false;
+    }
+#endif
+    return true;
 }
 
 std::size_t covered_bytes(QType format, std::int32_t max_rows, std::int32_t k,

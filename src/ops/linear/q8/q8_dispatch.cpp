@@ -58,6 +58,12 @@ Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 }
 
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
+#if defined(NINFER_TIER_VOLTA)
+    // 本仓库 V100 增量：窄宽度（解码/校验）直接走 rowsplit 的 SIMT 解码核；形状表里的
+    // ksplit 路线在 Volta 上实测慢约一倍（见 sm70_project.cu 的 covers 注释）。
+    if (t >= 1 && t <= 4) { return launch_q8_simt_r8_c4; }
+    if (t <= 8) { return launch_q8_simt_r8_c8; }
+#endif
     if (!valid_linear_policy(policy)) throw std::invalid_argument("q8 linear: unsupported policy");
     return select_q8_a16_launch(n, k, t);
 }
