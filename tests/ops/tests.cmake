@@ -60,6 +60,13 @@ ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
   LIBRARIES ninfer_ops)
 
+# The workspace reservation must cover every call the attention route gates can still select, not
+# only the configured capacity: the two envelopes differ, which once left a long-context
+# configuration without the Volta flash prefill staging (std::bad_alloc in layer 3).
+ninfer_add_op_test(ninfer_causal_attention_workspace_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_causal_attention_workspace.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_softmax_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"

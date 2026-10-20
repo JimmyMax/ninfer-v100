@@ -22,6 +22,34 @@ A second, native-nvfp4 artifact (`orcarouter-Qwen3.8-27B-Uncensored-nvfp4`) gain
 +4.7% at the same depths, so the win is not specific to a GGUF-derived artifact. Plain decode is at
 parity, and prefill is at parity at 27K and 1.0% behind at 66K.
 
+## Fixed: `std::bad_alloc` in prefill with a long `--max-context`
+
+A configuration with `--max-context` past 131,072 crashed on its first long prefill:
+
+```text
+ERROR engine | worker crash: text/layers/3 prefill columns=1920: std::bad_alloc
+FATAL engine unavailable after an engine-wide failure
+```
+
+The attention workspace is planned against the configured capacity but launched with the keys the
+call actually sees. The Volta flash prefill route keeps a staging budget (131,072 keys), and the
+planner asked whether the *capacity* was inside it: with `--max-context 200000` it concluded no and
+reserved nothing, while every call shorter than the budget still selected the route and asked the
+arena for up to 375 MiB it had never planned — so the first attention layer to run one threw. The
+reservation now covers the largest key count at which the route still runs, the same way the fast
+NVFP4 prompt branch reserves at the last key count its route holds for. Configurations at or below
+the budget were never affected, which is why every measurement above (all at `--max-context
+131072`) passed.
+
+`tests/ops/test_causal_attention_workspace.cpp` pins the invariant: for capacities of 131,072,
+200,000 and 262,144 keys, the planned reservation must cover a call at every visible key count
+below it, for both the BF16 and INT8 caches. Against the previous planner it reports the failure
+directly (`capacity 200000 plans 0.0 MiB, a call at 83000 visible keys needs 374.5 MiB`).
+
+The reservation costs the arena what the route allocates anyway when it runs: 562 MiB at the
+staging budget for this geometry. On a card where that competes with KV, Auto KV gives up roughly
+17,000 int8 tokens out of 250,000.
+
 ## What changed
 
 - **Copy drafting is opt-in.** `--ngram-draft-tokens` defaults to 0 and `speculative.*` counts only
@@ -40,6 +68,9 @@ parity, and prefill is at parity at 27K and 1.0% behind at 66K.
   The cap is now 131,072 keys and the route runs 1024-token Q blocks. 66K prefill 710.8 → 838 tok/s,
   27K 1000 → 1010. The staging planes come out of Auto KV: capacity at `--max-context 131072` drops
   from 286,400 to 281,152 tokens, and free VRAM after startup is unchanged.
+
+A failed allocation now also names the workspace it came from, so a report like the one above
+carries `(workspace used N MiB, peak N MiB of N MiB)` beside the layer and column count.
 
 ## Known costs
 

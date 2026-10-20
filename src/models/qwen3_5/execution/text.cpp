@@ -1232,9 +1232,17 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                 tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
             }
         } catch (const std::exception& error) {
+            std::string detail = error.what();
+            // An exhausted arena and a workspace smaller than a kernel's layout both surface as
+            // std::bad_alloc; name the numbers so the log says which one it was.
+            if (dynamic_cast<const std::bad_alloc*>(&error) != nullptr) {
+                detail += " (workspace used " + std::to_string(work_.used() >> 20) + " MiB, peak " +
+                          std::to_string(work_.peak_used() >> 20) + " MiB of " +
+                          std::to_string(work_.capacity() >> 20) + " MiB)";
+            }
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
                                      (prefill ? " prefill" : " verify") +
-                                     " columns=" + std::to_string(x.ne[1]) + ": " + error.what());
+                                     " columns=" + std::to_string(x.ne[1]) + ": " + detail);
         }
     }
     // Later passes are stream-ordered behind this one.

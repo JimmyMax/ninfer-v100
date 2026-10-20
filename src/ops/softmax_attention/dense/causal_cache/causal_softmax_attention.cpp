@@ -744,11 +744,22 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     // Any width in [min_width, max_width] at or past the flash route's first Q-block can select
     // it, so the reservation has to be accounted whenever the range reaches that width -- the
     // gather planes do not depend on the width, so one reservation covers the whole range.
+    //
+    // `envelope.max_visible_keys` here is the plan capacity, but a launch passes the keys it
+    // actually sees (execution builds its envelope from the call's visible keys), so a capacity
+    // past the route's staging budget does not rule the route out: any call shorter than the
+    // budget still selects it. Reserve at the last key count that can, the same way the fast NVFP4
+    // branch above reserves at the last key count its route holds for. Reserving at the capacity
+    // instead left every call of such a configuration without a budget and the arena threw
+    // std::bad_alloc inside the first attention layer that selected the route.
+    const std::int64_t flash_keys = std::min<std::int64_t>(
+        envelope.max_visible_keys, detail::causal_attention_volta_flash_maximum_visible_keys());
     if (max_width >= detail::causal_attention_volta_flash_q_block_tokens() &&
+        envelope.min_visible_keys <= flash_keys &&
         detail::causal_attention_volta_flash_applies(q_heads, max_width, batch_size, cache_storage,
-                                                     kHeadDim, envelope.max_visible_keys)) {
+                                                     kHeadDim, flash_keys)) {
         WorkspaceLayoutBuilder layout;
-        (void)allocate_volta_flash_workspace(layout, q_heads, envelope.max_visible_keys);
+        (void)allocate_volta_flash_workspace(layout, q_heads, flash_keys);
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
 #endif
