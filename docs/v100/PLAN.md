@@ -376,7 +376,7 @@ GGUF 转制制品）。
   （无 MTP）/ 41.8 tok/s（assistant，4 drafts，接受率 24.1%）** ✓，回答正确 ✓。
 * 详见 [gemma4-wide-rows-2026-10-16.md](gemma4-wide-rows-2026-10-16.md)。
 
-### S0.21 v1.5 → v1.6 差距的归因与收敛 ◐(2026-10-20)
+### S0.21 v1.5 → v1.6 差距的归因与收敛 ☑(2026-10-20)
 
 外部报告([#2](https://github.com/JimmyMax/ninfer-v100/issues/2)):同制品同参数下 1.5 线 MTP 接受率
 ~75%、1.6 线 60–68%。拆成三条独立原因:度量口径(已修)、验证端 KV 切分(上游 `ddacb96`)、
@@ -385,9 +385,12 @@ sm_70 的 FP16 范围饱和(上游 `67778be`+`2d69547`)。
 * [x] 拷贝草稿改为显式启用(默认 0),`speculative.*` 只统计神经行(`f0ee4fe`、`edcb69d`)
 * [x] 工作树重建到 `origin/main`(真实历史、与上游 `fcc4928a` 有 merge-base);核实 `main` 落后上游 148 个提交,其中 39 个触及 V100 关键路径
 * [x] 试合并 `upstream/master`:冲突 12 个文件 / 459 自动合并 → 策略定为**一次 merge**而非串行 cherry-pick
-* ☐ 解决 12 个冲突完成 merge(5 处 sm_70 钩子 vs 上游 unified 路由)
-* ☐ 合并后回归 + 逐位一致(`--spec mtp --draft-tokens 1..7` vs `--spec none`)
-* ☐ 27K A/B 确认 prefill 不回退、纯神经接受率 ≥ 58%
+* [x] 解决 12 个冲突完成 merge(5 处 sm_70 钩子 vs 上游 unified 路由):`6988552`
+* [x] decode 侧收敛:`1fcfa17`、`e563078`、`a639388`(FP8 预打包/暂存、Q8/Q4 窄宽度)
+* [x] 长上下文 prefill:`89be923`(flash 快路线放宽到 131K 可见键)、`b735b91`(宽 T 反量化)、
+      `80e9ae4`(Q 块 1024)
+* [x] 终验:两个制品上 MTP decode 全深度领先(+2.4% ~ +11.1%),纯解码持平,prefill 27K 持平 /
+      66K −1.0%(归属:精确 NVFP4 解码 645 ms + flash 每次调用 21.2 对 21.6 ms 但多 80 次)
 * 详见 [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md)。
 
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
