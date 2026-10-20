@@ -7,6 +7,7 @@ target_sources(ninfer_ops PRIVATE
   # 本仓库 V100 增量（docs/v100/PLAN.md）：Volta QPN 路径
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_volta_sm70.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_volta_qpn_gemm.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4_volta_multi_qpn.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_volta_stage_sm70.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_volta_mma_gemm.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4_prepack_sm70.cu"

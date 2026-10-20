@@ -15,6 +15,11 @@
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "ops/common/device_tier.h"
+#if defined(NINFER_TIER_VOLTA)
+#    include "ops/linear/nvfp4/nvfp4_launch.h"
+#    include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
+#endif
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -27,6 +32,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <vector>
 #include <stdexcept>
@@ -169,6 +176,25 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     validate_policy(policy);
     policy = without_integer(policy);
     // The parent's rows are [query; key; gate; value].
+#if defined(NINFER_TIER_VOLTA)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 的注意力输入在解码/校验宽度走 Volta QPN。
+    // 必须排在下面的 sm70 宽路线之前，否则 14336x5120 会落到 SIMT 小 T 路线——实测纯解码
+    // 比 v1.5 慢 12%（docs/v100/v1.6-vs-v1.5-2026-10-20.md）。
+    {
+        static const bool debug_qpn = std::getenv("NINFER_DEBUG_QPN") != nullptr;
+        if (debug_qpn) {
+            std::fprintf(stderr, "[qpn] attn t=%d n=%d k=%d layout=%d takes=%d\n", x.ne[1],
+                         weight.n, weight.k, static_cast<int>(weight.layout),
+                         static_cast<int>(detail::nvfp4_volta_takes(weight, x.ne[1])));
+        }
+    }
+    if (weight.qtype == QType::NVFP4 && weight.n == 2 * q.ne[0] + 2 * k.ne[0] &&
+        gate.ne[0] == q.ne[0] && v.ne[0] == k.ne[0] &&
+        detail::nvfp4_volta_takes(weight, x.ne[1])) {
+        detail::launch_nvfp4_attn_input_volta_qpn(x, weight, q, gate, k, v, stream);
+        return;
+    }
+#endif
     if (workspace != nullptr && detail::sm70::covers(weight, x.ne[1]) &&
         weight.n == 2 * q.ne[0] + 2 * k.ne[0] && gate.ne[0] == q.ne[0] && v.ne[0] == k.ne[0]) {
         sm70_split(x, weight, {&q, &k, &gate, &v}, nullptr, {}, policy, *workspace, stream);
@@ -521,6 +547,11 @@ bool attn_input_proj_fused_rmsnorm_nvfp4_eligible(const Weight& weight, LinearPo
                                                   std::int32_t tokens) {
     // T==1 fuses the GEMV consumer, T>=4 the W4A4 consumers. T==2,3 stay unfused: a fused
     // norm+SIMT variant measured a regression (see plan.h), so the gap is deliberate.
+    //
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：Volta 没有 int4 张量核，融合的 W4A4 路线在那里
+    // 退化成模拟内核；同一张卡上纯解码实测比 v1.5 慢 12%。sm_70 一律走非融合路径——先
+    // rmsnorm，再由 nvfp4 的 Volta QPN 投影（见 dispatch_single_parent 的分支）。
+    if (current_device_volta()) { return false; }
     const bool supported_tokens = tokens == 1 || tokens >= 4;
     return policy == LinearPolicy::AllowA4 && supported_tokens && weight.qtype == QType::NVFP4 &&
            weight.layout == QuantLayout::BlockScaleK16M128x4 && weight.n == 14336 &&

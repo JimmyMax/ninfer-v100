@@ -6,8 +6,15 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
+#if defined(NINFER_TIER_VOLTA)
+#    include "ops/linear/nvfp4/nvfp4_launch.h"
+#    include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
+#endif
+
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -90,6 +97,15 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
+#if defined(NINFER_TIER_VOLTA)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：解码/校验宽度上 14336x5120 走 Volta QPN，
+    // 不再落到 sm_70 的 SIMT 解码路线（实测纯解码比 v1.5 慢 12% 的来源之一）。宽 T 的
+    // prefill 维持原有 A16/W4A4 路线，读的是同一份存放布局，因此加载期不需要重排。
+    if (nvfp4_volta_takes(weight, x.ne[1])) {
+        launch_nvfp4_attn_input_volta_qpn(x, weight, q, gate, k, v, stream);
+        return;
+    }
+#endif
     if (fused_route_table("unified/nvfp4_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
         return;

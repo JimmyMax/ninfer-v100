@@ -18,6 +18,10 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#if defined(NINFER_TIER_VOLTA)
+#    include "ops/linear/nvfp4/nvfp4_launch.h"
+#    include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
+#endif
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
@@ -404,6 +408,16 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
     // NVFP4 and FP8 parents keep their own composites (and workspace contracts) on sm_70; NVFP4
     // artifacts need a 120a build anyway.
+#if defined(NINFER_TIER_VOLTA)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 的 GDN 输入（16384x5120）在解码/校验
+    // 宽度走 Volta QPN，qkv/z 两个目的地由输出策略分段。此前该形状走 SIMT 小 T 路线，
+    // 是纯解码比 v1.5 慢 12% 的来源之一。
+    if (weight.qtype == QType::NVFP4 && weight.n == qkv.ne[0] + z.ne[0] &&
+        qkv.ne[1] == cols && z.ne[1] == cols && detail::nvfp4_volta_takes(weight, cols)) {
+        detail::launch_nvfp4_gdn_input_volta_qpn(x, weight, qkv, z, stream);
+        return;
+    }
+#endif
     if (workspace != nullptr && weight.qtype != QType::NVFP4 &&
         weight.qtype != QType::FP8_E4M3FN_ROW_BF16 && sm70_takes(x, weight, nullptr) &&
         weight.n == qkv.ne[0] + z.ne[0] && qkv.ne[1] == cols && z.ne[1] == cols) {

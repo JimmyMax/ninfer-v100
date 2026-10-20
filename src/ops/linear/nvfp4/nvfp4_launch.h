@@ -28,6 +28,15 @@ void launch_nvfp4_volta_qpn_fp16_residual(const Tensor& x, const void* x_fp16, c
 [[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                              std::int32_t t) noexcept;
 
+// 本仓库 V100 增量（docs/v100/PLAN.md）：多目的地的解码投影（注意力输入的 q/gate/k/v、
+// GDN 输入的 qkv/z）走同一个 QPN 内核，输出策略决定每段父行写到哪里。两段与四段结构见
+// ops/attn_input_proj/nvfp4/nvfp4_attn_input_output.cuh 与
+// ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh。
+void launch_nvfp4_attn_input_volta_qpn(const Tensor& x, const Weight& w, Tensor& q, Tensor& gate,
+                                       Tensor& k, Tensor& v, cudaStream_t stream);
+void launch_nvfp4_gdn_input_volta_qpn(const Tensor& x, const Weight& w, Tensor& qkv, Tensor& z,
+                                      cudaStream_t stream);
+
 // Wide-T form (nvfp4_volta_mma_gemm.cuh): T on the mma A axis, dequantizing into shared memory
 // once per K-pass instead of QPN2's small-T-chunked re-streaming. Prefill's route.
 void launch_nvfp4_volta_mma(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,

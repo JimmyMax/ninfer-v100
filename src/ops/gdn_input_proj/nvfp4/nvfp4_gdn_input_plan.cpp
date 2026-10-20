@@ -5,6 +5,11 @@
 
 #include "ops/linear/nvfp4/nvfp4_config.h"
 
+#if defined(NINFER_TIER_VOLTA)
+#    include "ops/linear/nvfp4/nvfp4_launch.h"
+#    include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
@@ -79,6 +84,14 @@ std::size_t nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::i
 
 void nvfp4_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                               LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+#if defined(NINFER_TIER_VOLTA)
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：16384x5120 的解码宽度走 Volta QPN；宽 T 的
+    // prefill 保持 A16/W4A4，读同一份存放布局。
+    if (nvfp4_volta_takes(weight, x.ne[1])) {
+        launch_nvfp4_gdn_input_volta_qpn(x, weight, qkv, z, stream);
+        return;
+    }
+#endif
     if (fused_route_table("unified/nvfp4_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
         unified::nvfp4_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
         return;
