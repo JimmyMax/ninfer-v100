@@ -43,9 +43,10 @@ __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, 
         *reinterpret_cast<const std::uint16_t*>(codes + source_offset);
     const float2 weight = decode_fp8_e4m3x2(packed);
 
+    // 本仓库 V100 增量：一次 __float22half2_rn 写两个值，与两次 half_t 构造同为 RN，数值一致，
+    // 但少一半 cvt 指令（prefill 的反量化是权重带宽受限的）。
     cutlass::half_t* out_row = out + static_cast<std::int64_t>(row) * k;
-    out_row[pair_idx * 2]     = cutlass::half_t(weight.x);
-    out_row[pair_idx * 2 + 1] = cutlass::half_t(weight.y);
+    *reinterpret_cast<half2*>(out_row + pair_idx * 2) = __float22half2_rn(weight);
 }
 
 __global__ void bf16_to_fp16_kernel(const __nv_bfloat16* __restrict__ in,

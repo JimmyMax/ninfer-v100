@@ -18,17 +18,18 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// 本仓库 V100 增量：一维网格（原来是 grid.y = n，n = 248320 的词汇表超过 65535 的上限，
-// 会让整条路线以 cudaErrorInvalidConfiguration 失败）。
+// 本仓库 V100 增量：行用 grid.z * kDequantRowSlice + grid.y 展开（原来是 grid.y = n，n = 248320
+// 的词汇表超过 65535 的上限，会让整条路线以 cudaErrorInvalidConfiguration 失败）。早先的改法把
+// 整张矩阵摊成一维、每个线程对 (k / 2) 做一次整数除法；k 是运行期值，Volta 没有整数除法硬件，
+// 单这一处就让同样的反量化比 v1.5 的按行网格慢 18%（nsys：2664 ms 对 2256 ms）。
+constexpr int kDequantRowSlice = 64;
+
 __global__ void dequant_fp8_row_to_fp16(const std::uint8_t* __restrict__ codes, int n, int k,
                                         bool prepacked,
                                         cutlass::half_t* __restrict__ out) {
-    const std::int64_t pair_index =
-        static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::int64_t pairs = static_cast<std::int64_t>(n) * (k / 2);
-    if (pair_index >= pairs) { return; }
-    const int row      = static_cast<int>(pair_index / (k / 2));
-    const int pair_idx = static_cast<int>(pair_index % (k / 2));
+    const int row      = static_cast<int>(blockIdx.z) * kDequantRowSlice + static_cast<int>(blockIdx.y);
+    const int pair_idx = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= n || pair_idx >= k / 2) { return; }
     const int k0 = pair_idx * 2;
     const std::uint8_t* source = nullptr;
     if (prepacked) {
@@ -122,8 +123,9 @@ void fp8_cutlass_sm70_launch(const Tensor& x, const Weight& w, Tensor& out, Work
     auto* input  = static_cast<cutlass::half_t*>(scratch.input.data);
 
     const dim3 block(256);
-    const std::int64_t pairs = static_cast<std::int64_t>(n) * (k / 2);
-    const dim3 grid(static_cast<unsigned>((pairs + 255) / 256));
+    const dim3 grid(static_cast<unsigned>((k / 2 + 255) / 256),
+                    static_cast<unsigned>(n < kDequantRowSlice ? n : kDequantRowSlice),
+                    static_cast<unsigned>((n + kDequantRowSlice - 1) / kDequantRowSlice));
     dequant_fp8_row_to_fp16<<<grid, block, 0, stream>>>(
         static_cast<const std::uint8_t*>(w.qdata), n, k,
         w.layout == QuantLayout::VoltaQpnPrepacked, weight);

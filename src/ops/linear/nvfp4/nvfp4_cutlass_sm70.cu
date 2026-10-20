@@ -53,16 +53,26 @@ __device__ __forceinline__ void decode_e2m1_word_exact(std::uint32_t packed, flo
 // 顺序读字节则会把 k 读成置换后的次序，权重全错。
 __device__ __forceinline__ void decode_qpn_e2m1_word_exact(std::uint32_t packed,
                                                            float coefficient, half (&out)[8]) {
-    constexpr int qpn_byte[8]  = {0, 2, 0, 2, 1, 3, 1, 3};
-    constexpr bool qpn_high[8] = {false, false, true, true, false, false, true, true};
+    // Each source byte holds one even and one odd k value, so one fp4x2 conversion serves two
+    // outputs; decoding a byte per output (the earlier form) repeated every conversion and every
+    // multiply twice. The scaled pairs land in the shuffle order (k+0,k+2), (k+1,k+3) and are
+    // interleaved into k order by half-register moves. Values and rounding are unchanged: fp32
+    // multiply, one RN conversion to fp16.
+    constexpr int qpn_byte[4] = {0, 2, 1, 3};
+    half2 scaled[4];
 #pragma unroll
-    for (int index = 0; index < 8; ++index) {
+    for (int half_group = 0; half_group < 4; ++half_group) {
         __nv_fp4x2_e2m1 pair;
-        pair.__x = static_cast<std::uint8_t>((packed >> (8 * qpn_byte[index])) & 0xffu);
+        pair.__x = static_cast<std::uint8_t>((packed >> (8 * qpn_byte[half_group])) & 0xffu);
         const float2 decoded = static_cast<float2>(pair);
-        const float value    = qpn_high[index] ? decoded.y : decoded.x;
-        out[index]           = __float2half(value * coefficient);
+        scaled[half_group] =
+            __float22half2_rn(make_float2(decoded.x * coefficient, decoded.y * coefficient));
     }
+    auto* pairs = reinterpret_cast<half2*>(out);
+    pairs[0] = __halves2half2(__low2half(scaled[0]), __low2half(scaled[1]));
+    pairs[1] = __halves2half2(__high2half(scaled[0]), __high2half(scaled[1]));
+    pairs[2] = __halves2half2(__low2half(scaled[2]), __low2half(scaled[3]));
+    pairs[3] = __halves2half2(__high2half(scaled[2]), __high2half(scaled[3]));
 }
 
 // The artifact stores adjacent E2M1 values in each code byte and one E4M3 scale per K16 group.
