@@ -47,8 +47,22 @@ below it, for both the BF16 and INT8 caches. Against the previous planner it rep
 directly (`capacity 200000 plans 0.0 MiB, a call at 83000 visible keys needs 374.5 MiB`).
 
 The reservation costs the arena what the route allocates anyway when it runs: 562 MiB at the
-staging budget for this geometry. On a card where that competes with KV, Auto KV gives up roughly
-17,000 int8 tokens out of 250,000.
+staging budget for this geometry.
+
+Verified end to end on a V100-32GB with the reporting configuration
+(`--max-context 200000 --max-concurrency 2 --spec mtp --draft-tokens 4 --kv-dtype int8`, a 27B
+W4A4 artifact), two concurrent long prefills:
+
+| build | result | KV capacity |
+|---|---|---:|
+| the pre-fix planner | `worker crash: text/layers/3 prefill columns=1920: std::bad_alloc` | 251,904 |
+| this release | both lanes complete, prefill 746.3 / 744.0 tok/s | 244,160 |
+
+A single long prefill does not reproduce it — the unbudgeted allocation has to meet an arena that
+the second lane and the prefix cache have already filled, which is why the crash only appeared under
+the reporter's concurrent traffic. The cost of the reservation is the 7,744 int8 tokens Auto KV
+gives up (3.1%); commands at or below `--max-context 131072` are unaffected, because the plan
+already reserved exactly this much.
 
 ## What changed
 
