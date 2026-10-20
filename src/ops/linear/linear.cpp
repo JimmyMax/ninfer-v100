@@ -148,7 +148,13 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         // 本仓库 V100 增量（docs/v100/PLAN.md）：解码/校验宽度上交由 fork 的 QPN 内核，
         // 它直接消费 NVFP4 码；上游的 Volta A16 路线在同一形状上只有 85 GB/s（DRAM 9.5%）。
         if (detail::nvfp4_volta_takes(w, x.ne[1])) {
-            detail::nvfp4_volta_project(x, w, out, stream);
+            // 本仓库 V100 增量：激活先暂存成 FP16，QPN 内核就不必在内层循环里逐个转换
+            // （fork 实测同形状 155 us -> 102 us）。
+            if (workspace != nullptr) {
+                detail::nvfp4_volta_project_staged(x, w, out, *workspace, stream);
+            } else {
+                detail::nvfp4_volta_project(x, w, out, stream);
+            }
             return;
         }
 #endif

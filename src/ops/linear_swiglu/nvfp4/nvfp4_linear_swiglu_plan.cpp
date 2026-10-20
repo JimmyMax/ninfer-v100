@@ -1,4 +1,5 @@
 #include "ops/linear/common/route_table.h"
+
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.h"
 #include "core/weight.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
@@ -9,6 +10,7 @@
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
 #if defined(NINFER_TIER_VOLTA)
+#    include "ops/common/device_tier.h"
 #    include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h" // 本仓库 V100 增量：宽 T prefill 路径
 #endif
 
@@ -193,18 +195,35 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 linear_swiglu workspace: invalid token interval");
     }
-    if (!allows_a4(policy)) {
-        // 窄带（t <= 32）与宽带（t > 32）的路线不同，跨带取两者最大；单宽度查询时恰好落在
-        // 自己那一段，保持“查询即执行高水位”。
-        std::size_t need = 0;
-        if (min_tokens <= kNvfp4VoltaQpnMaxTokens) {
-            need = sm70_split_workspace_bytes(std::min(max_tokens, kNvfp4VoltaQpnMaxTokens));
-        }
-        if (max_tokens > kNvfp4VoltaQpnMaxTokens) {
-            need = std::max(need, sm70_wide_workspace_bytes(max_tokens));
-        }
-        return need;
+    // 解码宽度（t <= 32）：A16 族，以及 Volta 上的 A4 族，都由 QPN 拆分接管（见派发）。
+    // 更宽的宽度：A16 族走 CUTLASS，A4 族走上游路线，跨带取两者最大，单宽度查询恰好落在
+    // 自己那一段，保持“查询即执行高水位”。
+    std::size_t need = 0;
+    if (min_tokens <= kNvfp4VoltaQpnMaxTokens) {
+        need = sm70_split_workspace_bytes(std::min(max_tokens, kNvfp4VoltaQpnMaxTokens));
     }
+    if (max_tokens > kNvfp4VoltaQpnMaxTokens) {
+        if (!allows_a4(policy)) {
+            need = std::max(need, sm70_wide_workspace_bytes(max_tokens));
+        } else {
+            need = std::max(need, capacity_by_table(
+                                      min_tokens, max_tokens,
+                                      [](std::int32_t width) {
+                                          return fused_route_table(
+                                              "unified/nvfp4_linear_swiglu", width);
+                                      },
+                                      [&](LinearRouteTable table, std::int32_t first,
+                                          std::int32_t last) {
+                                          return table == LinearRouteTable::Unified
+                                                     ? unified::
+                                                           nvfp4_linear_swiglu_workspace_capacity_bytes(
+                                                               unified_policy(policy), first, last)
+                                                     : nvfp4_linear_swiglu_workspace_capacity_bytes_own(
+                                                           policy, first, last);
+                                      }));
+        }
+    }
+    return need;
 #endif
     return capacity_by_table(
         min_tokens, max_tokens,
@@ -225,7 +244,11 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     // （34816 x 5120，每层 178 M 参数，占模型 NVFP4 质量的三分之二）走 fork 的 QPN 拆分路线：
     // 两个独立 QPN2 pass（gate / up 各半）写 fp32 暂存，再由合并内核做 silu(gate)*up。
     // fork 实测拆分 371.6 GB/s vs 融合内核 225.4 GB/s，故不用融合单内核。
-    if (!allows_a4(policy) && nvfp4_linear_swiglu_qpn_split_supported(weight.k, x.ne[1])) {
+    // Volta 上没有 int4 张量核：AllowA4 策略的 W4A4 路线在 sm_70 上退化成模拟内核，
+    // 实测比 QPN 拆分慢得多。1.5 线在同一张卡上无视 A4 权限，解码宽度一律走 QPN。
+    if ((!allows_a4(policy) || current_device_volta()) &&
+        x.ne[1] <= kNvfp4VoltaQpnMaxTokens &&
+        nvfp4_linear_swiglu_qpn_split_supported(weight.k, x.ne[1])) {
         constexpr std::int32_t kIntermediate = Nvfp4N34816K5120::kOutputRows / 2;
         const std::size_t gate_bytes = static_cast<std::size_t>(kIntermediate) *
                                        static_cast<std::size_t>(x.ne[1]) * sizeof(float);

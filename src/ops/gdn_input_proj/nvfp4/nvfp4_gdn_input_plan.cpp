@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstdint>
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {

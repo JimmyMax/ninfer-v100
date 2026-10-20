@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -46,6 +47,12 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
 // 容量与派发共用此判定，才能保证“查询即执行高水位”。
 bool sm70_linear_then_add_route(std::int32_t input_rows, LinearPolicy policy,
                                 std::int32_t tokens) noexcept {
+    // Volta 没有 int4 张量核：解码宽度上宁可走 QPN 残差内核，也不要在 sm_70 上模拟 W4A4。
+    // 1.5 线在同一张卡上就是这样做的。
+    if (tokens <= kNvfp4VoltaQpnMaxTokens &&
+        nvfp4_volta_qpn_supported(5120, input_rows, tokens)) {
+        return true;
+    }
     if (resolve_route(5120, input_rows, policy, tokens) != Nvfp4LinearAddRoute::A16) {
         return false;
     }
