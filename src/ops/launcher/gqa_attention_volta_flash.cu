@@ -53,7 +53,7 @@ constexpr int kKeyPad = 256;
 
 // Query rows per flash launch. Bounding the block bounds the mask that has to be built and lets an
 // early block attend over a shorter key range than a later one.
-constexpr int kFlashQBlockTokens = 512; // probe
+constexpr int kFlashQBlockTokens = 1024; // probe
 
 // The mask covers whole rows of 8 halves, and the bridge wants `slots % 256 == 0`.
 constexpr int kFlashMaskRowPad = 8;
