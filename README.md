@@ -668,7 +668,7 @@ conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b
 
 `ghcr.io/jimmymax/ninfer-v100:latest` **is the Tesla V100 build**: sm_70, CUDA 12.8 on Ubuntu 24.04,
 packed by the release pipeline from [Dockerfile.sm70](Dockerfile.sm70). `:<version>` pins a release
-(`1.6.1`), and `sm70` is kept as an alias. Like the other ninfer images it sets no entrypoint, so the
+(`1.6.2`), and `sm70` is kept as an alias. Like the other ninfer images it sets no entrypoint, so the
 command names `ninfer-serve` first:
 
 ```bash

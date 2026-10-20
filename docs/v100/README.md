@@ -16,6 +16,7 @@
 | [fp8-swiglu-wide-t-2026-10-16.md](fp8-swiglu-wide-t-2026-10-16.md) | 混合量化制品 prefill 慢 2× 的真因：FP8 SwiGLU 宽 T 落在 SIMT 阶梯；改走 FP32 出口的 CUTLASS |
 | [v2-direct-read-2026-10-16.md](v2-direct-read-2026-10-16.md) | v2 制品直读：清单在内存里归一化成 v3 形态，权重原地读 |
 | [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md) | 外部报告的 1.5→1.6 接受率落差：度量口径、验证端 KV 切分、FP16 范围饱和三条原因与收敛计划 |
+| [../../RELEASE_NOTES_1.6.2.md](../../RELEASE_NOTES_1.6.2.md) | v1.6.2 发布说明：九次提交的实测矩阵、代价与已知缺口 |
 
 相关资产：
 

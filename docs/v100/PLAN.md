@@ -65,7 +65,7 @@ Gemma 只有上游能跑。加速增量应当往上游线上做。
 | 分支 | 基座 | 角色 |
 |---|---|---|
 | `master`（原仓库） | geoffwatts/ninfer-v100 + 本地 72 提交 | **Qwen 生产线**，V100 专精实现，继续调优 |
-| **`main`（本分支）** | `origin/main`（`JimmyMax/ninfer-v100`，v1.6.1，`12a74bd`） | **Gemma + gguf 家族线**，在其上做 V100 加速增量 |
+| **`main`（本分支）** | `origin/main`（`JimmyMax/ninfer-v100`，v1.6.1，`12a74bd`）+ merge `upstream/master`，本地发布为 **v1.6.2** | **Gemma + gguf 家族线**，在其上做 V100 加速增量 |
 | `backup/imported-gemma` | 2026-10-20 重建前的导入快照 | 仅作回退参照，不再推进 |
 
 `main` 的真实血缘：`origin/main` 是上游 `fcc4928a`（2026-10-12，上游 PR #58）的后代，此后
