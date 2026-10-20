@@ -177,11 +177,16 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
             // 也在名单里：它的解码宽度（W=5/6 等）此前落在只有 ~10% 带宽的 ksplit 小 MMA 上，
             // 是每轮最大的一笔开销。纳入 prepack 后由布局感知的路线独占：t<=32 走 QPN，
             // t>=33 走 CUTLASS，行主序的阶梯（SIMT/ksplit/gemm）不再被选中。
+            // FP8 的 SwiGLU gate_up（34816x5120）也在名单里：内核级剖析显示，未预打包时
+            // 解码走 fp8_volta_qpn_gemm_kernel<...,false,...>（294 us/次），而预打包的
+            // <...,true,...> 只要 111 us/次（2.65x）——这是 1.5 线在同一张卡上更快的主要来源
+            // 之一。宽 T 的 CUTLASS 路线按 w.layout 选择预打包偏移，所以 prefill 不受影响。
             const bool fp8_projection =
                 geometry.shape.size() == 2 &&
                 ((geometry.shape[0] == 14336 && geometry.shape[1] == 5120) ||
                  (geometry.shape[0] == 16384 && geometry.shape[1] == 5120) ||
                  (geometry.shape[0] == 248320 && geometry.shape[1] == 5120) ||
+                 (geometry.shape[0] == 34816 && geometry.shape[1] == 5120) ||
                  (geometry.shape[0] == 5120 &&
                   (geometry.shape[1] == 6144 || geometry.shape[1] == 17408)));
             if (geometry.format == QType::FP8_E4M3FN_ROW_BF16 && fp8_projection &&

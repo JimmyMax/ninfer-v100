@@ -14,7 +14,8 @@ import time
 sys.path.insert(0, "/home/max/code/ninfer-v100/bench/v100")
 from wait_ready import wait_ready_ip  # noqa: E402
 
-MODEL = "/workspace/models/Swift-1.5-Qwen3.8-27B-OrcaRouter-NVFP4-DFlash2-V2.ninfer"
+MODEL = os.environ.get("AB_MODEL",
+    "/workspace/models/Swift-1.5-Qwen3.8-27B-OrcaRouter-NVFP4-DFlash2-V2.ninfer")
 EXTRA_ENV = os.environ.get("AB_EXTRA", "").split()
 BASE = ["--host", "0.0.0.0", "--port", "8000", "--api-key", "sk-ab", "--model-id", "qwen",
         "--max-context", "131072", "--prefill-chunk", "2048", "--kv-capacity", "auto",
