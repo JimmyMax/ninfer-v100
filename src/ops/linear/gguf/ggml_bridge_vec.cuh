@@ -694,8 +694,16 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
         };
         if constexpr (KS != 0) {
             static_assert(KS % 1024 == 0);
+            if constexpr (T == 1) {
 #pragma unroll
-            for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+                for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+            } else {
+                // Wider T: keep the slice body in one small loop body. The fully unrolled form
+                // bloats the code past the Volta L1I (measured ~1/3 of warp stalls were instruction
+                // fetch); the loop branch costs far less than the cache misses.
+#pragma unroll 1
+                for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+            }
         } else {
             for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
         }
