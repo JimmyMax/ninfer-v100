@@ -68,8 +68,9 @@ void expect_covered(KvCacheStorage storage, const char* name, std::uint32_t capa
 } // namespace
 
 int main() {
-    // The flash prefill route's staging budget is 131,072 visible keys. Capacities at and past it
-    // are the cases that broke; a short call under any of them must still fit the plan.
+    // The flash prefill route's staging budget is 200,000 visible keys (the product's
+    // --max-context ceiling). Capacities at and past it are the cases that broke; a short call
+    // under any of them must still fit the plan.
     const std::vector<std::uint32_t> visibles{1024, 4096, 33280, 83000, 131072};
     for (const std::uint32_t capacity : {131072U, 200000U, 262144U}) {
         expect_covered(KvCacheStorage::Int8Group64, "int8", capacity, visibles);

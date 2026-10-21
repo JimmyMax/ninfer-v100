@@ -58,11 +58,15 @@ constexpr int kFlashQBlockTokens = 1024; // probe
 // The mask covers whole rows of 8 halves, and the bridge wants `slots % 256 == 0`.
 constexpr int kFlashMaskRowPad = 8;
 
-// Staging cap: the gathered K/V planes cost 2 bytes per (key, kv head, dim), so 131K keys at
-// kv_heads = 4 come to 537 MiB. The earlier 32K cap sent every chunk past 32K visible keys to the
-// sm_70 prompt kernel, which nsys measured at 105 ms a call against this route's 21.6 ms — a 66K
-// prompt then spent 32 s there and prefilled 16% slower than the v1.5 line, which caps nothing.
-constexpr std::int32_t kFlashMaximumVisibleKeys = 131072;
+// Staging cap: the gathered K/V planes cost 2 bytes per (key, kv head, dim), so 200K keys at
+// kv_heads = 4 come to about 781 MiB. The cap tracks the product's --max-context ceiling rather
+// than a route crossover: below it this route stays within 3% of the uncapped v1.5 line at every
+// measured length (97K: 728.5 vs 748.4 tok/s; 132K: 639.9 vs 659.2), while at the earlier 131,072
+// cap the sm_70 prompt fallback ran 14% slower than v1.5's uncapped flash at 166K (506.8 vs
+// 592.3). Measured on a V100-32GB with a 27B NVFP4 artifact, 2026-10-21; the sweep over caps
+// 32K..131K found no crossover below the cap (the prompt route is slower than this route at
+// every length it replaces). docs/v100/ab-v1.5-v1.6-decode-2026-10-21.html.
+constexpr std::int32_t kFlashMaximumVisibleKeys = 200000;
 
 constexpr int round_up_keys(int n) { return ((n + kKeyPad - 1) / kKeyPad) * kKeyPad; }
 

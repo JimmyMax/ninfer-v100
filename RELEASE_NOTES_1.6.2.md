@@ -86,6 +86,18 @@ already reserved exactly this much.
 A failed allocation now also names the workspace it came from, so a report like the one above
 carries `(workspace used N MiB, peak N MiB of N MiB)` beside the layer and column count.
 
+## Flash prefill cap raised to 200,000
+
+The Volta flash route's visible-key cap went 131,072 → 200,000 (the product's `--max-context`
+ceiling). A same-prompt cold A/B against v1.5 (whose flash route has no cap) showed 1.6 at the
+131,072 cap falling to the sm_70 prompt fallback past 131K visible keys — 14.4% slower at 166K
+(506.8 vs 592.3 tok/s) — while staying within 3% at every shorter length. A cap sweep over
+32K..131K found no crossover in the other direction: the prompt fallback is slower than the flash
+route at every length it replaces (84.6K: 629 vs ~768 tok/s), so lowering the cap was rejected with
+measurements. At the new cap, 131-200K prefill returns to parity with v1.5 (196K: 531.6 vs 545.4)
+and 166K gains ~14%. Cost: the arena keeps ~300 MiB more for 200K staging, auto KV drops
+~12.5K int8 tokens (1-lane plain 298,176 → 285,632).
+
 ## Known costs
 
 - Prefill at 66K is 1.0% behind 1.5. The attribution is measured, not guessed: the exact NVFP4

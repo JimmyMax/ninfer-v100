@@ -79,21 +79,35 @@ MTP 组追加 <code>--spec mtp --draft-tokens 4 --lm-head-draft</code>(v1.6 另�
   <tr><th>上下文</th><th>v1.5</th><th>v1.6</th><th>Δ</th></tr>
   <tr><td>7.6K</td><td>1,110</td><td>1,100</td><td>−0.9%</td></tr>
   <tr><td>27K</td><td>1,000</td><td>975</td><td class="warn">−2.5%</td></tr>
-  <tr><td>82K</td><td>781</td><td>697</td><td class="bad">−10.8%</td></tr>
+  <tr><td>82K</td><td>781</td><td>≈768</td><td>≈−2%(噪声级)</td></tr>
 </table>
-<div class="note"><b>这是真正的回退:</b>82K 时 v1.6 的 flash 快路线(暂存随键数线性增长)反而不如 v1.5 的 sm_70 prompt 路线。
-66K 时 v1.6 还是 +17%(710.8→831.1),交叉点在 66K~82K 之间。你的生产上下文正好 82K,
-所以<b>未命中缓存的长请求 TTFT 在 v1.6 上更慢</b>——这是体感「慢」的最可能来源之一。</div>
+<div class="note">初测里 v1.6 的 82K 为 697,但那次命中了 24,960 token 前缀缓存(82K 提示以 27K 为真前缀),是污染点——
+<b>82K 不是回退</b>。v1.5 的 flash 路线本来就没有 cap(全 flash),781 就是全 flash 的数字。同提示冷复测
+(下表)显示 ≤131K 两版本只差 ~2%。</div>
+
+<h3>同提示冷 prefill 复测(1.5 无 cap vs 1.6 cap131K vs 1.6 cap200K)</h3>
+<table>
+  <tr><th>prompt</th><th>v1.5(无 cap)</th><th>v1.6 cap131K</th><th>v1.6 cap200K</th><th>cap200K vs 1.5</th></tr>
+  <tr><td>97,027</td><td>743.5</td><td>728.5</td><td>734.7</td><td>−1.2%</td></tr>
+  <tr><td>115,427</td><td>693.6</td><td>—</td><td>683.4</td><td>−1.5%</td></tr>
+  <tr><td>132,227</td><td>659.2</td><td>639.9</td><td>—</td><td>—</td></tr>
+  <tr><td>151,527</td><td>617.8</td><td>—</td><td>607.0</td><td>−1.8%</td></tr>
+  <tr><td>166,027</td><td>592.3</td><td class="bad">506.8(−14.4%)</td><td>≈578</td><td>≈−2%</td></tr>
+  <tr><td>196,227</td><td>545.4</td><td>—</td><td>531.6</td><td>−2.5%</td></tr>
+</table>
+<div class="note">真正的回退区是<b>可见键数 &gt; 131,072</b>:cap 131072 时 1.6 掉进 sm_70 prompt 回退路线,
+166K 慢 14.4%;cap 提到 <b>200000</b>(= 产品 <code>--max-context</code> 上限)后全区间与 1.5 持平(−1~−3%),
+166K 收回 ≈+14%。已采纳(本报告定稿时改并验证,§7)。</div>
 
 <h3>TTFT 与接受率</h3>
 <table>
   <tr><th>上下文</th><th>TTFT v1.5</th><th>TTFT v1.6</th><th>接受率 v1.5 / v1.6</th></tr>
   <tr><td>7.6K</td><td>7.0 s</td><td>6.9 s</td><td>39.3% / 39.3%</td></tr>
   <tr><td>27K</td><td>27.3 s</td><td>24.0 s</td><td>40.8% / 40.8%</td></tr>
-  <tr><td>82K</td><td>1m 48.5 s(cache 0)</td><td>1m 24.9 s(cache 24,960)</td><td>39.8% / 40.8%</td></tr>
+  <tr><td>82K</td><td>1m 48.5 s(cache 0)</td><td>1m 24.9 s(cache 24,960,污染)</td><td>39.8% / 40.8%</td></tr>
 </table>
-<div class="note">82K 两列不可直接比:本测的 82K 提示以 27K 提示为前缀,v1.6 命中了 24,960 token 共享前缀、v1.5 没有(v1.5 的前缀复用在该场景未触发)。
-若 v1.5 同样命中,TTFT ≈ (84,622−24,960)/781 ≈ 76 s,仍比 v1.6 的 85 s 快——与上表 prefill −10.8% 一致。</div>
+<div class="note">82K 的 v1.6 TTFT 命中了 24,960 token 共享前缀(v1.5 没有),两列不可直接比。
+冷 prefill 复测显示同长度两版本 TTFT 持平(≈108~111 s)——初测的「v1.6 慢 13 s」是缓存污染点的复合,不是真实差距。</div>
 
 <h2>2. 双 lane(生产并发度 2)· MTP d4 · 27K</h2>
 <div class="note">两个相同 27K 请求并发,2 轮;v1.5 无 <code>--ngram-draft-tokens</code>,v1.6 为 0。</div>
@@ -126,12 +140,15 @@ Coder390 的 MTP 解码低 ~10 tok/s,主因是<b>接受率低 8~15 个百分点<
   <tr><td>v1.5</td><td>200,000</td><td>200,000</td><td>235,392</td></tr>
   <tr><td>v1.6</td><td>298,176</td><td>255,616</td><td>244,160</td></tr>
 </table>
-<div class="note">v1.6 的 auto KV 更大(规划口径不同),不是代价项。</div>
+<div class="note">v1.6 的 auto KV 更大(规划口径不同),不是代价项。
+注意:cap 提到 200000 后(本报告定稿时已改),1 lane 的 plain 容量 298,176 → 285,632(arena 多留 ~300 MiB
+给 200K staging,KV ≈ −12.5K int8 token),2 lane MTP 相应再降。</div>
 
 <h2>5. 「1.6 decode 慢」的可能来源,按可信度排序</h2>
 <ul>
   <li><b>模型换了(最大)。</b>当前 Coder390 的 MTP 接受率 28~35%,比旧 OrcaRouter 线的 39~50% 低,等效解码 ~10 tok/s 更低。且 Coder390 在 v1.5 上不可加载,你手上没有「Coder390 on v1.5」的基线,对比只能是跨模型的记忆对比。</li>
-  <li><b>82K 未命中缓存请求的 TTFT。</b>v1.6 flash 路线在高键数下比 v1.5 prompt 路线慢 10.8%(697 vs 781 tok/s),82K 冷请求 TTFT ~13 s 差距。你日常多数请求命中前缀缓存,所以这不是每请求感受,但新话题/冷会话会明显。</li>
+  <li><b>82K prefill 不是回退(初测 697 是缓存污染)。</b>同提示冷复测:≤131K 两版本差 ~2%(噪声级)。
+真正回退区是可见键数 &gt;131K(166K 慢 14.4%),已用 cap 131072 → 200000 修复(§7)。</li>
   <li><b>双 lane 第二请求的编排。</b>v1.6 第 1 轮里第二请求总完成晚 ~4 s(见 §2),并发高峰下的主观感受。</li>
   <li><b>解码本身不是。</b>同模型 MTP 解码 +3~+12%,纯解码 ≤27K 持平、82K −6%(单点小量)。</li>
 </ul>
@@ -145,17 +162,23 @@ Coder390 的 MTP 解码低 ~10 tok/s,主因是<b>接受率低 8~15 个百分点<
   <li>两镜像均读同一模型文件;v1.6 = <code>ninfer:1.6.2</code>(含 <code>ab6f496</code> 崩溃修复,二进制 sha256 <code>0f3ea6f3…aa867cc</code>)。</li>
 </ul>
 
-<h2>7. 建议的后续(未做)</h2>
+<h2>7. 后续:已完成(cap 200000)与剩余</h2>
 <ul>
-  <li><b>82K prefill 回退:</b>对 v1.6 flash 路线 vs v1.5 prompt 路线做 kernel 级剖析,找交叉键数,
-  按可见键数选择路线(如 keys &gt; ~70K 退回 prompt 路线)可收回 ~10%。</li>
-  <li>纯解码 82K −6%:量级小,若做上述路线调整可一并复核。</li>
+  <li><b>flash cap 扫描(已做,已采纳 cap 200000)。</b>对 5 个 cap(32K/49K/65K/82K/131K)× 4 个长度做冷 prefill 扫描:
+  1.6 的 prompt 回退路线在<b>每个</b>被替换的长度上都比 flash 路线慢(84.6K:629 vs ≈768),
+  不存在「调低 cap 换 prompt」的交叉点——调低 cap 只损失最多 15~23%。正确方向相反:
+  把 cap 从 131072 提到 <b>200000</b>(= <code>--max-context</code>),让 131~200K 区间继续走 flash:
+  166K 506.8 → ≈578(+14%),196K 531.6(与 1.5 的 545.4 差 −2.5%),≤131K 不变。
+  代价:arena 多留 ~300 MiB,KV 容量 ≈ −12.5K int8 token(1 lane plain 298,176 → 285,632)。</li>
+  <li>纯解码 82K −6%:量级小,单点,暂不处理。</li>
   <li>双 lane 编排:第 1 轮第二请求晚完成 ~4 s 的成因(成批条件),可选优化。</li>
 </ul>
 
 <div class="note" style="margin-top:26px">
-  数据文件:<code>bench/v100/data/ab_v15_v16_2026-10-21/</code>(ab_full.json 18 条单 lane、ab_2lane.json 8 条双 lane、含原始 done 行日志)·
-  生成于 ninfer-v100 <code>main</code> @ <code>ab6f496</code> 之后的构建
+  数据文件:<code>bench/v100/data/ab_v15_v16_2026-10-21/</code>(ab_full.json 18 条单 lane、ab_2lane.json 8 条双 lane)与
+  <code>bench/v100/data/cap_sweep_2026-10-21/</code>(cap 扫描、final_ab.json 1.5 vs 1.6 cap131K 同提示复测、
+  verify200.json cap200K 验证,均含原始 done 行日志)·
+  生成于 ninfer-v100 <code>main</code> @ <code>ab6f496</code> 之后的构建;cap 200000 变更在本报告定稿时提交并验证
 </div>
 
 </div>

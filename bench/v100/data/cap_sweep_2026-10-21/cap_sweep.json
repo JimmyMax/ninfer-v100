@@ -1,0 +1,232 @@
+[
+ {
+  "cap": 131072,
+  "capacity": "capacity | KV 298,176 tokens, int8, auto | pages 4,659/33,554,431 | runtime 11.2 GiB | free 1010.2 MiB",
+  "runs": [
+   {
+    "size": "66k",
+    "prompt": "72,227",
+    "prefill": "819.9",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:11:16.941  INFO  req#1 done | openai-chat | output limit | prompt 72,227 | output 16 | cache 0 (0.0%) | TTFT 1m 28.1s | total 1m 28.7s | queue 18.8 ms | prefill 819.9 tok/s | decode 28.7 tok/s"
+   },
+   {
+    "size": "70k",
+    "prompt": "72,067",
+    "prefill": "809.2",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:12:46.748  INFO  req#2 done | openai-chat | output limit | prompt 72,067 | output 16 | cache 0 (0.0%) | TTFT 1m 29.1s | total 1m 29.7s | queue 32.7 ms | prefill 809.2 tok/s | decode 28.9 tok/s"
+   },
+   {
+    "size": "77k",
+    "prompt": "77,067",
+    "prefill": "791.8",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:14:24.846  INFO  req#3 done | openai-chat | output limit | prompt 77,067 | output 16 | cache 0 (0.0%) | TTFT 1m 37.4s | total 1m 38.0s | queue 24.3 ms | prefill 791.8 tok/s | decode 28.6 tok/s"
+   },
+   {
+    "size": "82k",
+    "prompt": "97,027",
+    "prefill": "729.3",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:16:39.883  INFO  req#4 done | openai-chat | output limit | prompt 97,027 | output 16 | cache 0 (0.0%) | TTFT 2m 13.2s | total 2m 14.9s | queue 44.8 ms | prefill 729.3 tok/s | decode 27.6 tok/s"
+   }
+  ]
+ },
+ {
+  "cap": 32768,
+  "capacity": "capacity | KV 306,432 tokens, int8, auto | pages 4,788/33,554,431 | runtime 11.2 GiB | free 1010.2 MiB",
+  "runs": [
+   {
+    "size": "66k",
+    "prompt": "72,228",
+    "prefill": "686.5",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:20:19.584  INFO  req#1 done | openai-chat | output limit | prompt 72,228 | output 16 | cache 0 (0.0%) | TTFT 1m 45.3s | total 1m 45.8s | queue 20.2 ms | prefill 686.5 tok/s | decode 28.7 tok/s"
+   },
+   {
+    "size": "70k",
+    "prompt": "77,187",
+    "prefill": "660.9",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:22:17.131  INFO  req#2 done | openai-chat | output limit | prompt 77,187 | output 16 | cache 0 (0.0%) | TTFT 1m 56.9s | total 1m 57.4s | queue 27.7 ms | prefill 660.9 tok/s | decode 28.6 tok/s"
+   },
+   {
+    "size": "77k",
+    "prompt": "79,897",
+    "prefill": "648.4",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:24:21.122  INFO  req#3 done | openai-chat | output limit | prompt 79,897 | output 16 | cache 0 (0.0%) | TTFT 2m 3.3s | total 2m 3.9s | queue 23.5 ms | prefill 648.4 tok/s | decode 28.5 tok/s"
+   },
+   {
+    "size": "82k",
+    "prompt": "84,627",
+    "prefill": "628.8",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:26:37.456  INFO  req#4 done | openai-chat | output limit | prompt 84,627 | output 16 | cache 0 (0.0%) | TTFT 2m 14.7s | total 2m 16.2s | queue 26.2 ms | prefill 628.8 tok/s | decode 28.2 tok/s"
+   }
+  ]
+ },
+ {
+  "cap": 49152,
+  "capacity": "capacity | KV 306,432 tokens, int8, auto | pages 4,788/33,554,431 | runtime 11.2 GiB | free 1010.2 MiB",
+  "runs": [
+   {
+    "size": "66k",
+    "prompt": "72,228",
+    "prefill": "721.2",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:30:11.780  INFO  req#1 done | openai-chat | output limit | prompt 72,228 | output 16 | cache 0 (0.0%) | TTFT 1m 40.2s | total 1m 40.8s | queue 22.3 ms | prefill 721.2 tok/s | decode 28.7 tok/s"
+   },
+   {
+    "size": "70k",
+    "prompt": "77,187",
+    "prefill": "690.7",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:32:04.271  INFO  req#2 done | openai-chat | output limit | prompt 77,187 | output 16 | cache 0 (0.0%) | TTFT 1m 51.8s | total 1m 52.4s | queue 24.9 ms | prefill 690.7 tok/s | decode 28.5 tok/s"
+   },
+   {
+    "size": "77k",
+    "prompt": "79,897",
+    "prefill": "676.0",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:34:03.224  INFO  req#3 done | openai-chat | output limit | prompt 79,897 | output 16 | cache 0 (0.0%) | TTFT 1m 58.3s | total 1m 58.8s | queue 24.6 ms | prefill 676.0 tok/s | decode 28.5 tok/s"
+   },
+   {
+    "size": "82k",
+    "prompt": "84,627",
+    "prefill": "653.1",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:36:14.725  INFO  req#4 done | openai-chat | output limit | prompt 84,627 | output 16 | cache 0 (0.0%) | TTFT 2m 9.7s | total 2m 11.4s | queue 26.6 ms | prefill 653.1 tok/s | decode 28.1 tok/s"
+   }
+  ]
+ },
+ {
+  "cap": 65536,
+  "capacity": "capacity | KV 306,432 tokens, int8, auto | pages 4,788/33,554,431 | runtime 11.2 GiB | free 1010.2 MiB",
+  "runs": [
+   {
+    "size": "66k",
+    "prompt": "65,027",
+    "prefill": "842.5",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:39:31.460  INFO  req#1 done | openai-chat | output limit | prompt 65,027 | output 16 | cache 0 (0.0%) | TTFT 1m 17.3s | total 1m 17.8s | queue 28.6 ms | prefill 842.5 tok/s | decode 29.2 tok/s"
+   },
+   {
+    "size": "70k",
+    "prompt": "79,747",
+    "prefill": "725.1",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:41:22.199  INFO  req#2 done | openai-chat | output limit | prompt 79,747 | output 16 | cache 0 (0.0%) | TTFT 1m 50.1s | total 1m 50.6s | queue 29.5 ms | prefill 725.1 tok/s | decode 28.4 tok/s"
+   },
+   {
+    "size": "77k",
+    "prompt": "82,727",
+    "prefill": "705.7",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:43:20.187  INFO  req#3 done | openai-chat | output limit | prompt 82,727 | output 16 | cache 0 (0.0%) | TTFT 1m 57.3s | total 1m 57.9s | queue 25.4 ms | prefill 705.7 tok/s | decode 28.3 tok/s"
+   },
+   {
+    "size": "82k",
+    "prompt": "87,727",
+    "prefill": "677.5",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:45:31.508  INFO  req#4 done | openai-chat | output limit | prompt 87,727 | output 16 | cache 0 (0.0%) | TTFT 2m 9.6s | total 2m 11.2s | queue 27.0 ms | prefill 677.5 tok/s | decode 28.0 tok/s"
+   }
+  ]
+ },
+ {
+  "cap": 81920,
+  "capacity": "capacity | KV 306,432 tokens, int8, auto | pages 4,788/33,554,431 | runtime 11.2 GiB | free 1010.2 MiB",
+  "runs": [
+   {
+    "size": "66k",
+    "prompt": "65,027",
+    "prefill": "841.4",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:48:42.525  INFO  req#1 done | openai-chat | output limit | prompt 65,027 | output 16 | cache 0 (0.0%) | TTFT 1m 17.3s | total 1m 17.9s | queue 16.6 ms | prefill 841.4 tok/s | decode 29.2 tok/s"
+   },
+   {
+    "size": "70k",
+    "prompt": "79,747",
+    "prefill": "779.5",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:50:25.627  INFO  req#2 done | openai-chat | output limit | prompt 79,747 | output 16 | cache 0 (0.0%) | TTFT 1m 42.4s | total 1m 42.9s | queue 29.6 ms | prefill 779.5 tok/s | decode 28.4 tok/s"
+   },
+   {
+    "size": "77k",
+    "prompt": "82,727",
+    "prefill": "762.8",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:52:14.886  INFO  req#3 done | openai-chat | output limit | prompt 82,727 | output 16 | cache 0 (0.0%) | TTFT 1m 48.5s | total 1m 49.1s | queue 24.7 ms | prefill 762.8 tok/s | decode 28.3 tok/s"
+   },
+   {
+    "size": "82k",
+    "prompt": "87,727",
+    "prefill": "726.6",
+    "cache": [
+     "0",
+     "0.0"
+    ],
+    "line": "2026-10-21 11:54:17.468  INFO  req#4 done | openai-chat | output limit | prompt 87,727 | output 16 | cache 0 (0.0%) | TTFT 2m 0.8s | total 2m 2.4s | queue 26.6 ms | prefill 726.6 tok/s | decode 28.0 tok/s"
+   }
+  ]
+ }
+]

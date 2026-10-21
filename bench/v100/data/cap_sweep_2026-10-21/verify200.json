@@ -1,0 +1,54 @@
+[
+ {
+  "label": "1.6cap200",
+  "capacity": "capacity | KV 285,632 tokens, int8, auto | pages 4,463/33,554,431 | runtime 11.2 GiB | free 1010.2 MiB",
+  "runs": [
+   {
+    "size": "97k",
+    "prompt": "97,027",
+    "prefill": "734.7"
+   },
+   {
+    "size": "132k",
+    "prompt": "115,427",
+    "prefill": "683.4"
+   },
+   {
+    "size": "166k",
+    "prompt": "151,527",
+    "prefill": "607.0"
+   },
+   {
+    "size": "200k",
+    "prompt": "196,227",
+    "prefill": "531.6"
+   }
+  ]
+ },
+ {
+  "label": "1.5",
+  "capacity": "capacity | KV 200,000 tokens, int8, auto | pages 3,125/3,125 | runtime 8.16 GiB | free 4.00 GiB",
+  "runs": [
+   {
+    "size": "97k",
+    "prompt": "97,027",
+    "prefill": "743.5"
+   },
+   {
+    "size": "132k",
+    "prompt": "115,427",
+    "prefill": "693.6"
+   },
+   {
+    "size": "166k",
+    "prompt": "151,527",
+    "prefill": "617.8"
+   },
+   {
+    "size": "200k",
+    "prompt": "196,227",
+    "prefill": "545.4"
+   }
+  ]
+ }
+]
