@@ -76,7 +76,9 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
     // 它不向 arena 记账，所以在**这里**（模型加载、任何 CUDA graph 捕获之前）预留一次，
     // 运行期只读指针；捕获中绝不 cudaMalloc（否则捕获被 cudaErrorStreamCaptureInvalidated
     // 打断）。实测同形状同布局下 bf16 激活 548 GB/s vs 暂存 fp16 768 GB/s。
+#if defined(NINFER_TIER_VOLTA)
     (void)ops::detail::fp8_gdn_qpn_stage_reserve();
+#endif
     // sm_70's projection routes (ops/linear/sm70) read row-split codes in the panel layout, where
     // one 128-byte line holds a k-group's records of four rows: row-major records cost the decode
     // reads 10 to 40% of the card's bandwidth. The text layers' attention, GDN and dense MLP
