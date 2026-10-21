@@ -1,0 +1,42 @@
+[
+ {
+  "label": "1.5 mtp2",
+  "decode": "47.5",
+  "line": "2026-10-21 09:27:16.624  INFO  req#1 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 0 (0.0%) | TTFT 27.3s | total 29.5s | prefill 996.5 tok/s | decode 47.5 tok/s | mtp accepted 61/130 (46.9%)"
+ },
+ {
+  "label": "1.5 mtp2",
+  "decode": "50.0",
+  "line": "2026-10-21 09:27:16.666  INFO  req#2 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 27,215 (100.0%, shared prefix) | TTFT 27.6s | total 29.5s | queue 27.4s | prefill 65.4 tok/s | decode 50.0 tok/s | mtp accepted 63/127 (49.6%)"
+ },
+ {
+  "label": "1.5 mtp2",
+  "decode": "50.3",
+  "line": "2026-10-21 09:27:18.802  INFO  req#4 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 27,217 (100.0%, response replay) | TTFT 98.7 ms | total 2.1s | queue 15.2 ms | prefill 66.4 tok/s | decode 50.3 tok/s | mtp accepted 63/127 (49.6%)"
+ },
+ {
+  "label": "1.5 mtp2",
+  "decode": "48.3",
+  "line": "2026-10-21 09:27:18.972  INFO  req#3 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 27,217 (100.0%, response replay) | TTFT 274 ms | total 2.3s | queue 190 ms | prefill 65.6 tok/s | decode 48.3 tok/s | mtp accepted 61/130 (46.9%)"
+ },
+ {
+  "label": "1.6 mtp2",
+  "decode": "71.2",
+  "line": "2026-10-21 09:28:24.479  INFO  req#1 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 0 (0.0%) | TTFT 27.4s | total 28.8s | prefill 992.9 tok/s | decode 71.2 tok/s | mtp accepted 63/127 (49.6%)"
+ },
+ {
+  "label": "1.6 mtp2",
+  "decode": "71.7",
+  "line": "2026-10-21 09:28:29.103  INFO  req#2 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 24,960 (91.7%, shared prefix) | TTFT 32.1s | total 33.4s | queue 27.5s | prefill 685.5 tok/s | decode 71.7 tok/s | mtp accepted 63/127 (49.6%)"
+ },
+ {
+  "label": "1.6 mtp2",
+  "decode": "47.6",
+  "line": "2026-10-21 09:28:31.278  INFO  req#3 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 27,215 (100.0%, shared prefix) | TTFT 71.6 ms | total 2.1s | prefill 146.6 tok/s | decode 47.6 tok/s | mtp accepted 61/130 (46.9%)"
+ },
+ {
+  "label": "1.6 mtp2",
+  "decode": "47.5",
+  "line": "2026-10-21 09:28:31.322  INFO  req#4 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 27,215 (100.0%, shared prefix) | TTFT 164 ms | total 2.2s | queue 99.8 ms | prefill 146.8 tok/s | decode 47.5 tok/s | mtp accepted 61/130 (46.9%)"
+ }
+]

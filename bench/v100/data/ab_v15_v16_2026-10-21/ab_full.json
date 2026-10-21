@@ -1,0 +1,436 @@
+[
+ {
+  "prompt": [
+   "7,622"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": [
+   "6.8",
+   "s"
+  ],
+  "prefill": [
+   "1.12k"
+  ],
+  "decode": [
+   "33.0"
+  ],
+  "accept": null,
+  "line": "2026-10-21 09:07:58.984  INFO  req#1 done | openai-chat | output limit | prompt 7,622 | output 192 | cache 0 (0.0%) | TTFT 6.8s | total 12.6s | prefill 1.12k tok/s | decode 33.0 tok/s",
+  "version": "ninfer:1.6.2",
+  "model": "coder390",
+  "mode": "plain",
+  "size": "1k"
+ },
+ {
+  "prompt": [
+   "27,222"
+  ],
+  "cache": null,
+  "ttft": [
+   "23.7",
+   "s"
+  ],
+  "prefill": [
+   "987.4"
+  ],
+  "decode": [
+   "31.7"
+  ],
+  "accept": null,
+  "line": "2026-10-21 09:08:28.875  INFO  req#2 done | openai-chat | output limit | prompt 27,222 | output 192 | cache 3,840 (14.1%, shared prefix) | TTFT 23.7s | total 29.8s | prefill 987.4 tok/s | decode 31.7 tok/s",
+  "version": "ninfer:1.6.2",
+  "model": "coder390",
+  "mode": "plain",
+  "size": "27k"
+ },
+ {
+  "prompt": [
+   "84,622"
+  ],
+  "cache": null,
+  "ttft": null,
+  "prefill": [
+   "703.3"
+  ],
+  "decode": [
+   "28.2"
+  ],
+  "accept": null,
+  "line": "2026-10-21 09:10:00.726  INFO  req#3 done | openai-chat | output limit | prompt 84,622 | output 192 | cache 24,960 (29.5%, shared prefix) | TTFT 1m 24.9s | total 1m 31.7s | queue 28.4 ms | prefill 703.3 tok/s | decode 28.2 tok/s",
+  "version": "ninfer:1.6.2",
+  "model": "coder390",
+  "mode": "plain",
+  "size": "82k"
+ },
+ {
+  "prompt": [
+   "7,622"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": [
+   "7.0",
+   "s"
+  ],
+  "prefill": [
+   "1.09k"
+  ],
+  "decode": [
+   "53.3"
+  ],
+  "accept": [
+   "101",
+   "359",
+   "28.1"
+  ],
+  "line": "2026-10-21 09:10:48.030  INFO  req#1 done | openai-chat | output limit | prompt 7,622 | output 192 | cache 0 (0.0%) | TTFT 7.0s | total 10.6s | prefill 1.09k tok/s | decode 53.3 tok/s | mtp accepted 101/359 (28.1%)",
+  "version": "ninfer:1.6.2",
+  "model": "coder390",
+  "mode": "mtp",
+  "size": "1k"
+ },
+ {
+  "prompt": [
+   "27,222"
+  ],
+  "cache": null,
+  "ttft": [
+   "24.0",
+   "s"
+  ],
+  "prefill": [
+   "973.8"
+  ],
+  "decode": [
+   "57.6"
+  ],
+  "accept": [
+   "111",
+   "315",
+   "35.2"
+  ],
+  "line": "2026-10-21 09:11:15.514  INFO  req#2 done | openai-chat | output limit | prompt 27,222 | output 192 | cache 3,840 (14.1%, shared prefix) | TTFT 24.0s | total 27.4s | queue 11.8 ms | prefill 973.8 tok/s | decode 57.6 tok/s | mtp accepted 111/315 (35.2%)",
+  "version": "ninfer:1.6.2",
+  "model": "coder390",
+  "mode": "mtp",
+  "size": "27k"
+ },
+ {
+  "prompt": [
+   "84,622"
+  ],
+  "cache": null,
+  "ttft": null,
+  "prefill": [
+   "697.3"
+  ],
+  "decode": [
+   "50.4"
+  ],
+  "accept": [
+   "109",
+   "323",
+   "33.7"
+  ],
+  "line": "2026-10-21 09:12:45.115  INFO  req#3 done | openai-chat | output limit | prompt 84,622 | output 192 | cache 24,960 (29.5%, shared prefix) | TTFT 1m 25.6s | total 1m 29.5s | queue 30.5 ms | prefill 697.3 tok/s | decode 50.4 tok/s | mtp accepted 109/323 (33.7%)",
+  "version": "ninfer:1.6.2",
+  "model": "coder390",
+  "mode": "mtp",
+  "size": "82k"
+ },
+ {
+  "prompt": [
+   "7,622"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": [
+   "7.0",
+   "s"
+  ],
+  "prefill": [
+   "1.11k"
+  ],
+  "decode": [
+   "32.7"
+  ],
+  "accept": null,
+  "line": "2026-10-21 09:13:26.726  INFO  req#1 done | openai-chat | output limit | prompt 7,622 | output 192 | cache 0 (0.0%) | TTFT 7.0s | total 12.8s | prefill 1.11k tok/s | decode 32.7 tok/s",
+  "version": "ninfer:v1.5.0",
+  "model": "swiftv2",
+  "mode": "plain",
+  "size": "1k"
+ },
+ {
+  "prompt": [
+   "27,222"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": [
+   "27.3",
+   "s"
+  ],
+  "prefill": [
+   "1.00k"
+  ],
+  "decode": [
+   "31.5"
+  ],
+  "accept": null,
+  "line": "2026-10-21 09:14:00.156  INFO  req#2 done | openai-chat | output limit | prompt 27,222 | output 192 | cache 0 (0.0%) | TTFT 27.3s | total 33.4s | queue 63.0 ms | prefill 1.00k tok/s | decode 31.5 tok/s",
+  "version": "ninfer:v1.5.0",
+  "model": "swiftv2",
+  "mode": "plain",
+  "size": "27k"
+ },
+ {
+  "prompt": [
+   "84,622"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": null,
+  "prefill": [
+   "780.9"
+  ],
+  "decode": [
+   "26.2"
+  ],
+  "accept": null,
+  "line": "2026-10-21 09:15:56.070  INFO  req#3 done | openai-chat | output limit | prompt 84,622 | output 192 | cache 0 (0.0%) | TTFT 1m 48.5s | total 1m 55.8s | queue 26.3 ms | prefill 780.9 tok/s | decode 26.2 tok/s",
+  "version": "ninfer:v1.5.0",
+  "model": "swiftv2",
+  "mode": "plain",
+  "size": "82k"
+ },
+ {
+  "prompt": [
+   "7,622"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": [
+   "7.1",
+   "s"
+  ],
+  "prefill": [
+   "1.09k"
+  ],
+  "decode": [
+   "61.3"
+  ],
+  "accept": [
+   "116",
+   "295",
+   "39.3"
+  ],
+  "line": "2026-10-21 09:16:38.904  INFO  req#1 done | openai-chat | output limit | prompt 7,622 | output 192 | cache 0 (0.0%) | TTFT 7.1s | total 10.2s | prefill 1.09k tok/s | decode 61.3 tok/s | mtp accepted 116/295 (39.3%)",
+  "version": "ninfer:v1.5.0",
+  "model": "swiftv2",
+  "mode": "mtp",
+  "size": "1k"
+ },
+ {
+  "prompt": [
+   "27,222"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": [
+   "27.6",
+   "s"
+  ],
+  "prefill": [
+   "991.0"
+  ],
+  "decode": [
+   "60.9"
+  ],
+  "accept": [
+   "118",
+   "289",
+   "40.8"
+  ],
+  "line": "2026-10-21 09:17:09.743  INFO  req#2 done | openai-chat | output limit | prompt 27,222 | output 192 | cache 0 (0.0%) | TTFT 27.6s | total 30.8s | queue 65.4 ms | prefill 991.0 tok/s | decode 60.9 tok/s | mtp accepted 118/289 (40.8%)",
+  "version": "ninfer:v1.5.0",
+  "model": "swiftv2",
+  "mode": "mtp",
+  "size": "27k"
+ },
+ {
+  "prompt": [
+   "84,622"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": null,
+  "prefill": [
+   "772.5"
+  ],
+  "decode": [
+   "47.8"
+  ],
+  "accept": [
+   "117",
+   "294",
+   "39.8"
+  ],
+  "line": "2026-10-21 09:19:03.548  INFO  req#3 done | openai-chat | output limit | prompt 84,622 | output 192 | cache 0 (0.0%) | TTFT 1m 49.7s | total 1m 53.7s | queue 39.9 ms | prefill 772.5 tok/s | decode 47.8 tok/s | mtp accepted 117/294 (39.8%)",
+  "version": "ninfer:v1.5.0",
+  "model": "swiftv2",
+  "mode": "mtp",
+  "size": "82k"
+ },
+ {
+  "prompt": [
+   "7,622"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": [
+   "6.9",
+   "s"
+  ],
+  "prefill": [
+   "1.10k"
+  ],
+  "decode": [
+   "33.0"
+  ],
+  "accept": null,
+  "line": "2026-10-21 09:19:48.784  INFO  req#1 done | openai-chat | output limit | prompt 7,622 | output 192 | cache 0 (0.0%) | TTFT 6.9s | total 12.7s | prefill 1.10k tok/s | decode 33.0 tok/s",
+  "version": "ninfer:1.6.2",
+  "model": "swiftv2",
+  "mode": "plain",
+  "size": "1k"
+ },
+ {
+  "prompt": [
+   "27,222"
+  ],
+  "cache": null,
+  "ttft": [
+   "24.0",
+   "s"
+  ],
+  "prefill": [
+   "974.6"
+  ],
+  "decode": [
+   "31.3"
+  ],
+  "accept": null,
+  "line": "2026-10-21 09:20:19.075  INFO  req#2 done | openai-chat | output limit | prompt 27,222 | output 192 | cache 3,840 (14.1%, shared prefix) | TTFT 24.0s | total 30.1s | queue 11.5 ms | prefill 974.6 tok/s | decode 31.3 tok/s",
+  "version": "ninfer:1.6.2",
+  "model": "swiftv2",
+  "mode": "plain",
+  "size": "27k"
+ },
+ {
+  "prompt": [
+   "84,622"
+  ],
+  "cache": null,
+  "ttft": null,
+  "prefill": [
+   "696.5"
+  ],
+  "decode": [
+   "24.6"
+  ],
+  "accept": null,
+  "line": "2026-10-21 09:21:52.732  INFO  req#3 done | openai-chat | output limit | prompt 84,622 | output 192 | cache 24,960 (29.5%, shared prefix) | TTFT 1m 25.7s | total 1m 33.5s | queue 28.4 ms | prefill 696.5 tok/s | decode 24.6 tok/s",
+  "version": "ninfer:1.6.2",
+  "model": "swiftv2",
+  "mode": "plain",
+  "size": "82k"
+ },
+ {
+  "prompt": [
+   "7,622"
+  ],
+  "cache": [
+   "0.0"
+  ],
+  "ttft": [
+   "7.1",
+   "s"
+  ],
+  "prefill": [
+   "1.08k"
+  ],
+  "decode": [
+   "63.9"
+  ],
+  "accept": [
+   "116",
+   "295",
+   "39.3"
+  ],
+  "line": "2026-10-21 09:22:39.137  INFO  req#1 done | openai-chat | output limit | prompt 7,622 | output 192 | cache 0 (0.0%) | TTFT 7.1s | total 10.1s | prefill 1.08k tok/s | decode 63.9 tok/s | mtp accepted 116/295 (39.3%)",
+  "version": "ninfer:1.6.2",
+  "model": "swiftv2",
+  "mode": "mtp",
+  "size": "1k"
+ },
+ {
+  "prompt": [
+   "27,222"
+  ],
+  "cache": null,
+  "ttft": [
+   "24.2",
+   "s"
+  ],
+  "prefill": [
+   "967.5"
+  ],
+  "decode": [
+   "62.7"
+  ],
+  "accept": [
+   "118",
+   "289",
+   "40.8"
+  ],
+  "line": "2026-10-21 09:23:06.511  INFO  req#2 done | openai-chat | output limit | prompt 27,222 | output 192 | cache 3,840 (14.1%, shared prefix) | TTFT 24.2s | total 27.3s | queue 10.3 ms | prefill 967.5 tok/s | decode 62.7 tok/s | mtp accepted 118/289 (40.8%)",
+  "version": "ninfer:1.6.2",
+  "model": "swiftv2",
+  "mode": "mtp",
+  "size": "27k"
+ },
+ {
+  "prompt": [
+   "84,622"
+  ],
+  "cache": null,
+  "ttft": null,
+  "prefill": [
+   "693.3"
+  ],
+  "decode": [
+   "53.4"
+  ],
+  "accept": [
+   "118",
+   "289",
+   "40.8"
+  ],
+  "line": "2026-10-21 09:24:36.378  INFO  req#3 done | openai-chat | output limit | prompt 84,622 | output 192 | cache 24,960 (29.5%, shared prefix) | TTFT 1m 26.1s | total 1m 29.7s | queue 30.0 ms | prefill 693.3 tok/s | decode 53.4 tok/s | mtp accepted 118/289 (40.8%)",
+  "version": "ninfer:1.6.2",
+  "model": "swiftv2",
+  "mode": "mtp",
+  "size": "82k"
+ }
+]

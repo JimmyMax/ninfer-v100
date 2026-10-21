@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NInfer V100 — v1.5 vs v1.6 全面对比(2026-10-21)</title>
+<style>
+  :root { --bg:#101418; --card:#1a2129; --line:#2c3742; --fg:#d8e1ea; --dim:#8b9bab;
+          --good:#4fd08a; --bad:#f07178; --warn:#e6c07b; --acc:#7aa2f7; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.65 -apple-system,"Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:1060px; margin:0 auto; padding:28px 20px 60px; }
+  h1 { font-size:24px; margin:8px 0 4px; }
+  h2 { font-size:19px; margin:34px 0 10px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+  .sub { color:var(--dim); font-size:13.5px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 18px; margin:14px 0; }
+  table { border-collapse:collapse; width:100%; margin:10px 0; font-size:14px; }
+  th,td { border:1px solid var(--line); padding:7px 10px; text-align:right; white-space:nowrap; }
+  th { background:#202a34; color:var(--dim); font-weight:600; }
+  td:first-child, th:first-child { text-align:left; }
+  .good { color:var(--good); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+  .note { color:var(--dim); font-size:13px; }
+  code { background:#232d38; border-radius:4px; padding:1px 5px; font-size:12.5px;
+         font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .bar { height:18px; border-radius:3px; background:var(--acc); display:inline-block; vertical-align:middle; }
+  .bar.b5 { background:#5b7bd4; }
+  ul { margin:8px 0; padding-left:22px; } li { margin:4px 0; }
+  .tag { display:inline-block; background:#233043; color:var(--acc); border-radius:4px;
+         padding:1px 8px; font-size:12.5px; margin-right:6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>NInfer V100:v1.5 vs v1.6 全面对比</h1>
+<div class="sub">
+  2026-10-21 · Tesla V100-PCIE-32GB(sm_70,CUDA 12.8)· 同一张卡、同一模型文件、同参数 A/B
+  · v1.5 = <code>ninfer:v1.5.0</code> · v1.6 = <code>ninfer:1.6.2</code>(含长上下文 prefill 崩溃修复 <code>ab6f496</code>)
+</div>
+
+<div class="card">
+  <b>一句话结论:</b>同模型(两版本都支持的 Swift v2 制品)下,<b>v1.6 的 MTP 解码并不慢,反而快 3%~12%</b>;
+  纯解码在 ≤27K 持平,82K 时慢 6%。真正的回退是 <b>82K 长上下文 prefill 慢 10%</b>(v1.6 flash 路线在高键数下
+  不如 v1.5 的 prompt 路线)。「1.6 比 1.5 慢」的体感更可能来自<b>换了模型</b>:你的生产模型 Coder390 在
+  v1.5 上<b>根本无法加载</b>(制品未注册),它自身的 MTP 接受率(28~35%)低于之前 OrcaRouter/Swift 线
+  (39~50%),等效解码速度自然更低。
+</div>
+
+<h2>0. 前提:两个模型,不是所有组合都能比</h2>
+<table>
+  <tr><th>模型(制品)</th><th>v1.5</th><th>v1.6</th><th>说明</th></tr>
+  <tr><td>Swift-1.5-…-OrcaRouter-NVFP4-DFlash2-<b>V2</b>.ninfer</td>
+      <td class="good">可运行</td><td class="good">可运行</td>
+      <td class="note">本次同模型 A/B 用它;两版本读同一文件</td></tr>
+  <tr><td>Qwen3.8-27B-Coder390-…-W4A4-MTP-DFlash2.ninfer(生产在用)</td>
+      <td class="bad">不可运行</td><td class="good">可运行</td>
+      <td class="note">v1.5 启动即 <code>FATAL … artifact identity 'qwen3.8-27b-coder390-…' has no registered target for this device</code></td></tr>
+</table>
+<div class="note">所以「1.6 比 1.5 慢」不可能是在同一个制品上测出来的——Coder390 只有 1.6 能跑,1.5 的基准只能来自更早的 OrcaRouter/Swift 时期。</div>
+
+<h2>1. 同模型 A/B:Swift v2 制品,单 lane,生产参数</h2>
+<div class="note">参数(两版本一致):<code>--max-context 200000 --prefill-chunk 2048 --kv-dtype int8 --kv-capacity auto --max-concurrency 1 --preserve-thinking --vision</code>;
+MTP 组追加 <code>--spec mtp --draft-tokens 4 --lm-head-draft</code>(v1.6 另加 <code>--ngram-draft-tokens 0</code>;该特性 v1.5 不存在,故语义对齐)。
+贪心(temperature 0),输出 192 token;每格 = 该 (版本, 模式, 上下文) 的一次请求。</div>
+
+<h3>解码 tok/s(你感觉的那项)</h3>
+<table>
+  <tr><th>上下文</th><th colspan="3">纯解码(无投机)</th><th colspan="3">MTP d4(生产模式)</th></tr>
+  <tr><th></th><th>v1.5</th><th>v1.6</th><th>Δ</th><th>v1.5</th><th>v1.6</th><th>Δ</th></tr>
+  <tr><td>7.6K</td><td>32.7</td><td>33.0</td><td class="good">+0.9%</td><td>61.3</td><td>63.9</td><td class="good">+4.2%</td></tr>
+  <tr><td>27K</td><td>31.5</td><td>31.3</td><td>−0.6%</td><td>60.9</td><td>62.7</td><td class="good">+2.9%</td></tr>
+  <tr><td>82K</td><td>26.2</td><td>24.6</td><td class="bad">−6.1%</td><td>47.8</td><td>53.4</td><td class="good">+11.7%</td></tr>
+</table>
+<div class="note">MTP 接受率几乎相同(39.3/40.8/39.8% vs 39.3/40.8/40.8%),所以 MTP 提速来自每步延迟,不是更长的接受链。纯解码 82K 的 −6.1% 是 82K prefill 之外的另一个小回退(单点,量级小)。</div>
+
+<h3>Prefill tok/s(冷请求,无缓存)</h3>
+<table>
+  <tr><th>上下文</th><th>v1.5</th><th>v1.6</th><th>Δ</th></tr>
+  <tr><td>7.6K</td><td>1,110</td><td>1,100</td><td>−0.9%</td></tr>
+  <tr><td>27K</td><td>1,000</td><td>975</td><td class="warn">−2.5%</td></tr>
+  <tr><td>82K</td><td>781</td><td>697</td><td class="bad">−10.8%</td></tr>
+</table>
+<div class="note"><b>这是真正的回退:</b>82K 时 v1.6 的 flash 快路线(暂存随键数线性增长)反而不如 v1.5 的 sm_70 prompt 路线。
+66K 时 v1.6 还是 +17%(710.8→831.1),交叉点在 66K~82K 之间。你的生产上下文正好 82K,
+所以<b>未命中缓存的长请求 TTFT 在 v1.6 上更慢</b>——这是体感「慢」的最可能来源之一。</div>
+
+<h3>TTFT 与接受率</h3>
+<table>
+  <tr><th>上下文</th><th>TTFT v1.5</th><th>TTFT v1.6</th><th>接受率 v1.5 / v1.6</th></tr>
+  <tr><td>7.6K</td><td>7.0 s</td><td>6.9 s</td><td>39.3% / 39.3%</td></tr>
+  <tr><td>27K</td><td>27.3 s</td><td>24.0 s</td><td>40.8% / 40.8%</td></tr>
+  <tr><td>82K</td><td>1m 48.5 s(cache 0)</td><td>1m 24.9 s(cache 24,960)</td><td>39.8% / 40.8%</td></tr>
+</table>
+<div class="note">82K 两列不可直接比:本测的 82K 提示以 27K 提示为前缀,v1.6 命中了 24,960 token 共享前缀、v1.5 没有(v1.5 的前缀复用在该场景未触发)。
+若 v1.5 同样命中,TTFT ≈ (84,622−24,960)/781 ≈ 76 s,仍比 v1.6 的 85 s 快——与上表 prefill −10.8% 一致。</div>
+
+<h2>2. 双 lane(生产并发度 2)· MTP d4 · 27K</h2>
+<div class="note">两个相同 27K 请求并发,2 轮;v1.5 无 <code>--ngram-draft-tokens</code>,v1.6 为 0。</div>
+<table>
+  <tr><th>版本</th><th>lane 1</th><th>lane 2</th><th>第 2 轮(全缓存)lane 1</th><th>第 2 轮 lane 2</th><th>两路完成时刻</th></tr>
+  <tr><td>v1.5</td><td>47.5</td><td>50.0</td><td>50.3</td><td>48.3</td><td>29.5 s / 29.5 s(同批)</td></tr>
+  <tr><td>v1.6</td><td>71.2</td><td>71.7</td><td>47.6</td><td>47.5</td><td>28.8 s / 33.4 s(串开)</td></tr>
+</table>
+<div class="note">v1.6 第 1 轮:第一请求 27.4→28.8 s 独跑解码(71.2 tok/s),其间第二请求在跑 prefill
+(27.5→32.1 s,共享前缀只命中 91.7%);第二请求 prefill 完成后独跑解码(32.1→33.4 s,71.7 tok/s),
+总完成比 1.5 晚 ~4 s。1.5 则第二请求命中 100% 共享前缀,27.6 s 就完成 prefill,两请求 decode 同批
+(47.5/50.0 tok/s,同时 29.5 s 完成)。所以第 1 轮的差距主要来自<b>共享前缀命中率</b>(91.7% vs 100%)
+与独跑/同批的差异(独跑单路更快,同批总吞吐更高)。第 2 轮两版本均全缓存、同批,decode 50.3/48.3 vs
+47.6/47.5,持平(−2~−5%,噪声级)——成批解码速度本身没有回退。</div>
+
+<h2>3. 你的生产模型:Coder390(只有 v1.6 能跑)</h2>
+<table>
+  <tr><th>上下文</th><th>纯解码</th><th>MTP d4 解码</th><th>MTP 接受率</th><th>prefill</th></tr>
+  <tr><td>7.6K</td><td>33.0</td><td>53.3</td><td>28.1%</td><td>1,120</td></tr>
+  <tr><td>27K</td><td>31.7</td><td>57.6</td><td>35.2%</td><td>987</td></tr>
+  <tr><td>82K</td><td>28.2</td><td>50.4</td><td>33.7%</td><td>703</td></tr>
+</table>
+<div class="note">对比同上下文下 Swift v2 线的 v1.6 数字(纯解码 33.0/31.3/24.6;MTP 63.9/62.7/53.4):
+Coder390 的 MTP 解码低 ~10 tok/s,主因是<b>接受率低 8~15 个百分点</b>(28~35% vs 39~50%)——是模型/制品属性,不是 v1.6 引擎回退。
+如果你拿「现在(Coder390, v1.6)」对比「以前(OrcaRouter, v1.5)」,解码体感变慢主要来自模型。</div>
+
+<h2>4. KV 容量(int8,<code>--max-context 200000</code>,auto)</h2>
+<table>
+  <tr><th>版本</th><th>plain 1 lane</th><th>MTP 1 lane</th><th>MTP 2 lane</th></tr>
+  <tr><td>v1.5</td><td>200,000</td><td>200,000</td><td>235,392</td></tr>
+  <tr><td>v1.6</td><td>298,176</td><td>255,616</td><td>244,160</td></tr>
+</table>
+<div class="note">v1.6 的 auto KV 更大(规划口径不同),不是代价项。</div>
+
+<h2>5. 「1.6 decode 慢」的可能来源,按可信度排序</h2>
+<ul>
+  <li><b>模型换了(最大)。</b>当前 Coder390 的 MTP 接受率 28~35%,比旧 OrcaRouter 线的 39~50% 低,等效解码 ~10 tok/s 更低。且 Coder390 在 v1.5 上不可加载,你手上没有「Coder390 on v1.5」的基线,对比只能是跨模型的记忆对比。</li>
+  <li><b>82K 未命中缓存请求的 TTFT。</b>v1.6 flash 路线在高键数下比 v1.5 prompt 路线慢 10.8%(697 vs 781 tok/s),82K 冷请求 TTFT ~13 s 差距。你日常多数请求命中前缀缓存,所以这不是每请求感受,但新话题/冷会话会明显。</li>
+  <li><b>双 lane 第二请求的编排。</b>v1.6 第 1 轮里第二请求总完成晚 ~4 s(见 §2),并发高峰下的主观感受。</li>
+  <li><b>解码本身不是。</b>同模型 MTP 解码 +3~+12%,纯解码 ≤27K 持平、82K −6%(单点小量)。</li>
+</ul>
+
+<h2>6. 测法与限制</h2>
+<ul>
+  <li>硬件:Tesla V100-PCIE-32GB(sm_70 构建,CUDA 12.8),单卡独占;每次测试前 <code>docker rm -f</code> 清理,测完恢复生产容器。</li>
+  <li>提示:合成中文长文(逐条编号 filler),7.6K / 27K / 82K 三个长度;82K 提示以 27K 提示为真前缀(故 §1 的 82K TTFT 两版本缓存状态不同,已在表内标注)。</li>
+  <li>贪心(temperature 0),输出 192 token(双 lane 96);每个 (版本, 模式, 长度) 单点,未重复。1.6 两个 82K 点的相互偏差 &lt;1%,量级可信;单点 ±3% 内的差异按噪声处理。</li>
+  <li>v1.5 无 <code>--ngram-draft-tokens</code> 旗标(该特性 v1.6 才引入);MTP 组语义对齐(均为纯 MTP,无 n-gram 混合草稿)。</li>
+  <li>两镜像均读同一模型文件;v1.6 = <code>ninfer:1.6.2</code>(含 <code>ab6f496</code> 崩溃修复,二进制 sha256 <code>0f3ea6f3…aa867cc</code>)。</li>
+</ul>
+
+<h2>7. 建议的后续(未做)</h2>
+<ul>
+  <li><b>82K prefill 回退:</b>对 v1.6 flash 路线 vs v1.5 prompt 路线做 kernel 级剖析,找交叉键数,
+  按可见键数选择路线(如 keys &gt; ~70K 退回 prompt 路线)可收回 ~10%。</li>
+  <li>纯解码 82K −6%:量级小,若做上述路线调整可一并复核。</li>
+  <li>双 lane 编排:第 1 轮第二请求晚完成 ~4 s 的成因(成批条件),可选优化。</li>
+</ul>
+
+<div class="note" style="margin-top:26px">
+  数据文件:<code>bench/v100/data/ab_v15_v16_2026-10-21/</code>(ab_full.json 18 条单 lane、ab_2lane.json 8 条双 lane、含原始 done 行日志)·
+  生成于 ninfer-v100 <code>main</code> @ <code>ab6f496</code> 之后的构建
+</div>
+
+</div>
+</body>
+</html>
