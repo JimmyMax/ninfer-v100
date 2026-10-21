@@ -77,10 +77,23 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+#if defined(NINFER_TIER_AMPERE)
+    // t=5 与 t<=4 同走 SharedPhase：TokenPacked 把 5 个 token 的激活打包常驻寄存器
+    // （5 x 8 字 = 40 寄存器），在 sm_89 上把占用率压到 40%（85 寄存器/线程，ncu 实测），
+    // 内核变成延迟受限（DRAM 仅 35%）。SharedPhase 每阶段把激活切片放进 shared（5 KB），
+    // 寄存器降回 ~48，占用率翻倍。t=5 的 warp 数从 4 提到 8：每 CTA 覆盖 16 行（128 行
+    // m_tile / 8 CTAs 的整数划分不变），延迟隐藏更充分。Volta 层级保持原调度（QPN 先
+    // 接管 t<=32，本文件仍被编译，保持 sm_70 二进制不变）。
+    static constexpr auto kActivationAccess = ActiveTokens <= 5
+                                                  ? Nvfp4SimtActivationAccess::SharedPhase
+                                                  : Nvfp4SimtActivationAccess::TokenPacked;
+    static constexpr int kWarpsPerCta       = ActiveTokens >= 13 ? 16 : 8;
+#else
     static constexpr auto kActivationAccess = ActiveTokens <= 4
                                                   ? Nvfp4SimtActivationAccess::SharedPhase
                                                   : Nvfp4SimtActivationAccess::TokenPacked;
     static constexpr int kWarpsPerCta       = ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8);
+#endif
     using Schedule = Nvfp4SimtSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
                                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                                        Nvfp4SimtBlockOrder::RowsContiguous, 1>;

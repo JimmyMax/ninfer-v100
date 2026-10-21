@@ -6,11 +6,23 @@ namespace {
 using Geometry = Nvfp4Geometry<34816, 5120>;
 using Gemv =
     Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+#if defined(NINFER_TIER_AMPERE)
+// t<=5 同 down 投影：SharedPhase 避免激活常驻寄存器（sm_89 占用率）。Volta 层级保持原
+// TokenPacked（QPN 路线先接管 t<=32，但别名仍会实例化，保持 sm_70 二进制不变）。
 template <int Tokens>
-using Exact     = Nvfp4SimtSchedule<(Tokens <= 12 ? 8 : (Tokens <= 16 ? 16 : 4)), 1, 2,
+using Exact = Nvfp4SimtSchedule<(Tokens <= 12 ? 8 : (Tokens <= 16 ? 16 : 4)), 1, 2,
                                 (Tokens >= 17 && Tokens <= 20) ? 8 : 16, Tokens, 1,
-                                    Nvfp4SimtActivationAccess::TokenPacked, Nvfp4ScaleAccess::Direct,
-                                    Nvfp4CodeCache::Default, 1, Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+                                Tokens <= 5 ? Nvfp4SimtActivationAccess::SharedPhase
+                                            : Nvfp4SimtActivationAccess::TokenPacked,
+                                Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+#else
+template <int Tokens>
+using Exact = Nvfp4SimtSchedule<(Tokens <= 12 ? 8 : (Tokens <= 16 ? 16 : 4)), 1, 2,
+                                (Tokens >= 17 && Tokens <= 20) ? 8 : 16, Tokens, 1,
+                                Nvfp4SimtActivationAccess::TokenPacked, Nvfp4ScaleAccess::Direct,
+                                Nvfp4CodeCache::Default, 1, Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+#endif
 using C2        = Nvfp4SimtSchedule<8, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::SharedPhase,
                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;

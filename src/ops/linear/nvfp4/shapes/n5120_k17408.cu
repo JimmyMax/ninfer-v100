@@ -6,10 +6,23 @@ namespace {
 using Geometry = Nvfp4Geometry<5120, 17408>;
 using Gemv =
     Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+#if defined(NINFER_TIER_AMPERE)
+// t<=5 走 SharedPhase + 8 warp：TokenPacked 的激活寄存器暂存在 sm_89 上把占用率压到 ~40%
+// （ncu 实测），shared 暂存版本寄存器减半。Volta 层级保持原调度（QPN 先接管，别名仍会
+// 实例化，保持 sm_70 二进制不变）。
 template <int Tokens>
-using Exact     = Nvfp4SimtSchedule<(Tokens >= 8 && Tokens <= 16) ? 16 : 4, 1, 2, 16, Tokens, 1,
+using Exact = Nvfp4SimtSchedule<(Tokens >= 8 && Tokens <= 16) ? 16 : (Tokens <= 5 ? 8 : 4), 1,
+                                2, 16, Tokens, 1,
+                                Tokens <= 5 ? Nvfp4SimtActivationAccess::SharedPhase
+                                            : Nvfp4SimtActivationAccess::TokenPacked,
+                                Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+#else
+template <int Tokens>
+using Exact = Nvfp4SimtSchedule<(Tokens >= 8 && Tokens <= 16) ? 16 : 4, 1, 2, 16, Tokens, 1,
                                 Nvfp4SimtActivationAccess::TokenPacked, Nvfp4ScaleAccess::Direct,
                                 Nvfp4CodeCache::Default, 1, Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+#endif
 using C2        = Nvfp4SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::TokenPacked,
                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;

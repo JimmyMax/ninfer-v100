@@ -18,11 +18,28 @@ using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <class Geometry, int ActiveTokens>
 void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
+#if defined(NINFER_TIER_AMPERE)
+    // t<=5 的 17408 几何（down 投影）与 swiglu small_t 同病：TokenPacked 把激活常驻寄存器，
+    // sm_89 上占用率被压到 ~40%（ncu 实测 85 寄存器/线程）。SharedPhase 走 shared 暂存，
+    // 8 warp 提高延迟隐藏。6144 几何与其它 t 不变；Volta 层级保持原调度（QPN 先接管，
+    // 本文件仍被编译，保持 sm_70 二进制不变）。
+    static constexpr bool kSharedPhaseSmallT =
+        ActiveTokens <= 5 && Geometry::kInputRows == 17408;
+    using Schedule = Nvfp4SimtSchedule<
+        (ActiveTokens <= 16 && ActiveTokens >= (Geometry::kInputRows == 6144 ? 14 : 8)) ? 16
+            : (kSharedPhaseSmallT ? 8 : 4),
+        1, 2, (ActiveTokens >= 17 && ActiveTokens <= 20) ? 8 : 16, ActiveTokens, 1,
+        kSharedPhaseSmallT ? Nvfp4SimtActivationAccess::SharedPhase
+                           : Nvfp4SimtActivationAccess::TokenPacked,
+        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1, Nvfp4SimtBlockOrder::RowsContiguous,
+        1>;
+#else
     using Schedule = Nvfp4SimtSchedule<
         (ActiveTokens <= 16 && ActiveTokens >= (Geometry::kInputRows == 6144 ? 14 : 8)) ? 16 : 4, 1,
         2, (ActiveTokens >= 17 && ActiveTokens <= 20) ? 8 : 16, ActiveTokens, 1,
         Nvfp4SimtActivationAccess::TokenPacked, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default,
         1, Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+#endif
     constexpr int kTokenTiles = (ActiveTokens + Schedule::kTokenTile - 1) / Schedule::kTokenTile;
     constexpr int kBlocks     = (Geometry::kOutputRows / Schedule::kRowsPerCta) * kTokenTiles;
     const float inverse       = 1.0F / weight.weight_scale_divisor;
