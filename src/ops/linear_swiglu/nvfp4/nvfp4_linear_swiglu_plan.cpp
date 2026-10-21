@@ -13,6 +13,10 @@
 #    include "ops/common/device_tier.h"
 #    include "ops/linear/nvfp4/nvfp4_cutlass_sm70.h" // 本仓库 V100 增量：宽 T prefill 路径
 #endif
+#if defined(NINFER_TIER_AMPERE)
+#    include "ops/linear/bf16/bf16_dispatch.h" // Ampere 宽 T A16 路线的 GEMM 族
+#    include "ops/linear/nvfp4/nvfp4_a16_wide_sm86.h"
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -225,6 +229,20 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
     }
     return need;
 #endif
+#if defined(NINFER_TIER_AMPERE)
+    // A16 族在 Ampere 上没有注册超过 T=16 的路线，上游容量在规划期就抛出——sm_86 上 NVFP4
+    // 制品整个加载不了的症状就来自这里。宽路线在表检查之前接管（见派发），容量必须同源：
+    // t <= 32 留在融合内核/分块循环（不占工作区），t >= 33 占投影平面 + BF16 暂存。
+    if (!allows_a4(policy) && max_tokens >= kNvfp4A16WideFirstToken) {
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::BF16, {Nvfp4N34816K5120::kOutputRows, max_tokens}, 256);
+        (void)layout.alloc_bytes(
+            nvfp4_a16_wide_staged_bytes(Nvfp4N34816K5120::kOutputRows,
+                                       Nvfp4N34816K5120::kInputRows),
+            256);
+        return layout.peak_bytes(1);
+    }
+#endif
     return capacity_by_table(
         min_tokens, max_tokens,
         [](std::int32_t width) { return fused_route_table("unified/nvfp4_linear_swiglu", width); },
@@ -277,6 +295,44 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         constexpr std::int32_t kIntermediate = Nvfp4N34816K5120::kOutputRows / 2;
         silu_mul(projected.slice(0, 0, kIntermediate),
                  projected.slice(0, kIntermediate, kIntermediate), out, stream);
+        return;
+    }
+#endif
+#if defined(NINFER_TIER_AMPERE)
+    // A16 族的宽 T：与 sm_70 的 CUTLASS 钩子同位（表检查之前），容量与执行才能同源。
+    // t >= 33：一次性把 NVFP4 平面精确解码为 BF16 暂存，既有 BF16 GEMM 写投影平面，
+    // 再 silu_mul。t 17..32：16 列分块循环复用融合内核（不占工作区，只读存放的码/尺度）。
+    if (!allows_a4(policy) && x.ne[1] > 16) {
+        const std::int32_t t = x.ne[1];
+        if (t >= kNvfp4A16WideFirstToken) {
+            auto scope       = workspace.scope();
+            Tensor projected =
+                workspace.alloc(DType::BF16, {Nvfp4N34816K5120::kOutputRows, t}, 256);
+            const DeviceSpan stage = workspace.alloc_bytes(
+                nvfp4_a16_wide_staged_bytes(Nvfp4N34816K5120::kOutputRows,
+                                           Nvfp4N34816K5120::kInputRows),
+                256);
+            nvfp4_a16_wide_staged(weight, stage.data, stream);
+            Weight staged = weight;
+            staged.qtype  = QType::BF16;
+            staged.qdata  = stage.data;
+            bf16_dispatch(x, staged, projected, policy, stream);
+            constexpr std::int32_t kIntermediate = Nvfp4N34816K5120::kOutputRows / 2;
+            silu_mul(projected.slice(0, 0, kIntermediate),
+                     projected.slice(0, kIntermediate, kIntermediate), out, stream);
+            return;
+        }
+        constexpr std::int32_t kChunk = 16;
+        for (std::int32_t token_begin = 0; token_begin < t; token_begin += kChunk) {
+            const std::int32_t active = std::min(kChunk, t - token_begin);
+            const Tensor input_chunk = x.slice(1, token_begin, active);
+            Tensor output_chunk      = out.slice(1, token_begin, active);
+            if (active == 1) {
+                nvfp4_linear_swiglu_decode_launch(input_chunk, weight, output_chunk, stream);
+            } else {
+                nvfp4_linear_swiglu_small_t_launch(input_chunk, weight, output_chunk, stream);
+            }
+        }
         return;
     }
 #endif

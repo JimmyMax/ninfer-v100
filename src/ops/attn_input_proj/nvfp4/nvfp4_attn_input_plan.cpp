@@ -10,9 +10,15 @@
 #    include "ops/linear/nvfp4/nvfp4_launch.h"
 #    include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
 #endif
+#if defined(NINFER_TIER_AMPERE)
+#    include "ops/linear/bf16/bf16_dispatch.h" // Ampere 宽 T A16 路线的 GEMM 族
+#    include "ops/linear/nvfp4/nvfp4_a16_wide_sm86.h"
+#endif
 
 #include <algorithm>
 #include <cstdint>
+
+#include <cuda_bf16.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -85,6 +91,18 @@ static std::size_t nvfp4_attn_input_workspace_capacity_bytes_own(LinearPolicy po
 
 std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
                                                       std::int32_t max_tokens) {
+#if defined(NINFER_TIER_AMPERE)
+    // A16 族的宽 T（t >= 33）在表检查之前被宽路线接管（见派发）：只占整面 BF16 暂存，四个
+    // 目的地直接吃 GEMM 的输出。t <= 32 留在 32 列分块循环，不占工作区。
+    if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
+        max_tokens >= kNvfp4A16WideFirstToken) {
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc_bytes(nvfp4_a16_wide_staged_bytes(Nvfp4N14336K5120::kOutputRows,
+                                                             Nvfp4N14336K5120::kInputRows),
+                                 256);
+        return layout.peak_bytes(1);
+    }
+#endif
     return capacity_by_table(
         min_tokens, max_tokens,
         [](std::int32_t width) { return fused_route_table("unified/nvfp4_attn_input", width); },
@@ -104,6 +122,38 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
     // prefill 维持原有 A16/W4A4 路线，读的是同一份存放布局，因此加载期不需要重排。
     if (nvfp4_volta_takes(weight, x.ne[1])) {
         launch_nvfp4_attn_input_volta_qpn(x, weight, q, gate, k, v, stream);
+        return;
+    }
+#endif
+#if defined(NINFER_TIER_AMPERE)
+    // A16 族的宽 T（t >= 33）：14336x5120 整面精确解码为 BF16 暂存，四个行段 GEMM 直接写
+    // q / k / gate / v（父行顺序 [query; key; gate; value]）。t <= 32 留在下面的 32 列
+    // 分块循环。
+    if ((policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) &&
+        x.ne[1] >= kNvfp4A16WideFirstToken) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("nvfp4 A16 wide attn_input_proj requires caller workspace");
+        }
+        auto scope = workspace->scope();
+        const DeviceSpan stage =
+            workspace->alloc_bytes(nvfp4_a16_wide_staged_bytes(weight.n, weight.k), 256);
+        nvfp4_a16_wide_staged(weight, stage.data, stream);
+        constexpr std::int32_t kQRows  = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        const auto sub = [&](std::int32_t row_begin, std::int32_t rows) {
+            Weight staged = weight;
+            staged.qtype  = QType::BF16;
+            staged.qdata  = static_cast<const std::uint8_t*>(stage.data) +
+                            static_cast<std::uint64_t>(row_begin) *
+                                static_cast<std::uint64_t>(weight.k) *
+                                sizeof(__nv_bfloat16);
+            staged.n      = rows;
+            return staged;
+        };
+        bf16_dispatch(x, sub(0, kQRows), q, policy, stream);
+        bf16_dispatch(x, sub(kQRows, kKvRows), k, policy, stream);
+        bf16_dispatch(x, sub(kQRows + kKvRows, kQRows), gate, policy, stream);
+        bf16_dispatch(x, sub(2 * kQRows + kKvRows, kKvRows), v, policy, stream);
         return;
     }
 #endif

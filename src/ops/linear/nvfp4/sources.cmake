@@ -35,3 +35,10 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   target_sources(ninfer_ops PRIVATE
     "${CMAKE_CURRENT_LIST_DIR}/nvfp4_cutlass_sm70.cu")
 endif()
+
+# 本仓库增量：Ampere 档（sm_80/86/89）的 NVFP4 宽 T A16 路线——精确解码到 BF16 暂存平面，
+# 再走既有 BF16 GEMM 族。仅 Ampere 档构建编译，其余档不受影响。
+if(NINFER_ARCH_AMPERE)
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/nvfp4_a16_wide_sm86.cu")
+endif()
