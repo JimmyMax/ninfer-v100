@@ -1,0 +1,15 @@
+# Dockerfile.1.7.0-sm89.local — RTX 4080 SUPER (sm_89), version 1.7.0
+#
+# 与 ninfer:1.7.0(sm_70) 同一条打包线:已验证的 sm89 runtime 基底(1.6.5-sm89,
+# CUDA 12.x runtime/cublas + ffmpeg + curl,4080S 上生产运行过)+ 本仓库
+# v1.7.0 代码用同一 CUDA 12.8 工具链新编译的 sm_89 二进制。
+#
+#   docker build -f Dockerfile.1.7.0-sm89.local -t ninfer:1.7.0-sm89 .
+#
+# 前提:docker-runtime/1.7.0-sm89/ninfer-serve 由 ninfer-sm70-build2 容器
+# (cmake -DCMAKE_CUDA_ARCHITECTURES=89, Release, 只编 ninfer-serve)产出。
+
+FROM ninfer:1.6.5-sm89
+
+COPY docker-runtime/1.7.0-sm89/ninfer-serve /usr/local/bin/ninfer-serve
+RUN chmod +x /usr/local/bin/ninfer-serve
