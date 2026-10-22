@@ -1,0 +1,6 @@
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.trace.csv
+ncu_diag*
+body_*.json

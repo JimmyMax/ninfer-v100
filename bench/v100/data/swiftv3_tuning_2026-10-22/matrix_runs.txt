@@ -1,0 +1,43 @@
+done nvfp4_27k-ch1024 http=200000 wall=28.0s | req1 out=4 ttft=27.9s prefill=977.3 dec=32.4 acc=-
+done nvfp4_27k-ch2048 http=200000 wall=27.2s | req1 out=4 ttft=27.1s prefill=1.01k dec=32.4 acc=-
+done nvfp4_27k-ch4096 http=200000 wall=27.1s | req1 out=4 ttft=27.0s prefill=1.01k dec=32.4 acc=-
+done nvfp4_82k-ch2048 http=200000 wall=118.4s | 
+done nvfp4_27k-plain http=200000 wall=30.2s | req1 out=96 ttft=27.2s prefill=1.00k dec=32.7 acc=-
+done nvfp4_27k-plain-c2 http=200000/200000 wall=34.4s | req2 out=96 ttft=27.2s prefill=1.00k dec=31.2 acc=- || req1 out=96 ttft=31.2s prefill=810.2 dec=30.5 acc=-
+done nvfp4_27k-d2 http=200000 wall=28.9s | req1 out=96 ttft=27.5s prefill=993.6 dec=68.9 acc=56/78 (71.8%)
+done nvfp4_27k-d4 http=200000 wall=28.7s | req1 out=96 ttft=27.4s prefill=993.6 dec=75.6 acc=64/123 (52.0%)
+done nvfp4_27k-d6 http=200000 wall=28.8s | req1 out=96 ttft=27.4s prefill=994.8 dec=69.5 acc=66/169 (39.1%)
+done nvfp4_27k-d8 http=200000 wall=29.0s | req1 out=96 ttft=27.4s prefill=994.0 dec=60.1 acc=67/217 (30.9%)
+done nvfp4_27k-d4-c2 http=200000/200000 wall=32.9s | req1 out=96 ttft=27.4s prefill=994.7 dec=75.6 acc=64/123 (52.0%) || req2 out=96 ttft=31.7s prefill=770.6 dec=75.6 acc=64/123 (52.0%)
+done nvfp4_27k-d4-ng15 http=200000 wall=28.8s | req1 out=96 ttft=27.5s prefill=992.9 dec=75.6 acc=64/123 (52.0%)
+done nvfp4_82k-plain http=200000 wall=121.7s | 
+done nvfp4_82k-d4 http=200000 wall=120.6s | 
+done gguf_27k-ch1024 http=200000 wall=31.5s | req1 out=4 ttft=31.4s prefill=869.1 dec=31.8 acc=-
+done gguf_27k-ch2048 http=200000 wall=29.7s | req1 out=4 ttft=29.6s prefill=920.3 dec=31.8 acc=-
+done gguf_27k-ch4096 http=200000 wall=27.7s | req1 out=4 ttft=27.6s prefill=987.9 dec=31.1 acc=-
+done gguf_82k-ch2048 http=200000 wall=125.5s | 
+done gguf_27k-plain http=200000 wall=32.6s | req1 out=96 ttft=29.6s prefill=920.5 dec=31.8 acc=-
+done gguf_27k-plain-c2 http=200000/200000 wall=37.3s | req1 out=96 ttft=29.6s prefill=922.2 dec=30.4 acc=- || req2 out=96 ttft=33.9s prefill=738.6 dec=28.4 acc=-
+done gguf_27k-d2 http=200000 wall=31.3s | req1 out=96 ttft=29.7s prefill=918.8 dec=60.0 acc=53/81 (65.4%)
+done gguf_27k-d4 http=200000 wall=31.1s | req1 out=96 ttft=29.7s prefill=919.4 dec=66.7 acc=63/119 (52.9%)
+done gguf_27k-d6 http=200000 wall=31.4s | req1 out=96 ttft=29.6s prefill=919.9 dec=55.2 acc=64/170 (37.6%)
+done gguf_27k-d8 http=200000 wall=32.1s | req1 out=96 ttft=29.7s prefill=918.9 dec=39.6 acc=67/203 (33.0%)
+done gguf_27k-d4-c2 http=200000/200000 wall=35.9s | req1 out=96 ttft=29.6s prefill=922.2 dec=66.9 acc=63/119 (52.9%) || req2 out=96 ttft=34.4s prefill=664.4 dec=66.9 acc=63/119 (52.9%)
+done gguf_27k-d4-ng15 http=200000 wall=31.2s | req1 out=96 ttft=29.7s prefill=918.9 dec=66.9 acc=63/119 (52.9%)
+done gguf_82k-plain http=200000 wall=128.7s | 
+done gguf_82k-d4 http=200000 wall=127.3s | 
+ALL DONE
+done nvfp4_76k-ch2048-plain http=200000 wall=31.3s prompt=7518 prefill=1125.0 dec=34.2 acc=-
+done nvfp4_76k-ch2048-d4 http=200000 wall=30.0s prompt=7518 prefill=1107.3 dec=73.7 acc=62/131 (47.3%)
+done gguf_76k-ch2048-plain http=200000 wall=31.2s prompt=7518 prefill=1013.7 dec=33.4 acc=-
+done gguf_76k-ch2048-d4 http=200000 wall=29.9s prompt=7518 prefill=1008.3 dec=65.2 acc=61/135 (45.2%)
+done nvfp4_76k-ch4096-plain http=200000 wall=31.3s prompt=7518 prefill=1103.1 dec=34.1 acc=-
+done nvfp4_76k-ch4096-d4 http=200000 wall=30.5s prompt=7518 prefill=1084.3 dec=71.7 acc=61/128 (47.7%)
+done gguf_76k-ch4096-plain http=200000 wall=30.6s prompt=7518 prefill=1099.0 dec=33.4 acc=-
+done gguf_76k-ch4096-d4 http=200000 wall=29.3s prompt=7518 prefill=1096.1 dec=71.6 acc=64/118 (54.2%)
+done nvfp4_82k-ch4096 http=200000 wall=140.3s prompt=89326 prefill=753.8 dec=28.4 acc=-
+done gguf_82k-ch4096 http=200000 wall=139.7s prompt=89326 prefill=753.3 dec=28.0 acc=-
+done nvfp4_27k-ch4096-d4 http=200000 wall=51.1s prompt=27250 prefill=991.9 dec=75.5 acc=64/123 (52.0%)
+done gguf_27k-ch4096-d4 http=200000 wall=50.1s prompt=27250 prefill=987.6 dec=73.8 acc=66/112 (58.9%)
+gguf_82k_ch4096_d4 (manual rerun, 2026-10-22 07:48 UTC+8, container dbg82k, /workspace/models mount):
+2026-10-22 07:48:23.256  INFO  req#1 done | openai-chat | output limit | prompt 83,110 | output 96 | cache 0 (0.0%) | TTFT 1m 49.8s | total 1m 51.4s | queue 20.1 ms | prefill 757.7 tok/s | decode 57.0 tok/s | mtp accepted 63/126 (50.0%)
