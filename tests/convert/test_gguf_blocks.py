@@ -10,6 +10,7 @@ from tools.convert import gguf_blocks
 from tools.convert.sources.gguf import GGUFFile, write_gguf
 
 TYPE_Q8_0 = 8
+TYPE_F32 = 0
 
 # ggml-common.h: block values and bytes of every type the importer keeps.
 GGML_BLOCKS = {
@@ -108,3 +109,23 @@ def test_q8_0_gdn_controls_round_to_bf16_in_grouped_head_order(tmp_path):
     grouped = [r * 16 + k for k in range(16) for r in range(3)]
     assert values.dtype == torch.bfloat16
     assert torch.equal(values, torch.from_numpy(tiled[grouped]).to(torch.bfloat16))
+
+
+def test_f32_gdn_controls_round_to_bf16_in_grouped_head_order(tmp_path):
+    # Standard llama.cpp exports store ssm_alpha/ssm_beta as F32 words: their values reach the
+    # Engine's BF16 operand rounded to BF16, the exporter's tiled value heads back in the
+    # grouped order.
+    heads = gguf_blocks.GDN_VALUE_HEADS
+    columns = 64
+    f32 = np.random.default_rng(11).uniform(-1.0, 1.0, size=(heads, columns)).astype(np.float32)
+    path = tmp_path / "f32.gguf"
+    write_gguf(
+        path,
+        {"general.architecture": "qwen35"},
+        [("blk.0.ssm_alpha.weight", (heads, columns), TYPE_F32, f32.tobytes())],
+    )
+    with GGUFFile(path) as gguf:
+        values = gguf_blocks.gdn_control_source(gguf, "blk.0.ssm_alpha.weight").rows(0, heads)
+    grouped = [r * 16 + k for k in range(16) for r in range(3)]
+    assert values.dtype == torch.bfloat16
+    assert torch.equal(values, torch.from_numpy(f32[grouped]).to(torch.bfloat16))

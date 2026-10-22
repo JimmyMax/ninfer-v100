@@ -11,8 +11,9 @@ move without re-quantising, so its Use carries an ``input_columns`` auxiliary: c
 stored matrix multiplies element ``input_columns[c]`` of the grouped activation.
 
 The GDN controls ``ssm_alpha`` and ``ssm_beta`` are BF16 operands of the Engine. Exporters store
-them as BF16 words or as Q8_0 blocks (Underdog-Saluki and similar releases), whose values are
-rounded to BF16: the one place a stored value changes.
+them as BF16 words, as Q8_0 blocks (Underdog-Saluki and similar releases) or as F32 words
+(standard llama.cpp exports), whose values are rounded to BF16: the one place a stored value
+changes.
 
 Vision comes from the release's ``mmproj`` GGUF (``--source vision=mmproj.gguf``) with the official
 Vision formats, DFlash2 from ``--source dflash2`` and the frontend resources from ``--model``, which
@@ -60,7 +61,7 @@ from .ternary import (
 
 MTP_BLOCK = LAYERS
 # The storage the GDN controls may have (gdn_control_source).
-GDN_CONTROL_TYPES = ("BF16", "Q8_0")
+GDN_CONTROL_TYPES = ("BF16", "Q8_0", "F32")
 
 EXPECTED_HEADER = {
     "general.architecture": "qwen35",
@@ -272,10 +273,15 @@ def block_source(
 
 def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
     """A GDN A/B control as its BF16 operand, its value heads in the grouped order: BF16 words
-    as stored, Q8_0 values rounded to BF16."""
+    as stored, Q8_0 values rounded to BF16, F32 values rounded to BF16."""
 
     if gguf.info(tensor).type_id == GGML_Q8_0:
         values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
+        return array_source(
+            torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
+        )
+    if gguf.info(tensor).type_name == "F32":
+        values = untile(gguf.read_direct(tensor), 1)
         return array_source(
             torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
         )
