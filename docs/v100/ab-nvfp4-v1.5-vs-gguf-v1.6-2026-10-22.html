@@ -40,13 +40,16 @@
 <div class="sub">
   2026-10-22 · Tesla V100-PCIE-32GB(sm_70,ECC,CUDA 12.8)· 同卡、同参数、同日同口径 12 组 A/B
   · 左 = <code>ninfer:v1.5.0</code> + NVFP4 制品 · 右 = <code>ninfer:1.6.2-ggufopt</code>(含 vec 优化)+ GGUF 制品
+  · 同日追加:<b>同模型</b>公平对比(§1,Swift-1.5 的 Q4_K_M GGUF vs NVFP4,12 组)
 </div>
 
 <div class="card">
   <b>一句话结论:</b>GGUF 路线靠 <b>小 37% 的权重(15.0 vs 23.7 GB)</b>拿下<b>纯解码全胜(+21%~+24%)</b>和
   <b>2.7 倍的 KV 容量(540K vs 200K)</b>;MTP 生产模式在 <b>27K 小胜(+4.5%)</b>,但 <b>7.5K(−15%)和 89K(−21%)输给
   NVFP4</b>——差距主要来自<b>两个模型的 MTP 接受率不同</b>(35.9/47.3/33.8% vs 48.1/44.6/56.0%),不是内核
-  (每步速率仅差 ±8%)。prefill 上 NVFP4 快 7~9%。选哪条线取决于工作负载:纯解码/大 KV/中上下文 MTP → GGUF;
+  (每步速率仅差 ±8%)。同日同模型(Swift-1.5)公平对比(§1):<b>纯解码两格式打平(±3%)、MTP 打平(±8%)、
+  接受率对齐(≤4pp)</b>——跨格式差距的主体是<b>量化字节数</b>,不是引擎或格式本身。prefill 上 NVFP4 快 7~9%
+  。选哪条线取决于工作负载:纯解码/大 KV/中上下文 MTP → GGUF;
   长上下文高接受率 MTP、prefill 密集 → NVFP4 仍强。
 </div>
 
@@ -66,7 +69,45 @@ MTP 组的语义对齐:v1.5 无 <code>--ngram-draft-tokens</code>,新 1.6 显式
 --max-concurrency 1 --preserve-thinking --vision</code>;MTP 组追加 <code>--spec mtp --draft-tokens 4 --lm-head-draft</code>。
 贪心(temperature 0),输出 96 token,单 lane,冷请求(无缓存命中);每 (路线, 模式, 上下文) 一组。</div>
 
-<h2>1. 解码 tok/s(生产体感的核心指标)</h2>
+<h2>1. 同模型公平对比:Swift-1.5 Q4_K_M GGUF(新 1.6)vs NVFP4(1.5)</h2>
+<div class="card">
+  <b>背景:</b>上一节的对比混合了两个模型文件。为回答「格式本身差多少」,同日补测同一份
+  <b>Swift-1.5 Qwen3.8-27B</b> 权重的两种量化:NVFP4(DFlash2-V2,1.5 引擎)vs 标准 llama.cpp
+  <b>Q4_K_M GGUF</b>(F16 mmproj,经 <code>tools.convert --recipe qwen3_8_27b_gguf</code> 转换,
+  18.2 GB / 1127 对象,1.6 ggufopt 引擎)。条件与 §0 完全一致:同卡、同参数、同提示、贪心、
+  输出 96、单 lane、冷请求,12 组。</div>
+<table>
+  <tr><th>上下文</th><th>模式</th><th>NVFP4 (1.5)</th><th>Q4_K_M GGUF (新 1.6)</th><th>Δ</th></tr>
+  <tr><td>7.6K</td><td>plain</td><td>32.9</td><td>33.4</td><td class="good">+1.5%</td></tr>
+  <tr><td>7.6K</td><td>MTP d4</td><td>70.6(接受 48.1%)</td><td>65.3(接受 45.2%)</td><td class="bad">−7.5%</td></tr>
+  <tr><td>27K</td><td>plain</td><td>31.5</td><td>32.0</td><td class="good">+1.6%</td></tr>
+  <tr><td>27K</td><td>MTP d4</td><td>64.9(接受 44.6%)</td><td class="good">67.0(接受 52.9%)</td><td class="good">+3.2%</td></tr>
+  <tr><td>82K</td><td>plain</td><td>27.4</td><td>28.2</td><td class="good">+2.9%</td></tr>
+  <tr><td>82K</td><td>MTP d4</td><td>63.6(接受 56.0%)</td><td>63.9(接受 55.1%)</td><td class="good">+0.5%</td></tr>
+</table>
+<table>
+  <tr><th>上下文</th><th colspan="2">prefill tok/s</th><th>Δ</th></tr>
+  <tr><th></th><th>NVFP4</th><th>Q4_K_M GGUF</th><th></th></tr>
+  <tr><td>7.6K</td><td>1,110</td><td>1,010</td><td class="bad">−9.0%</td></tr>
+  <tr><td>27K</td><td>997</td><td>922</td><td class="bad">−7.5%</td></tr>
+  <tr><td>82K</td><td>770</td><td>712</td><td class="bad">−7.5%</td></tr>
+</table>
+<ul>
+  <li><b>纯解码打平(±3%)。</b>Q4_K_M 权重 18.2 GB,比 NVFP4 小 23%,若解码是纯带宽限制应快 ~30%;
+      实测仅 +2%,与 ncu 实测「V100 decode DRAM 只占 30%,指令取指/L1I 主导」一致(见 vec 优化报告)。
+      上一节 +21~24% 的纯解码差距因此是 <b>IQ3_S(15.0 GB)对 NVFP4(23.7 GB)的字节数优势</b>,不是格式优势。</li>
+  <li><b>MTP 接受率对齐。</b>同一模型、两种量化:45.2/52.9/55.1% vs 48.1/44.6/56.0%,逐点差 ≤4pp——
+      进一步确认接受率是<b>模型/量化属性</b>,与引擎无关;MTP 的 ±3~8% 差距即这两种量化的接受率差。
+      上一节 12~22pp 的接受率差是<b>两个不同模型</b>造成的。</li>
+  <li><b>输出一致性验证:</b>每个上下文 plain 与 MTP 的输出在两侧逐字相同(96 贪心 token);
+      NVFP4 与 GGUF 两种量化的共同前缀 60~72%(27K 在第 12 字分叉,仅推理措辞不同,任务与正文一致)
+      ——两侧确为同一模型,量化只引入 near-tie 抖动。</li>
+  <li><b>prefill:NVFP4 快 7~9%</b>(与上一节一致,格式 dequant + 引擎差叠加)。</li>
+  <li><b>KV:</b>Q4_K_M 单 lane int8 auto 334,464 tokens,介于 NVFP4 1.5 的 200,000 与 IQ3_S 的 540,672
+      ——KV 容量随权重大小线性地落在两者之间。</li>
+</ul>
+
+<h2>2. 解码 tok/s(生产体感的核心指标,跨模型文件)</h2>
 <h3>纯解码(无投机)</h3>
 <table>
   <tr><th>上下文</th><th>NVFP4 (1.5)</th><th>GGUF (新 1.6)</th><th>Δ</th></tr>
@@ -79,7 +120,8 @@ MTP 组的语义对齐:v1.5 无 <code>--ngram-draft-tokens</code>,新 1.6 显式
 <div class="rowbar"><span class="lbl">89K</span><span class="bar a" style="width:182px"></span>27.4&nbsp;&nbsp;<span class="bar b" style="width:219px"></span>33.2</div>
 <div class="note">解码是访存主导:每 token 要读一遍全部权重。NVFP4 每 token 读 23.7 GB 权重、GGUF 读 15.0 GB(−37%),
 有效带宽相近时 tok/s 近似与权重大成反比——实测 +21~24% 与该比例一致(89K 略小是因为长上下文里
-KV 读取占比上升、且接受率无关的 attention 开销上升)。</div>
+KV 读取占比上升、且接受率无关的 attention 开销上升)。注意:这是 <b>IQ3_S 对 NVFP4</b> 的字节数优势;
+同模型 Q4_K_M 对 NVFP4 只有 +2%(§1)。</div>
 
 <h3>MTP d4(生产模式)</h3>
 <table>
@@ -94,7 +136,7 @@ KV 读取占比上升、且接受率无关的 attention 开销上升)。</div>
 <div class="note">MTP 结果不是单调的:27K GGUF 赢,两头输。原因分解见 §3——<b>接受率(模型属性)主导,
 内核每步速率只贡献 ±8%</b>。</div>
 
-<h2>2. Prefill 与 TTFT(冷请求)</h2>
+<h2>3. Prefill 与 TTFT(冷请求)</h2>
 <table>
   <tr><th>上下文</th><th colspan="2">prefill tok/s</th><th>Δ</th><th colspan="2">TTFT</th></tr>
   <tr><th></th><th>NVFP4</th><th>GGUF</th><th></th><th>NVFP4</th><th>GGUF</th></tr>
@@ -106,7 +148,7 @@ KV 读取占比上升、且接受率无关的 attention 开销上升)。</div>
 所以 GGUF 的小权重优势在这里只体现为「不输太多」;实测 NVFP4 快 7~9%(格式 dequant 差异
 + 1.5→1.6 引擎差的叠加)。TTFT 与 prefill 同步。</div>
 
-<h2>3. MTP 差距分解:接受率 vs 内核每步速率</h2>
+<h2>4. MTP 差距分解:接受率 vs 内核每步速率</h2>
 <table>
   <tr><th>上下文</th><th>接受率 NVFP4 / GGUF</th><th>tokens/步 NVFP4 / GGUF</th>
       <th>每步速率 NVFP4 / GGUF</th><th>每步速率 Δ</th><th>总 Δ</th></tr>
@@ -118,13 +160,13 @@ KV 读取占比上升、且接受率无关的 attention 开销上升)。</div>
       <td class="bad">−8.1%</td><td class="bad">−21.3%</td></tr>
 </table>
 <div class="note">tokens/步 = 1 + 接受数/尝试数;每步速率 = 解码 tok/s ÷ tokens/步(即「内核一步能推进多少 token」的
-等效)。可见:<b>每步速率两条线基本打平(±8%)</b>——GGUF 的 T=1 纯解码明显更快(§1),但合成到 MTP 每步
+等效)。可见:<b>每步速率两条线基本打平(±8%)</b>——GGUF 的 T=1 纯解码明显更快(§2),但合成到 MTP 每步
 (1 次 T=1 草稿 + 1 次 T=5 校验 + lm head)后两条线打平,推断 NVFP4 的 T=5 校验每层略快、
 抵消了 GGUF 的 T=1 优势(推断,非直接测量)。
 <b>MTP 总差距几乎全部来自接受率</b>:NVFP4 模型在 7.5K/89K 接受率比 GGUF 模型高 12~22 个百分点
-(模型/权重属性,与引擎无关)。27K 处两模型接受率相近(44.6 vs 47.3),GGUF 的小内核优势显现为 +4.5%。</div>
+(模型/权重属性,与引擎无关;同模型两种量化只差 ≤4pp,§1)。27K 处两模型接受率相近(44.6 vs 47.3),GGUF 的小内核优势显现为 +4.5%。</div>
 
-<h2>4. 权重、显存与 KV 容量</h2>
+<h2>5. 权重、显存与 KV 容量</h2>
 <table>
   <tr><th>项</th><th>NVFP4 (1.5)</th><th>GGUF (新 1.6)</th></tr>
   <tr><td>权重文件</td><td>23.7 GB</td><td class="good">15.0 GB(−37%)</td></tr>
@@ -137,7 +179,7 @@ KV 读取占比上升、且接受率无关的 attention 开销上升)。</div>
 GGUF 多出的显存来自 KV arena 更大(权重小 → 规划器留更多给 KV)。实用结论:<b>同样的 32 GB 卡,
 GGUF 路线能挂 2.7 倍的 int8 KV</b>,长上下文/高并发场景的实际可用容量是硬优势。</div>
 
-<h2>5. vec 优化的贡献(新 1.6 vs 旧 1.6,GGUF 线内部)</h2>
+<h2>6. vec 优化的贡献(新 1.6 vs 旧 1.6,GGUF 线内部)</h2>
 <table>
   <tr><th>GGUF 27K</th><th>旧 1.6.2</th><th>新 1.6.2-ggufopt</th><th>Δ</th></tr>
   <tr><td>plain decode</td><td>38.6</td><td>38.6</td><td>0%</td></tr>
@@ -148,34 +190,45 @@ GGUF 路线能挂 2.7 倍的 int8 KV</b>,长上下文/高并发场景的实际�
 MTP +18.9%,纯解码(T=1)不受影响,接受率/输出逐字不变。详见
 <code>docs/v100/gguf-vec-optimization-2026-10-21.md</code>。</div>
 
-<h2>6. 结论:两条线怎么选</h2>
+<h2>7. 结论:两条线怎么选</h2>
 <ul>
-  <li><b>纯解码、长输出、无投机</b>:GGUF 全面胜(+21~24%),且 KV 容量 2.7×。</li>
-  <li><b>MTP 生产模式(27K 典型工作负载)</b>:GGUF 小胜(+4.5%);接受率与 NVFP4 线接近时,
-      GGUF 的内核小优势就能兑现。</li>
-  <li><b>长上下文(89K)MTP</b>:NVFP4 胜(−21%)——本对比中 NVFP4 模型在长上下文接受率 56% 远高于
-      GGUF 模型的 33.8%;若 GGUF 模型长上下文接受率能提上来(模型侧问题,非引擎),这条差距会缩小。</li>
-  <li><b>prefill/TTFT 密集</b>(短输出、长输入、多轮):NVFP4 快 7~9%。</li>
-  <li><b>显存预算紧 / 要挂大 KV / 高并发</b>:GGUF(15 GB 权重 + 540K KV)。</li>
+  <li><b>同模型、同预算下的格式选择(§1,公平口径)</b>:纯解码两格式打平(GGUF 略快 ±3%),MTP 打平
+      (±8%),prefill NVFP4 快 7~9%。格式本身不是 decode 的胜负手,<b>量化字节数才是</b>:
+      权重越小,纯解码越快、KV 越大。</li>
+  <li><b>纯解码、长输出、无投机(跨模型文件口径)</b>:IQ3_S GGUF 对 NVFP4 全胜(+21~24%),且 KV 容量 2.7×。
+      若手上有同模型的更低比特 GGUF(如 IQ3_S),选它;Q4_K_M(4.85 bit)对 NVFP4 没有解码优势。</li>
+  <li><b>MTP 生产模式(27K 典型工作负载)</b>:同模型口径两边打平;跨模型文件口径 GGUF 小胜(+4.5%),
+      本质是接受率相近时 GGUF 内核的小优势。</li>
+  <li><b>长上下文(89K)MTP(跨模型文件口径)</b>:NVFP4 胜(−21%)——该对比中 NVFP4 模型在长上下文接受率 56%
+      远高于 GGUF 模型的 33.8%(模型侧属性);同模型口径 89K MTP 打平(55.1% vs 56.0%)。</li>
+  <li><b>prefill/TTFT 密集</b>(短输出、长输入、多轮):NVFP4 快 7~9%(两种口径一致)。</li>
+  <li><b>显存预算紧 / 要挂大 KV / 高并发</b>:小字节量化(GGUF IQ3_S 15 GB + 540K KV)。</li>
 </ul>
 
-<h2>7. 测法与限制</h2>
+<h2>8. 测法与限制</h2>
 <ul>
   <li>硬件:Tesla V100-PCIE-32GB(sm_70 构建,CUDA 12.8,ECC 开,带宽约 803 GB/s),单卡独占;
-      测前停掉生产 GGUF 服务(23.7 GB 与 15 GB 两个权重无法同卡共存),测完恢复并验证。</li>
+      测前停掉生产 GGUF 服务(两个大权重无法同卡共存),测完恢复并验证。</li>
   <li>提示:合成中文长文(逐条编号 filler),7,518 / 27,250 / 89,326 token 三个长度;
-      两条路线读<b>同一份提示</b>;贪心 temperature 0,输出 96;单 lane,冷请求。</li>
-  <li>每个 (路线, 模式, 上下文) 单点,未重复;±3% 内按噪声处理。12 组全部完成、无失败。</li>
-  <li>跨版本 + 跨格式混测(§0):同模型下 1.5 vs 1.6 引擎差 ≤3%(10-21 同模型 A/B),
-      故格式/权重差是主体,引擎版本是次要项。</li>
-  <li>MTP 接受率是<b>模型属性</b>:同一引擎上换模型,接受率会变;本对比的 MTP 差距不能全部归因引擎。</li>
-  <li>未测:双 lane 并发、缓存命中路径、&gt;131K 超长(两路线均已验证 ≤200K 区间正常)。</li>
+      同一对比内各路线读<b>同一份提示</b>;贪心 temperature 0,输出 96;单 lane,冷请求。</li>
+  <li>每个 (路线, 模式, 上下文) 单点,未重复;±3% 内按噪声处理。两个 12 组矩阵全部完成、无失败。</li>
+  <li>§1 的 GGUF 侧制品由 <code>tools.convert --recipe qwen3_8_27b_gguf</code> 从标准 llama.cpp Q4_K_M
+      GGUF 转换(866 张量逐字节保留;GDN 控制 ssm_alpha/ssm_beta 为该导出的 F32,转 BF16 入 Engine;
+      vision 取自 F16 mmproj;<code>--proposal</code> 生成 proposal 头)。转换本身不改变权重值(除控制张量舍入)。</li>
+  <li>§2~§6 跨版本 + 跨格式混测(§0):同模型下 1.5 vs 1.6 引擎差 ≤3%(10-21 同模型 A/B),
+      故格式/权重差是主体,引擎版本是次要项;§1 补测后,格式本身的 decode 差异被分离出来(≈0)。</li>
+  <li>MTP 接受率是<b>模型/量化属性</b>:同模型两种量化差 ≤4pp(§1);换模型可差 12~22pp(§4)。
+      本对比的跨模型 MTP 差距不能归因引擎。</li>
+  <li>未测:双 lane 并发、缓存命中路径、&gt;131K 超长(两路线均已验证 ≤200K 区间正常)、
+      两种量化的困惑度差(输出一致性检查已确认同模型,§1)。</li>
 </ul>
 
 <div class="note" style="margin-top:26px">
   数据文件:<code>bench/v100/data/nvfp4_vs_gguf_2026-10-22/</code>(full_nvfp4_gguf_ab.log 12 组 done 行日志 +
-  full_nvfp4_gguf_ab.py 复现脚本)· vec 优化数据:<code>bench/v100/data/gguf_vec_opt_2026-10-21/</code> ·
-  生成于 ninfer-v100 <code>main</code> @ <code>787afbb</code>;新镜像 <code>ninfer:1.6.2-ggufopt</code>(sha <code>5f39561</code>)
+  full_nvfp4_gguf_ab.py 复现脚本)· 同模型公平对比数据:<code>bench/v100/data/samemodel_ab_2026-10-22/</code>
+  (full_samemodel_ab.log + 脚本 + 12 份原始响应 JSON)· vec 优化数据:
+  <code>bench/v100/data/gguf_vec_opt_2026-10-21/</code> · 生成于 ninfer-v100 <code>main</code> @ <code>68930d4</code>+
+  ;新镜像 <code>ninfer:1.6.2-ggufopt</code>(sha <code>5f39561</code>)
 </div>
 
 </div>
