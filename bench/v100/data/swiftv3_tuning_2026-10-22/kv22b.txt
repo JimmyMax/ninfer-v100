@@ -1,0 +1,5 @@
+req wall 29.5s
+done b170 | 2026-10-22 10:28:37.851  INFO  req#1 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 0 (0.0%) | TTFT 27.7s | total 29.4s | prefill 982.1 tok/s | decode 55.9 tok/s | mtp accepted 62/127 (48.8%)
+req wall 29.5s
+done b150 | 2026-10-22 10:29:26.760  INFO  req#1 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 0 (0.0%) | TTFT 27.9s | total 29.5s | prefill 975.3 tok/s | decode 61.2 tok/s | mtp accepted 64/123 (52.0%)
+ALL DONE

@@ -76,6 +76,36 @@ llama.cpp 标准导出 <code>Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf</code> 转换件(
 <li>1.5.0 的 27.2K 75.8 与 1.7.0 的 27.3K(27,250)75.5 恰好接近,但 prompt 不同(27,222 vs 27,250)且接受率不同
 (54.6 vs 52.0),不是同一条件下的对比。</li>
 </ul>
+<h3>追问:1.7.0 的 MTP 接受率在长 prompt 下为何比 1.5.0 低?(调查,同 NVFP4 工件)</h3>
+<p class="note">方法:greedy 256-token 文本流对比(1K/10K/27.2K 三个 context)+ KV dtype × 引擎 2×2 矩阵 +
+bf16 KV 下的 MTP 接受率复测。数据:<code>txt_ab.txt</code>、<code>kv22.txt</code>、<code>kv22b.txt</code> 与 <code>txt_*.json</code>。</p>
+<ul>
+<li><b>同引擎内,MTP 推测流与 plain 流逐字符完全一致</b>(27.2K:374/374 与 370/370 字符)——
+接受率差距不是推测路径或统计口径的问题。</li>
+<li><b>跨引擎,两版 plain(无推测)流从早期近-tie 位置分叉</b>:同工件、同 prompt、同 int8 KV 下,
+10K context 首次分叉在第 12 字符,1K 在第 49,27.2K 在第 115(≈前 10–100 个 token 内)。
+两版引擎跑的是<b>不同的 greedy 轨迹</b>。</li>
+<li><b>换成无量化的 bf16 KV,两版流仍早期分叉</b>(10K,第 66 字符)→ 分叉不是 int8 量化造成的:
+1.7.0 线吸收了 148-commit 上游 merge(模型层 targets→models 重构、Volta decode 换 QPN 核族、
+激活 FP16/FP8 staging),每个单独提交都声明「数值不变」,但累积效应使 near-tie logits 移动,
+greedy 在第一个近-tie 处翻盘。</li>
+</ul>
+<table>
+<tr><th>27.2K MTP d4,KV dtype</th><th>1.7.0</th><th>1.5.0</th><th>差距</th></tr>
+<tr><td>int8</td><td>50.0%(62/124)</td><td>54.6%(65/119)</td><td>4.6pp</td></tr>
+<tr><td>bf16(无量化)</td><td>48.8%(62/127)</td><td>52.0%(64/123)</td><td>3.2pp</td></tr>
+</table>
+<ul>
+<li><b>分解</b>:即使去掉 KV 量化,1.7.0 的 draft-target 一致率仍低 ~3.2pp——主因是 merge 后新的
+模型层/decode 核族让 draft 模型与 target 在同一(已改变的)轨迹上的一致率下降;int8 G64 量化
+(两版 codec 同源:per-group absmax + FP16 scale)把差距再放大 ~1.4pp。</li>
+<li><b>不是「越长越差」的系统性退化</b>:短 prompt 方向反而反转(1.7.0 58.9% > 1.5.0 52.5%)。
+接受率是「引擎数值 × 工件 × prompt」的联合属性,±5pp 随 prompt 漂移;单看 27.2K 一个点
+不能推出「1.7.0 的 MTP 变差」。</li>
+<li><b>工程含义</b>:这是重构线对 1.5.0 的结构性代价(换取 GGML decode +18.9% 与新特性),
+不是可 patch 的缺陷;若以 1.5.0 的接受率为目标,路径是逐段复核 draft 路径与 1.5.0 的数值
+等价性(周级),而不是调参数。</li>
+</ul>
 
 <h2>2. 调参矩阵:每侧最快配置</h2>
 <h3>Prefill(tok/s)</h3>

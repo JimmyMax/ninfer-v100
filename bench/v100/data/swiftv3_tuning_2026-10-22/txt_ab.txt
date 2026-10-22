@@ -1,0 +1,9 @@
+saved /tmp/txt_t170l.json think=374 content=0 finish=length wall=35.8s
+saved /tmp/txt_t150l.json think=370 content=0 finish=length wall=35.7s
+saved /tmp/txt_t170m.json think=390 content=0 finish=length wall=17.4s
+saved /tmp/txt_t150m.json think=387 content=0 finish=length wall=17.3s
+saved /tmp/txt_t170s.json think=391 content=0 finish=length wall=8.4s
+saved /tmp/txt_t150s.json think=365 content=0 finish=length wall=8.6s
+saved /tmp/txt_m170.json think=374 content=0 finish=length wall=32.4s
+saved /tmp/txt_m150.json think=370 content=0 finish=length wall=32.2s
+ALL DONE

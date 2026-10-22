@@ -108,6 +108,13 @@ tok/s MTP at 27.3K, 63.8 tok/s at 82K.
 - MTP decode remains 2.3–12% behind NVFP4 on the same weights depending on prompt; the gap is
   the quantization representation plus the artifact's frozen-draft-head acceptance spread
   (±5 pp across prompts and chunking), not a defect of the GGML path.
+- Versus 1.5.0 on the same NVFP4 artifact, the MTP acceptance rate is prompt-dependent in both
+  directions (short prompt: 1.7.0 58.9% > 1.5.0 52.5%; 27.2K: 1.5.0 54.6% > 1.7.0 50.0%, int8 KV;
+  with unquantized bf16 KV the 27.2K gap is 52.0% vs 48.8%). Investigation (A/B report, §1.1):
+  the two engines run different greedy trajectories — the 148-commit upstream merge restructured
+  the model layer and the Volta decode kernel family, shifting near-tie logits — and 1.7.0's
+  draft-target agreement on its own trajectory is ~3 pp lower at 27.2K even without KV
+  quantization. This is a structural cost of the restructured line, not a patchable defect.
 - `--spec mtp` output is not token-identical to running without speculation, on this line and
   on 1.5 alike: batched verification reaches near-tied logits differently. Use no `--spec`
   when exact equivalence to an unspeculated decode matters.
