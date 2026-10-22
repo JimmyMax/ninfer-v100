@@ -1,0 +1,47 @@
+# nsys --cuda-graph-trace=node decode 相位核族聚合
+# 请求:256 tok 输出(9.6K prompt),92 轮 dflash2 K=5,窗口 2818 ms
+# 引擎 ninfer:1.7.0-sm89,RTX 4080 SUPER,GSQ-RCO IQ3_S artifact,int8 KV
+
+wall 2818 ms | kernel busy 2504 ms (89%) | gaps 315 ms
+gap 结构: >0.5ms x95 = 301 ms (96% 空闲) | 0.05-0.5ms x59 = 8 ms | <0.05ms x89661 = 6 ms
+  -> 空闲几乎全部是轮间大停顿(每轮 ~3.3 ms),graph 内节点间隙可忽略
+
+## 按核族 (kernel 时间合计 2551 ms)
+  1953.1 ms  76.6%  x36619  vec::kernel (GGML vec GEMV)
+   260.9 ms  10.2%  x1933   q8_ksplit_mma_kernel (Q8 平面 tensor core GEMM, draft 模型)
+    77.5 ms   3.0%  x1488   causal_attention_small_t_i8_tiled_kernel
+    61.6 ms   2.4%  x4416   gdn recurrent_record_kernel
+    39.2 ms   1.5%  x92     gdn recurrent_fold_kernel
+    36.9 ms   1.4%  x23980  quantize_vector_kernel
+    21.4 ms   0.8%  x4461   gdn_norm_gating_27_simt
+    18.8 ms   0.7%  x920    dynamic_grouped_conv_prepare_partial_kernel
+    14.5 ms   0.6%  x8543   rmsnorm_cta_bf16x2_kernel
+    13.1 ms   0.5%  x4416   gdn_projected_conv_kernel
+     8.9 ms   0.3%  x460    sliding_window_attention_split_partial_kernel
+     8.4 ms   0.3%  x94     context_kv_grouped_kernel
+     7.2 ms   0.3%  x4461   rmsnorm_warp_bf16x2_kernel
+     6.6 ms   0.3%  x1488   causal_attention_small_t_reduce_output_kernel
+     4.8 ms   0.2%  x92     t2_logits_topk_kernel
+     2.8 ms   0.1%  x1487   rmsnorm_rope_d256_text_kernel
+
+## vec::kernel 细分 (type, T, k)  [每轮 21.23 ms]
+  t21 (IQ3_S)  T=6 k=5120    396.6 ms  x7820  grid=(320,1,1)
+  t18 (IQ3_XXS)T=6 k=5120    324.3 ms  x5244  grid=(400,1,1)
+  t23 (IQ4_XS) T=6 k=5120    255.0 ms  x5060  grid=(320,1,1)
+  t12 (Q4_K)   T=6 k=5120    163.7 ms  x2300  grid=(128,1,1)
+  t23 (IQ4_XS) T=6 k=17408   144.5 ms  x1932  grid=(320,1,1)
+  t21 (IQ3_S)  T=6 k=17408   130.1 ms  x2024  grid=(320,1,1)
+  t21 (IQ3_S)  T=6 k=6144     75.8 ms  x2944  grid=(320,1,1)
+  (draft 步骤为 T=5 变体,同族)
+
+带宽核算: target 权重 13.4 GiB/轮 ÷ 21.23 ms ≈ 630 GB/s (含 draft 权重后
+有效 ~700 GB/s,DR4080S GDDR6X 峰值 ~950 GB/s 的 66-73%) -> 带宽受限,
+核内无优化空间。
+
+## q8_ksplit_mma 形状 (draft 模型 Q8 平面)
+  34816x5120  x500  143.3 ms  (gate+up)
+  5120x17408  x500   70.1 ms  (down)
+  5120x25600  x102   27.6 ms  (qkv)
+  5120x4096   x500   17.5 ms
+  6144x5120   x500   25.0 ms  (GDN out)
+  ~450 MB/轮 ÷ 3.54 ms ≈ 127 GB/s (13% 峰值;量小,端到端占比 ~1%)

@@ -1,0 +1,31 @@
+req baseline_long wall 7.9s
+req baseline_short wall 2.8s
+req baseline_prefill27k wall 11.3s
+done baseline | 2026-10-22 17:41:52.304  INFO  req#1 done | openai-chat | output limit | prompt 9,630 | output 256 | cache 0 (0.0%) | TTFT 5.2s | total 7.9s | prefill 1.87k tok/s | decode 93.8 tok/s | dflash2 accepted 163/453 (36.0%)
+done baseline | 2026-10-22 17:41:55.190  INFO  req#2 done | openai-chat | stop token | prompt 64 | output 160 | cache 0 (0.0%) | TTFT 47.3 ms | total 2.8s | prefill 1.41k tok/s | decode 57.9 tok/s | dflash2 accepted 65/475 (13.7%)
+done baseline | 2026-10-22 17:42:06.555  INFO  req#3 done | openai-chat | output limit | prompt 26,798 | output 64 | cache 6,400 (23.9%, shared prefix) | TTFT 10.6s | total 11.3s | prefill 1.94k tok/s | decode 90.7 tok/s | dflash2 accepted 41/109 (37.6%)
+req chunk4096_long wall 8.0s
+req chunk4096_short wall 2.8s
+req chunk4096_prefill27k wall 14.9s
+done chunk4096 | 2026-10-22 17:42:32.177  INFO  req#1 done | openai-chat | output limit | prompt 9,630 | output 256 | cache 0 (0.0%) | TTFT 5.3s | total 8.0s | prefill 1.81k tok/s | decode 94.7 tok/s | dflash2 accepted 165/443 (37.2%)
+done chunk4096 | 2026-10-22 17:42:35.109  INFO  req#2 done | openai-chat | stop token | prompt 64 | output 160 | cache 0 (0.0%) | TTFT 46.9 ms | total 2.8s | prefill 1.42k tok/s | decode 57.0 tok/s | dflash2 accepted 65/475 (13.7%)
+done chunk4096 | 2026-10-22 17:42:50.052  INFO  req#3 done | openai-chat | output limit | prompt 26,798 | output 64 | cache 0 (0.0%) | TTFT 14.1s | total 14.8s | prefill 1.91k tok/s | decode 84.2 tok/s | dflash2 accepted 40/114 (35.1%)
+req chunk8192_long wall 8.2s
+req chunk8192_short wall 2.9s
+req chunk8192_prefill27k wall 15.4s
+done chunk8192 | 2026-10-22 17:43:15.802  INFO  req#1 done | openai-chat | output limit | prompt 9,630 | output 256 | cache 0 (0.0%) | TTFT 5.3s | total 8.2s | prefill 1.81k tok/s | decode 88.4 tok/s | dflash2 accepted 161/458 (35.2%)
+done chunk8192 | 2026-10-22 17:43:18.783  INFO  req#2 done | openai-chat | stop token | prompt 64 | output 160 | cache 0 (0.0%) | TTFT 46.8 ms | total 2.9s | prefill 1.41k tok/s | decode 56.0 tok/s | dflash2 accepted 65/475 (13.7%)
+done chunk8192 | 2026-10-22 17:43:34.227  INFO  req#3 done | openai-chat | output limit | prompt 26,798 | output 64 | cache 0 (0.0%) | TTFT 14.6s | total 15.3s | prefill 1.84k tok/s | decode 82.8 tok/s | dflash2 accepted 40/114 (35.1%)
+req k7_long wall 8.3s
+req k7_short wall 2.9s
+req k7_prefill27k wall 11.7s
+done k7 | 2026-10-22 17:44:00.326  INFO  req#1 done | openai-chat | output limit | prompt 9,630 | output 256 | cache 0 (0.0%) | TTFT 5.2s | total 8.3s | prefill 1.86k tok/s | decode 81.6 tok/s | dflash2 accepted 166/612 (27.1%)
+done k7 | 2026-10-22 17:44:03.284  INFO  req#2 done | openai-chat | stop token | prompt 64 | output 142 | cache 0 (0.0%) | TTFT 47.7 ms | total 2.9s | prefill 1.40k tok/s | decode 50.1 tok/s | dflash2 accepted 59/581 (10.2%)
+done k7 | 2026-10-22 17:44:15.115  INFO  req#3 done | openai-chat | output limit | prompt 26,798 | output 64 | cache 6,400 (23.9%, shared prefix) | TTFT 10.9s | total 11.7s | prefill 1.87k tok/s | decode 77.7 tok/s | dflash2 accepted 41/149 (27.5%)
+req kvbf16_long wall 8.2s
+req kvbf16_short wall 2.6s
+req kvbf16_prefill27k wall 12.2s
+done kvbf16 | 2026-10-22 17:44:38.734  INFO  req#1 done | openai-chat | output limit | prompt 9,630 | output 256 | cache 0 (0.0%) | TTFT 4.9s | total 8.2s | prefill 1.98k tok/s | decode 77.4 tok/s | dflash2 accepted 151/516 (29.3%)
+done kvbf16 | 2026-10-22 17:44:41.432  INFO  req#2 done | openai-chat | stop token | prompt 64 | output 141 | cache 0 (0.0%) | TTFT 47.9 ms | total 2.6s | prefill 1.40k tok/s | decode 54.8 tok/s | dflash2 accepted 57/420 (13.6%)
+done kvbf16 | 2026-10-22 17:44:53.683  INFO  req#3 done | openai-chat | output limit | prompt 26,798 | output 64 | cache 6,144 (22.9%, shared prefix) | TTFT 11.4s | total 12.2s | prefill 1.81k tok/s | decode 88.6 tok/s | dflash2 accepted 42/104 (40.4%)
+ALL DONE
