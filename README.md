@@ -149,12 +149,16 @@ drafts, greedy).
 
 | Artifact | Container | Weights | Context | 27K-token request |
 |---|---|---:|---:|---|
-| `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3.ninfer` (native `nvfp4` profile, production default) | v3 | 19.1 GiB | 254,208 | TTFT **27.2 s**, prefill **1.00k tok/s**, decode **76-78 tok/s** |
-| `Swift-1.5-Qwen3.8-27B-OrcaRouter-NVFP4-DFlash2-V2.ninfer` (same family, **v2, read in place**) | v2 | 22.1 GiB | 200,000 | TTFT **27.3 s**, prefill **998 tok/s**, decode **82.7 tok/s** |
+| `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3.ninfer` (native `nvfp4` profile, production default) | v3 | 19.1 GiB | 254,208 | TTFT **27.2 s**, prefill **1.00k tok/s**, decode **71.1 tok/s** (MTP 接受 50.0%) |
+| `Swift-1.5-Qwen3.8-27B-OrcaRouter-NVFP4-DFlash2-V2.ninfer` (same family, **v2, read in place**) | v2 | 22.1 GiB | 200,000 | TTFT **27.4 s**, prefill **996 tok/s**, decode **67.6 tok/s** (MTP 接受 45.9%) |
 | `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` (GGUF-derived, IQ3_S among 18 block formats) | v3 | 12.9 GiB | 400,000 | TTFT **30.8 s**, prefill **885 tok/s**, decode **66-74 tok/s** |
 
-Short-context decode (1K prompt) is **82.3 tok/s**, and MTP accepts 69% of its drafts on the 27K
-prompt. `Huihui-...-nvfp4` and `orcarouter-...-nvfp4` (v2, the same native family) load as well, so do both Gemma 4 artifacts below.
+Short-context decode (1K prompt) is **82.3 tok/s** (1.6-pre 口径,未在 1.6.2 复验).The table's
+decode figures were re-measured on the 1.6.2 build (2026-10-22, same harness); on 1.6-pre the
+same artifacts measured 76-78 / 82.7 tok/s. MTP acceptance drifts a few points across engine
+revisions because the hidden state feeding the (frozen) draft head changes; the same run at 192
+output tokens averages 37% acceptance, so acceptance is also prompt- and output-length-dependent.
+`Huihui-...-nvfp4` and `orcarouter-...-nvfp4` (v2, the same native family) load as well, so do both Gemma 4 artifacts below.
 
 #### Gemma 4
 
