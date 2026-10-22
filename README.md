@@ -504,6 +504,30 @@ ninfer-serve models/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer --model-id qwen3.
   --spec mtp --draft-tokens 3
 ```
 
+**Converting a GGUF release.** The recipe `qwen3_8_27b_gguf` imports a Qwen3.8-27B GGUF with
+its `qwen35` header, keeping every text, embedding, head and MTP tensor in its own ggml block
+format, byte for byte. `--model` needs only the base checkpoint's `config.json` and tokenizer
+files; the text blocks come from `--source gguf=` (an `-mtp` build carries the MTP head), the
+Vision tower from the release's `mmproj` GGUF, and DFlash2 from the tune's directory:
+
+```bash
+python3 -m tools.convert \
+  --model Qwen3.8-27B \
+  --recipe qwen3_8_27b_gguf \
+  --source gguf=Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
+  --source vision=mmproj-Qwen3.8-27B-BF16.gguf \
+  --source dflash2=Qwen3.8-27B-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --name qwen3.8-27b \
+  --out Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer
+```
+
+Any other Qwen3.8-27B GGUF with that header converts the same way (drop `--source dflash2` and
+its component when the release has none). The [weight-conversion guide](docs/weight-conversion.md)
+covers the supported block types and the GDN control rounding.
+
 - **The official artifact with `rk8v4`.** The same speculation fits 167,936 tokens on an RTX 4090
   and 176,128 on an RTX 3090. An RTX 5090 takes the full 262,144 with either KV format.
 - **IQ3_S.** It drafts with `--spec dflash2 --draft-tokens 5` as well, and `--vision` adds images.
