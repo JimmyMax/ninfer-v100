@@ -104,7 +104,29 @@ decode 段(GPU 忙碌率 97.6%,96 tok / 3.29 s):
 - GGUF 侧现实可兑现的剩余空间:**~3–6%**(小核 + Q8_0/Q5_K 边角),全部在低收益区。
 - 大空间项(Q6_K 布局重打包 ~2–3%、Q4_K 争用融合)是周级工程,且与 NVFP4 的差距(2.3–5.0%)同量级——**即使做完,GGUF decode 也只会接近而非超过 NVFP4**;差距本质是 NVFP4 的 4 bit 值 + E4M3 标量解码比 Q4_K 的 superblock 解码便宜(每元素整数 ALU 更少、行 16 B 对齐)。
 
-## 4. 备注 / 未完成
+## 4. 1.7.0 / 1.5.0 A/B + 短 prompt(2026-10-22,同会话背靠背)
+
+短 prompt 982 tok / 27.2K(27,222 tok),greedy,96 输出,int8 KV,各侧最快 chunk(NVFP4 2048 / GGUF 4096)。
+原始日志:<code>v17_ab_runs.txt</code>(12 case + 1 复测)。
+
+| prompt | 引擎 | 工件 | plain | MTP d4 | prefill |
+|---|---|---|---:|---:|---:|
+| 短 | 1.7.0 | NVFP4 v3 | 34.3 | **84.7**(58.9%) | **1,000** |
+| 短 | 1.7.0 | GGUF v3 | 33.3 | 68.4(51.6%) | 786 |
+| 短 | 1.5.0 | NVFP4 v3 | 33.9 | 77.6(52.5%) | 960 |
+| 短 | 1.5.0 | GGUF v3 | n/a | n/a | n/a |
+| 27.2K | 1.7.0 | NVFP4 v3 | — | 68.3(50.0%)×2 复测 | 975 |
+| 27.2K | 1.7.0 | GGUF v3 | — | 59.5(45.5%) | 969 |
+| 27.2K | 1.5.0 | NVFP4 v3 | — | **75.8**(54.6%) | 977 |
+
+- **1.5.0 无法加载 v3 GGUF 工件**:1.5.0 loader 不支持 v3 帧的 F32 GDN 控制,启动即
+  `ERROR startup failed | inspecting artifact`——1.5.0 从未可运行此 GGUF,表中 n/a。
+- **1.7.0 vs 1.5.0(同 NVFP4 工件)方向随 prompt 反转**:短 prompt 1.7.0 +9.1%(84.7 vs 77.6),
+  27.2K 1.5.0 +11.0%(75.8 vs 68.3);两个方向的差距都主要由接受率驱动(同一工件同一 prompt,
+  两版引擎 draft/target 数值不同,greedy 下分叉),单轮时间在两版间差 ~5% 以内。
+- 1.7.0 测得最高吞吐:**短 prompt MTP 84.7 tok/s**(58.9%)。
+
+## 5. 备注 / 未完成
 
 - IQ3_S 复测已取消:`Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` 是 Qwen3.8 基座,不是 Swift-1.5 v3 家族,不属于本 A/B;生产 `llama-cpp-text` 服务跑的是 Q4_K_M 工件,本矩阵已给出其最快配置(ch4096 + MTP d4)。
 - 生产 compose 若要把 27K prefill 从 920 提到 988 tok/s,可把 `--prefill-chunk 2048` 改为 4096(本 session 未动生产配置)。

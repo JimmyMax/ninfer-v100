@@ -1,0 +1,25 @@
+req wall 3.8s
+done 170_nvfp4_s_plain | 2026-10-22 08:55:45.952  INFO  req#1 done | openai-chat | output limit | prompt 982 | output 96 | cache 0 (0.0%) | TTFT 982 ms | total 3.8s | prefill 1.00k tok/s | decode 34.3 tok/s
+req wall 2.2s
+done 170_nvfp4_s_mtp | 2026-10-22 08:56:09.478  INFO  req#1 done | openai-chat | output limit | prompt 982 | output 96 | cache 0 (0.0%) | TTFT 1.0s | total 2.2s | prefill 939.3 tok/s | decode 84.7 tok/s | mtp accepted 66/112 (58.9%)
+req wall 4.1s
+done 170_gguf_s_plain | 2026-10-22 08:56:32.957  INFO  req#1 done | openai-chat | output limit | prompt 982 | output 96 | cache 0 (0.0%) | TTFT 1.3s | total 4.1s | prefill 785.8 tok/s | decode 33.3 tok/s
+req wall 2.7s
+done 170_gguf_s_mtp | 2026-10-22 08:56:57.045  INFO  req#1 done | openai-chat | output limit | prompt 982 | output 96 | cache 0 (0.0%) | TTFT 1.3s | total 2.6s | prefill 783.4 tok/s | decode 68.4 tok/s | mtp accepted 63/122 (51.6%)
+req wall 29.3s
+done 170_nvfp4_27k_mtp | 2026-10-22 08:57:47.802  INFO  req#1 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 0 (0.0%) | TTFT 27.9s | total 29.3s | prefill 975.4 tok/s | decode 68.3 tok/s | mtp accepted 62/124 (50.0%)
+req wall 29.7s
+done 170_gguf_27k_mtp | 2026-10-22 08:58:38.951  INFO  req#1 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 0 (0.0%) | TTFT 28.1s | total 29.7s | prefill 968.6 tok/s | decode 59.5 tok/s | mtp accepted 61/134 (45.5%)
+req wall 3.8s
+done v15_nvfp4_s_plain | 2026-10-22 08:59:00.133  INFO  req#1 done | openai-chat | output limit | prompt 982 | output 96 | cache 0 (0.0%) | TTFT 1.0s | total 3.8s | prefill 960.2 tok/s | decode 33.9 tok/s
+req wall 2.3s
+done v15_nvfp4_s_mtp | 2026-10-22 08:59:22.120  INFO  req#1 done | openai-chat | output limit | prompt 982 | output 96 | cache 0 (0.0%) | TTFT 1.1s | total 2.3s | prefill 942.8 tok/s | decode 77.6 tok/s | mtp accepted 63/120 (52.5%)
+LOAD-FAIL v15_gguf_s_plain: 2026-10-22 08:59:25.731  ERROR startup failed | inspecting artifact | 17.9 ms
+LOAD-FAIL v15_gguf_s_mtp: 2026-10-22 09:04:31.390  ERROR startup failed | inspecting artifact | 15.5 ms
+req wall 29.2s
+done v15_nvfp4_27k_mtp | 2026-10-22 09:10:21.975  INFO  req#1 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 0 (0.0%) | TTFT 27.9s | total 29.2s | prefill 976.7 tok/s | decode 75.8 tok/s | mtp accepted 65/119 (54.6%)
+LOAD-FAIL v15_gguf_27k_mtp: 2026-10-22 09:10:25.580  ERROR startup failed | inspecting artifact | 15.6 ms
+ALL DONE
+req wall 29.4s
+done 170_nvfp4_27k_mtp_r2 | 2026-10-22 09:19:51.741  INFO  req#1 done | openai-chat | output limit | prompt 27,222 | output 96 | cache 0 (0.0%) | TTFT 28.0s | total 29.4s | prefill 973.7 tok/s | decode 68.3 tok/s | mtp accepted 62/124 (50.0%)
+ALL DONE

@@ -2,7 +2,7 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
-<title>Swift-1.5 v3 A/B:NVFP4 vs GGUF Q4_K_M(同引擎 1.6.2-ggufopt)</title>
+<title>Swift-1.5 v3 A/B:NVFP4 vs GGUF Q4_K_M(1.7.0 / 1.6.2 / 1.5.0)</title>
 <style>
 body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; margin: 2em auto; max-width: 1080px; color: #222; line-height: 1.55; }
 h1 { font-size: 1.5em; border-bottom: 2px solid #444; padding-bottom: .3em; }
@@ -16,12 +16,14 @@ td:first-child, th:first-child { text-align: left; }
 .note { color: #555; font-size: .9em; }
 ul { margin: .5em 0; }
 code { background: #f2f2f2; padding: 0 .3em; border-radius: 3px; }
+.fast { background: #fff7e0; border: 1px solid #d9a800; border-left: 4px solid #d9a800; padding: .6em 1em; margin: 1em 0; }
 </style>
 </head>
 <body>
 
-<h1>Swift-1.5 v3 A/B:NVFP4 vs GGUF Q4_K_M(同引擎、同权重、双工件)</h1>
-<p class="note">2026-10-22 · GPU 1 Tesla V100-PCIE-32GB(sm_70,ECC on,实测 803 GB/s)· 引擎 <code>ninfer:1.6.2-ggufopt</code> ·
+<h1>Swift-1.5 v3 A/B:NVFP4 vs GGUF Q4_K_M(1.7.0 发布版 / 1.6.2 / 1.5.0)</h1>
+<p class="note">2026-10-22 · GPU 1 Tesla V100-PCIE-32GB(sm_70,ECC on,实测 803 GB/s)·
+引擎 <code>ninfer:1.7.0</code>(= 1.6.2-ggufopt 代码 + 版本号,二进制 sha256 <code>2fb0c0a3…475</code>)/ <code>ninfer:v1.5.0</code> ·
 数据:<code>bench/v100/data/swiftv3_tuning_2026-10-22/</code></p>
 
 <h2>0. 对比前提</h2>
@@ -32,10 +34,50 @@ llama.cpp 标准导出 <code>Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf</code> 转换件(
 <li>两边都有 MTP(nextn)头,greedy,96 输出,无 ngram,无 DFlash2 drafter;int8 KV;1 lane。
 提示词为固定重复 filler(7,518 / 27,250 / 89,326 tok)。</li>
 <li>本报告同时覆盖用户要求的「最快 prefill/decode 配置」调参矩阵(prefill chunk 1024/2048/4096、MTP d2/d4/d6/d8、
-<code>--max-concurrency 2</code>、<code>--ngram-draft-tokens 15</code>)。</li>
+<code>--max-concurrency 2</code>、<code>--ngram-draft-tokens 15</code>),以及<b>短 prompt(~1K)对比</b>与<b>1.5.0 基线</b>。</li>
 </ul>
 
-<h2>1. 调参矩阵:每侧最快配置</h2>
+<div class="fast">
+<b>本发布测得的最快配置</b>(V100-32GB,greedy,96 输出,int8 KV):
+<code>ninfer-serve model.ninfer --max-context 200000 --prefill-chunk 2048 --kv-capacity auto --kv-dtype int8
+--max-concurrency 1 --spec mtp --draft-tokens 4 --lm-head-draft</code>
+—— NVFP4 工件:<b>短 prompt(982 tok)MTP decode 84.7 tok/s</b>(58.9% 接受率,1.7.0 测得的最高吞吐)、
+27.3K MTP <b>75.5 tok/s</b>(52.0%)、27.3K plain 32.7、27.3K prefill 1,006 tok/s;GGUF 工件同 decode 参数 +
+<code>--prefill-chunk 4096</code>(27.3K prefill 988、MTP 73.8)。
+</div>
+
+<h2>1. 短 prompt 对比 + 版本 A/B(1.7.0 / 1.5.0)</h2>
+<p class="note">同一 V100、同一会话内背靠背测;短 prompt = 982 tok,长 prompt = 27,222 tok;greedy,96 输出,int8 KV;
+各侧最快 chunk(NVFP4 2048 / GGUF 4096);1.5.0 侧无 <code>--lm-head-draft</code> 差异(两版都带)。数据:
+<code>v17_ab.log</code> / <code>v17_ab2.log</code>。</p>
+<h3>短 prompt(982 tok)</h3>
+<table>
+<tr><th>引擎</th><th>工件</th><th>plain decode</th><th>MTP d4 decode</th><th>prefill</th></tr>
+<tr><td rowspan="2"><b>1.7.0</b></td><td>NVFP4 v3</td><td>34.3</td><td class="best">84.7(58.9%)</td><td class="best">1,000</td></tr>
+<tr><td>GGUF Q4_K_M v3</td><td>33.3</td><td>68.4(51.6%)</td><td>786</td></tr>
+<tr><td rowspan="2">1.5.0</td><td>NVFP4 v3</td><td>33.9</td><td>77.6(52.5%)</td><td>960</td></tr>
+<tr><td>GGUF Q4_K_M v3</td><td colspan="3">n/a —— 1.5.0 loader 不支持 v3 GGUF 工件的 F32 GDN 控制(启动即
+<code>ERROR startup failed | inspecting artifact</code>),从未可运行此 GGUF</td></tr>
+</table>
+<h3>27.2K prompt(27,222 tok)</h3>
+<table>
+<tr><th>引擎</th><th>工件</th><th>MTP d4 decode</th><th>prefill</th></tr>
+<tr><td rowspan="2"><b>1.7.0</b></td><td>NVFP4 v3</td><td>68.3(50.0%)</td><td>975</td></tr>
+<tr><td>GGUF Q4_K_M v3</td><td>59.5(45.5%)</td><td>969</td></tr>
+<tr><td>1.5.0</td><td>NVFP4 v3</td><td class="best">75.8(54.6%)</td><td>977</td></tr>
+</table>
+<ul>
+<li><b>1.7.0 vs 1.5.0(同 NVFP4 工件):方向随 prompt 反转</b>——短 prompt 1.7.0 快(84.7 vs 77.6,+9.1%),
+27.2K 1.5.0 快(75.8 vs 68.3,+11.0%)。两个方向的差距都主要由<b>接受率</b>驱动:同一工件、同一 prompt,
+两版引擎的 draft/target 数值不同,greedy 下逐 token 分叉(短 prompt 58.9 vs 52.5;27.2K 50.0 vs 54.6),
+单轮(round)时间在两版间差 ~5% 以内。</li>
+<li><b>接受率是「引擎数值 × 工件」的联合属性</b>,不能跨引擎直接比:上表的 1.7.0 vs 1.5.0 行是端到端吞吐
+(已包含各自接受率),kernel 效率对比请看 §3(同一引擎 1.7.0 内 NVFP4 vs GGUF)。</li>
+<li>1.5.0 的 27.2K 75.8 与 1.7.0 的 27.3K(27,250)75.5 恰好接近,但 prompt 不同(27,222 vs 27,250)且接受率不同
+(54.6 vs 52.0),不是同一条件下的对比。</li>
+</ul>
+
+<h2>2. 调参矩阵:每侧最快配置</h2>
 <h3>Prefill(tok/s)</h3>
 <table>
 <tr><th>ctx</th><th>chunk</th><th>NVFP4</th><th>GGUF</th></tr>
@@ -82,15 +124,15 @@ llama.cpp 标准导出 <code>Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf</code> 转换件(
 → 27K MTP 73.8 / plain 31.8 / 82K MTP 63.8(实测 57.0@ch4096,接受率 50% 漂移;ch2048 63.8@55.1%)</li>
 </ul>
 
-<h2>2. 调优后 A/B 结论</h2>
+<h2>3. 调优后 A/B 结论</h2>
 <ul>
 <li><b>纯 decode:两边打平(±3%)</b>——GGUF 少 2.2 GiB 权重却只差 2–3%(27K 31.8 vs 32.7),Q4_K 系列 vec 内核已接近其带宽上限。</li>
 <li><b>MTP decode:NVFP4 领先 2.3%(27K 各自最优 chunk)~5.0%(82K ch2048)</b>——每步验证速率差(GEMV 每字节效率),接受率两边在漂移带内。</li>
 <li><b>Prefill:GGUF 用 4096 chunk 后 82K 追平 NVFP4,27K/7.6K 差 2%</b>。</li>
-<li>对「GGUF 侧还能否更快」:有,但有限。见 §3 的 profiling 分解。</li>
+<li>对「GGUF 侧还能否更快」:有,但有限。见 §4 的 profiling 分解。</li>
 </ul>
 
-<h2>3. GGUF decode 内核构成与剩余空间</h2>
+<h2>4. GGUF decode 内核构成与剩余空间</h2>
 <h3>3.1 nsys(27K plain,decode 段 GPU 忙碌率 97.6%,96 tok / 3.29 s)</h3>
 <table>
 <tr><th>内核</th><th>decode 时间</th><th>占比</th><th>每 token 权重</th><th>纯带宽时间@803 GB/s</th><th>并发下效率</th></tr>
@@ -124,12 +166,15 @@ llama.cpp 标准导出 <code>Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf</code> 转换件(
 <li>已排除项:T=1 已全展开;T≥2 已 <code>#pragma unroll 1</code>(L1I 修复,收益 +18.9% e2e);kRows/TC 路线在小 T 已测量拒绝。</li>
 </ul>
 
-<h2>4. 测法与限制</h2>
+<h2>5. 测法与限制</h2>
 <ul>
 <li>每 case 全新容器(冷 KV/上下文);请求后从响应 <code>timings</code>(引擎自报)取 prefill/decode/接受数;与 serve 日志 <code>req#N done</code> 行交叉核对一致。</li>
 <li>greedy;输出 96 tok;接受率 = draft 接受数/草稿数(仅神经草稿,无 ngram)。</li>
 <li>接受率跨提示词/分块漂移 ±5pp;单点 decode 速率重复测量波动 ±2%。</li>
 <li>ECC on(V100 出厂状态):带宽 803 GB/s(关 ECC 可 ~902)——两侧同等受影响。</li>
+<li>§1 的版本 A/B(1.7.0 vs 1.5.0)在同一会话内背靠背运行(每 case 全新容器,同一 GPU 状态);
+短 prompt 982 tok、27.2K prompt 27,222 tok 的 filler 与 §2 矩阵(27,250)略有差异,接受率数字不可跨 prompt 直接对比。
+原始日志:<code>v17_ab_runs.txt</code>。</li>
 </ul>
 
 </body>
