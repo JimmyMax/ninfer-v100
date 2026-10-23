@@ -316,7 +316,11 @@ The Windows reader paths have not been run.
 On a serving workload with one RTX 3090, the table's pages evicted before the first request, the
 PLE layer waited 0 to 4 microseconds per request for its rows with buffered or direct reads. The
 row cache stays off by default: with a 4 GiB cache the first requests took 10-11% longer, and
-repeated requests that hit every row generated no faster.
+repeated requests that hit every row generated no faster. On a Tesla V100-32GB (sm_70, PCIe 3.0,
+ECC on) with host experts, MTP 4 drafts, and five greedy 512-token chat passes per run, disk
+residency (depth 64) stalled the PLE layer 0.004-0.06 s over a ~53 s pass (well under 0.1% of the
+pass), and `ram-hot` with the published 4 GiB profile served ~35% of the rows from RAM at the same
+stall time and wall time, so a further zero-copy host-table route buys nothing measurable there.
 
 `--ngram-residency ram` reads the whole table into RAM at startup (2 MiB pages where Linux offers
 them), and `ram-hot` reads only the rows a hot-row profile ranks most used, as many as
