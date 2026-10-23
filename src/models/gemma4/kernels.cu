@@ -268,11 +268,12 @@ __global__ void f32_to_bf16_kernel(const float* in, __nv_bfloat16* out, std::int
 }
 
 // ---- Decode attention ---------------------------------------------------------------------------
-// Block (row, kv head, split): the G query heads of the KV head over the split's keys, in tiles. Four
-// warps; warp w scores heads [w * HPW, (w + 1) * HPW) over keys of its key group (G < 4: the tile's
-// keys are split between 4 / G warps per head). Every thread then accumulates D / 128 dimensions of
-// every head's output.
-constexpr int kDecodeThreads = 128;
+// Block (row, kv head, split): the G query heads of the KV head over the split's keys, in tiles of
+// 32. Eight warps; warp w scores head w / 4 over keys [8 (w % 4), 8 (w % 4) + 8) of the tile, read
+// straight from the cache into registers -- keys never touch shared memory, so a block's shared
+// footprint is the values alone and twice as many blocks stay resident per SM. Every thread owns
+// one dimension of every head's output.
+constexpr int kDecodeThreads = 256;
 
 // The sums of 16 per-lane values v[k] over the warp, by halving exchanges: afterwards lanes 2j and
 // 2j + 1 both hold the total of key (lane & 16 ? 8 : 0) + (lane & 8 ? 4 : 0) + (lane & 4 ? 2 : 0) +
@@ -289,6 +290,25 @@ __device__ __forceinline__ float key_reduce16(float (&v)[16], int lane) {
         }
     }
     return v[0] + __shfl_xor_sync(0xFFFFFFFFu, v[0], 1);
+}
+
+// The same halving exchange for eight values: afterwards every lane holds the total of key
+// (lane & 16 ? 4 : 0) + (lane & 8 ? 2 : 0) + (lane & 4 ? 1 : 0) (the free lane bits 2 and 1 are
+// mixed afterwards).
+__device__ __forceinline__ float key_reduce8(float (&v)[8], int lane) {
+#pragma unroll
+    for (int width = 4, offset = 16; width >= 1; width >>= 1, offset >>= 1) {
+        const bool upper = (lane & offset) != 0;
+#pragma unroll
+        for (int i = 0; i < width; ++i) {
+            const float send = upper ? v[i] : v[i + width];
+            const float keep = upper ? v[i + width] : v[i];
+            v[i]             = keep + __shfl_xor_sync(0xFFFFFFFFu, send, offset);
+        }
+    }
+    float t = v[0] + __shfl_xor_sync(0xFFFFFFFFu, v[0], 1);
+    t += __shfl_xor_sync(0xFFFFFFFFu, t, 2);
+    return t;
 }
 
 // The splits a row's keys actually use: at least a tile of keys each, so a short context does not
@@ -343,21 +363,10 @@ __device__ __forceinline__ uint4 tile_word(const TileRegs<C, N>& t, int u) {
     }
 }
 
-template <int D, int G>
-struct DecodeShape {
-    static constexpr int kTile      = D == 512 ? 16 : 32;
-    static constexpr int kHpw       = G >= 4 ? G / 4 : 1;   // heads per warp
-    static constexpr int kGroups    = G >= 4 ? 1 : 4 / G;   // key groups per head
-    static constexpr int kDpl       = D / 32;               // dims per lane
-    static constexpr int kDpt       = D / kDecodeThreads;   // dims per thread (PV)
-};
-
 template <int D, int G, KvCoding KC = KvCoding::F16, KvCoding VC = KvCoding::F16>
-__launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(DecodeAttentionArgs a) {
-    constexpr int V      = G;
-    using S              = DecodeShape<D, V>;
-    constexpr int kTile  = S::kTile;
-    // Rows vary fastest: a verification's rows of one sequence read the same keys at once.
+__launch_bounds__(kDecodeThreads, 2) __global__ void decode_attention_kernel(DecodeAttentionArgs a) {
+    constexpr int V     = G;
+    constexpr int kTile = 32;
     const int b          = blockIdx.x;
     const int kv_head    = blockIdx.y;
     const int split      = blockIdx.z;
@@ -373,7 +382,6 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
     const int lo         = lo_all + split * chunk;
     const int hi         = min(position + 1, lo + chunk);
 
-    __shared__ __align__(16) __half k_s[kTile][D];
     __shared__ __align__(16) __half v_s[kTile][D];
     __shared__ float p_s[V][kTile];
     __shared__ float m_s[V], l_s[V], scale_s[V];
@@ -382,45 +390,52 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
         m_s[threadIdx.x] = -INFINITY;
         l_s[threadIdx.x] = 0.0f;
     }
-    float acc[V][S::kDpt];
+    float acc[V];
 #pragma unroll
-    for (int g = 0; g < V; ++g) {
-#pragma unroll
-        for (int j = 0; j < S::kDpt; ++j) { acc[g][j] = 0.0f; }
-    }
+    for (int g = 0; g < V; ++g) { acc[g] = 0.0f; }
     __syncthreads();
 
-    // This lane's slice of each of its heads' queries.
-    const int head_base = (warp / S::kGroups) * S::kHpw;
-    const int key_group = warp % S::kGroups;
-    float q_r[S::kHpw][S::kDpl];
+    // Warp w: head w / 4, the key octet w % 4; the lane covers dimensions [8 lane, 8 lane + 8)
+    // of its octet's keys, read straight from the cache.
+    const int head      = warp >> 2;
+    const int key_group = warp & 3;
+    float q_r[8];
+    {
+        const float* q =
+            a.q + (std::int64_t(b) * a.query_heads + kv_head * G + head) * D + lane * 8;
 #pragma unroll
-    for (int h = 0; h < S::kHpw; ++h) {
-        const float* q = a.q + (std::int64_t(b) * a.query_heads + kv_head * G + head_base + h) * D +
-                         lane * S::kDpl;
-#pragma unroll
-        for (int j = 0; j < S::kDpl; ++j) { q_r[h][j] = q[j] * a.scale; }
+        for (int j = 0; j < 8; ++j) { q_r[j] = q[j] * a.scale; }
     }
 
     const std::int64_t base = std::int64_t(sequence) * a.seq_stride +
                               std::int64_t(kv_head) * a.head_stride;
-    // The K and V rows of a tile in 16-byte words, kLoads per thread; the next tile's words are
-    // fetched into registers while the current one is scored.
+    // The warp's key octet in registers, decoded at scoring; the tile's values stage through
+    // registers into shared memory for the PV pass.
+    constexpr int kOctet = kTile / 4;
+    TileRegs<KC, kOctet> k_regs;
     constexpr int kWords = D / 8;
     constexpr int kLoads = kTile * kWords / kDecodeThreads;
     static_assert(kTile * kWords % kDecodeThreads == 0);
-    TileRegs<KC, kLoads> k_next;
     TileRegs<VC, kLoads> v_next;
     const auto fetch = [&](int tile, int count) {
+#pragma unroll
+        for (int i = 0; i < kOctet; ++i) {
+            const int key  = key_group * kOctet + i;
+            const int p    = tile + key;
+            const int slot = a.ring != 0 ? p % a.ring : p;
+            tile_fetch(k_regs, i, key < count, a.k_cache,
+                       base + std::int64_t(slot) * D + lane * 8, a.k_plane, sequence, kv_head,
+                       slot, lane);
+        }
 #pragma unroll
         for (int u = 0; u < kLoads; ++u) {
             const int w = threadIdx.x + u * kDecodeThreads;
             const int r = w / kWords, c = w % kWords;
             const int p    = tile + r;
             const int slot = a.ring != 0 ? p % a.ring : p;
-            const std::int64_t at = base + std::int64_t(slot) * D + c * 8;
-            tile_fetch(k_next, u, r < count, a.k_cache, at, a.k_plane, sequence, kv_head, slot, c);
-            tile_fetch(v_next, u, r < count, a.v_cache, at, a.v_plane, sequence, kv_head, slot, c);
+            tile_fetch(v_next, u, r < count, a.v_cache,
+                       base + std::int64_t(slot) * D + c * 8, a.v_plane, sequence, kv_head, slot,
+                       c);
         }
     };
     if (lo < hi) { fetch(lo, min(kTile, hi - lo)); }
@@ -430,48 +445,34 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
         for (int u = 0; u < kLoads; ++u) {
             const int w = threadIdx.x + u * kDecodeThreads;
             const int r = w / kWords, c = w % kWords;
-            *reinterpret_cast<uint4*>(&k_s[r][c * 8]) = tile_word(k_next, u);
             *reinterpret_cast<uint4*>(&v_s[r][c * 8]) = tile_word(v_next, u);
         }
         __syncthreads();
-        if (tile + kTile < hi) { fetch(tile + kTile, min(kTile, hi - tile - kTile)); }
-        // Scores: each lane's partial dot products over its kDpl dimensions for the warp's 16 keys,
-        // then one butterfly that leaves every key's sum on a pair of lanes (16 shuffles per head
-        // instead of 16 full reductions).
-        constexpr int kKeysPerGroup = kTile / S::kGroups;
-        static_assert(kKeysPerGroup == 16, "the score butterfly reduces 16 keys");
-        float part[S::kHpw][kKeysPerGroup];
+        // Scores from the registers: eight dots of eight dimensions each, then one butterfly that
+        // leaves every key's sum on every lane.
+        float part[kOctet];
 #pragma unroll
-        for (int kk = 0; kk < kKeysPerGroup; ++kk) {
-            const int key = key_group * kKeysPerGroup + kk;
-            float kf[S::kDpl];
+        for (int i = 0; i < kOctet; ++i) {
+            const uint4 w   = tile_word(k_regs, i);
+            const __half2* h = reinterpret_cast<const __half2*>(&w);
+            float dot       = 0.0f;
 #pragma unroll
-            for (int j = 0; j < S::kDpl; j += 2) {
-                const float2 f = __half22float2(
-                    *reinterpret_cast<const __half2*>(&k_s[key][lane * S::kDpl + j]));
-                kf[j]     = f.x;
-                kf[j + 1] = f.y;
+            for (int j = 0; j < 4; ++j) {
+                const float2 f = __half22float2(h[j]);
+                dot += q_r[2 * j] * f.x + q_r[2 * j + 1] * f.y;
             }
-#pragma unroll
-            for (int h = 0; h < S::kHpw; ++h) {
-                float dot = 0.0f;
-#pragma unroll
-                for (int j = 0; j < S::kDpl; ++j) { dot += q_r[h][j] * kf[j]; }
-                part[h][kk] = dot;
-            }
+            part[i] = dot;
         }
-        const int lane_key = key_group * kKeysPerGroup + ((lane & 16) ? 8 : 0) + ((lane & 8) ? 4 : 0) +
-                             ((lane & 4) ? 2 : 0) + ((lane & 2) ? 1 : 0);
-#pragma unroll
-        for (int h = 0; h < S::kHpw; ++h) {
-            const float dot = key_reduce16(part[h], lane);
-            if ((lane & 1) == 0) {
-                p_s[head_base + h][lane_key] = lane_key < count ? dot : -INFINITY;
-            }
+        // The registers are scored; the next tile's loads overlap the softmax and PV passes.
+        if (tile + kTile < hi) { fetch(tile + kTile, min(kTile, hi - tile - kTile)); }
+        const int lane_key = key_group * kOctet + ((lane & 16) ? 4 : 0) + ((lane & 8) ? 2 : 0) +
+                             ((lane & 4) ? 1 : 0);
+        const float dot    = key_reduce8(part, lane);
+        if ((lane & 1) == 0) {
+            p_s[head][lane_key] = lane_key < count ? dot : -INFINITY;
         }
         __syncthreads();
-        // Online softmax: warp w takes heads w, w + 4, ...; lane k the tile's key k.
-        static_assert(kTile <= 32, "one lane per key of a tile");
+        // Online softmax: warp w takes heads w, w + 8, ...; lane k the tile's key k.
         for (int g = warp; g < V; g += kDecodeThreads / 32) {
             const float p     = lane < count ? p_s[g][lane] : -INFINITY;
             float m_tile      = p;
@@ -491,18 +492,11 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
         }
         __syncthreads();
 #pragma unroll
-        for (int g = 0; g < V; ++g) {
-            const float scale = scale_s[g];
-#pragma unroll
-            for (int j = 0; j < S::kDpt; ++j) { acc[g][j] *= scale; }
-        }
+        for (int g = 0; g < V; ++g) { acc[g] *= scale_s[g]; }
         for (int k = 0; k < count; ++k) {
+            const float v = __half2float(v_s[k][threadIdx.x]);
 #pragma unroll
-            for (int j = 0; j < S::kDpt; ++j) {
-                const float v = __half2float(v_s[k][threadIdx.x + j * kDecodeThreads]);
-#pragma unroll
-                for (int g = 0; g < V; ++g) { acc[g][j] += p_s[g][k] * v; }
-            }
+            for (int g = 0; g < V; ++g) { acc[g] += p_s[g][k] * v; }
         }
         __syncthreads();
     }
@@ -512,10 +506,7 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
     for (int g = 0; g < V; ++g) {
         const std::int64_t row =
             (std::int64_t(b) * a.query_heads + kv_head * G + g) * a.splits + split;
-#pragma unroll
-        for (int j = 0; j < S::kDpt; ++j) {
-            a.partial[row * D + threadIdx.x + j * kDecodeThreads] = acc[g][j];
-        }
+        a.partial[row * D + threadIdx.x] = acc[g];
         if (threadIdx.x == 0) {
             a.partial[rows * D + 2 * row]     = m_s[g];
             a.partial[rows * D + 2 * row + 1] = l_s[g];
@@ -529,10 +520,11 @@ __launch_bounds__(kDecodeThreads) __global__ void decode_attention_kernel(Decode
 // 8 lane, 256 + 8 lane + 8) (conflict-free 16-byte reads), and every warp keeps its own online
 // softmax, so a tile costs two barriers (three when the keys are derived from the values).
 constexpr int kWideThreads = 256;
+constexpr int kWideTile    = 16;
 
 template <bool Derived, KvCoding VC = KvCoding::F16>
 __launch_bounds__(kWideThreads, 2) __global__ void decode_attention_wide_kernel(DecodeAttentionArgs a) {
-    constexpr int D = 512, kTile = 16, kHalf = D / 2;
+    constexpr int D = 512, kTile = kWideTile, kHalf = D / 2;
     const int b        = blockIdx.x; // rows fastest, as decode_attention_kernel
     const int kv_head  = blockIdx.y;
     const int split    = blockIdx.z;
@@ -741,7 +733,7 @@ __global__ void decode_combine_kernel(DecodeAttentionArgs a) {
     const std::int64_t first = (std::int64_t(b) * a.query_heads + head) * a.splits;
     const int position = a.positions[b];
     const int lo_all   = a.ring != 0 ? max(0, position - a.window + 1) : 0;
-    const int active   = decode_active_splits(position + 1 - lo_all, a.splits, D == 512 ? 16 : 32);
+    const int active   = decode_active_splits(position + 1 - lo_all, a.splits, D == 512 ? kWideTile : 32);
     // Each split's weight exp(m_s - m) once, in shared memory (blockDim >= splits).
     __shared__ float weight[Rotated ? kKvBlockDims : kDecodeCombineThreads];
     __shared__ float max_s, inv_l;

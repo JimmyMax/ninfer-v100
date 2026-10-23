@@ -405,7 +405,7 @@ sm_70 的 FP16 范围饱和(上游 `67778be`+`2d69547`)。
 * 产出一张 `--kv-dtype × max-context × drafts` 的 V100-32G 参数表。
 * 预估：2–5 天。
 
-### S2 Gemma 4 的 Volta 解码注意力（attention v2 技术落地） ☐
+### S2 Gemma 4 的 Volta 解码注意力（attention v2 技术落地） ☐（滑窗几何已落地 2026-12-23）
 
 **Gemma 4 不使用共享的 `causal_cache` 家族**，它有自己的
 `src/models/gemma4/{kernels.cu,kv_kernels.cu,kv_codec.cuh}`（25 层滑窗 window=1024 / head 256 /
@@ -416,6 +416,27 @@ sm_70 的 FP16 范围饱和(上游 `67778be`+`2d69547`)。
 * 验收：Gemma 4 decode 提升百分比 + 数值等价（上游自带 FP64 oracle 测试：
   `tests/models/gemma4/*`，`ninfer_gemma4_kv_test` 等）。
 * 预估：1–2 周。
+
+#### S2 进展（滑窗几何，2026-12-23）
+
+重写 `decode_attention_kernel`（D256 滑窗）：128 线程/4 warp 改为 256 线程/8 warp，
+warp w 对 head w/4 取 tile 内 8 个 key，K **直接从全局读进寄存器**（不再过 shared
+memory），V 保留 smem 暂存 → 每块 smem 从 33KB 降到 16KB；`key_reduce8` 蝴蝶归约
+（3 轮二分交换 + 2 轮自由位混合，主机模拟验证）；fetch 移到打分之后，下一 tile 的
+加载与 softmax/PV 重叠。`__launch_bounds__(256, 2)`，80 寄存器零 spill。
+
+* oracle：`ninfer_gemma4_kernels_test` 全绿（D256 全形状，rms ≈ 1.65e-3，与基线相同）；
+  `ninfer_gemma4_{kv,output,wide_rows}_test` 全绿。
+* ncu 固定时钟 A/B（同 87 个注意力 launch 窗口）：滑窗 kernel 577→507 µs（**−12.1%**，
+  平均 15.6→13.7 µs/launch），wide 与 combine 不变，注意力合计 1014→948 µs（−6.5%）。
+* E2E V100-32G（Gemma4-26B-A4B MTP 制品，prompt 1813 tokens）：无投机 126.7→129.4 tok/s
+  （**+1.6%**，交替 A/B ×3 可复现；轨迹分叉使 v3 早 1 token 到 EOS）；MTP-2
+  159.2→170.0 tok/s，per-token **+6.7%**（每轮 9.98→9.45 ms；接受率相当：58% vs 59%）。
+* 试过并否决：512 线程/16 warp 版（64 寄存器上限下热循环 spill 到 local memory，
+  local 流量 ~28MB/launch，47 µs 反而更慢）；splits 32/64（无收益）；`launch_bounds(256,3)`
+  （无差异）；wide kernel `kTile` 16→8（E2E −7%，barrier 密度加倍吞掉 smem 收益）。
+* 剩余：wide（D512）几何的同款重构、`byte_perm` int8→fp16 反量化路径、fp16 PV 累加链
+  （目前 PV 为 fp32 累加）。
 
 ### S3 Volta GGUF 投影加速 ☐
 
