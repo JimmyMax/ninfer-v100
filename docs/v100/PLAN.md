@@ -405,7 +405,7 @@ sm_70 的 FP16 范围饱和(上游 `67778be`+`2d69547`)。
 * 产出一张 `--kv-dtype × max-context × drafts` 的 V100-32G 参数表。
 * 预估：2–5 天。
 
-### S2 Gemma 4 的 Volta 解码注意力（attention v2 技术落地） ☐（滑窗几何已落地 2026-12-23）
+### S2 Gemma 4 的 Volta 解码注意力（attention v2 技术落地） ☐（滑窗几何已落地 2026-10-23）
 
 **Gemma 4 不使用共享的 `causal_cache` 家族**，它有自己的
 `src/models/gemma4/{kernels.cu,kv_kernels.cu,kv_codec.cuh}`（25 层滑窗 window=1024 / head 256 /
@@ -417,7 +417,7 @@ sm_70 的 FP16 范围饱和(上游 `67778be`+`2d69547`)。
   `tests/models/gemma4/*`，`ninfer_gemma4_kv_test` 等）。
 * 预估：1–2 周。
 
-#### S2 进展（滑窗几何，2026-12-23）
+#### S2 进展（滑窗几何，2026-10-23）
 
 重写 `decode_attention_kernel`（D256 滑窗）：128 线程/4 warp 改为 256 线程/8 warp，
 warp w 对 head w/4 取 tile 内 8 个 key，K **直接从全局读进寄存器**（不再过 shared
@@ -438,7 +438,7 @@ memory），V 保留 smem 暂存 → 每块 smem 从 33KB 降到 16KB；`key_red
 * 剩余：wide（D512）几何的同款重构、`byte_perm` int8→fp16 反量化路径、fp16 PV 累加链
   （目前 PV 为 fp32 累加）。
 
-### S3 Volta GGUF 投影加速 ☐
+### S3 Volta GGUF 投影加速 ☐（decode 投影已落地 2026-10-24）
 
 Gemma 4 的权重是逐张量 GGUF block 格式（Q4_K / Q5_0 / Q6_K / Q8_0 / Q4_0（草稿头）/ BF16（视觉塔）/ FP32）。
 上游在 Volta 上的现状：≤8 列走 NInfer 的 DP4A 向量核，>8 列走 ggml 的 DP4A 矩阵核，
@@ -449,6 +449,48 @@ Gemma 4 的权重是逐张量 GGUF block 格式（Q4_K / Q5_0 / Q6_K / Q8_0 / Q4
   激活分块暂存。
 * 验收：`pp2048` 与 decode 段耗时对照表（`ninfer_bench`）。
 * 预估：1–2 周。
+
+#### S3 进展（vec 核 constexpr K，2026-10-24）
+
+31B decode 的 kernel 分解（nvprof，1.8K prompt，100 token，MTP-4）：GGUF 反量化 GEMM 族
+占 decode kernel 时间 ~85%，其中 vec matvec（Q4_K 73% / Q6_K 22% / Q4_0 5%）为主。
+微基准（纯 DRAM，N=20480 单 buffer > L2，K=5376，T=5）基线 Q4_K 125.6 µs/product
+（493 GB/s，V100-32GB 实测 DRAM 上限 875 GB/s 的 56%）。
+
+根因：kernel 是延迟受限而非带宽受限（ncu：long_scoreboard 54%，L1 35% / L2 23% /
+DRAM 50%，均不饱和）；编译器不做预取。constexpr K 让 (j, it) 激活基址在编译期预计算
+（去掉每 it 的 IMAD 地址链），单独带来 14%。另外原静态 T>1 路径的 `#pragma unroll 1`
+kFull/tail 分裂循环（132 µs）比简单循环慢；T=1 全展开（96.3 µs）又略快于运行时形式
+（97.1 µs）。
+
+落地改动（`src/ops/linear/gguf/ggml_bridge_vec.cuh`）：
+
+* 静态 K 循环统一为单一 slice 循环；`T==1 && KS!=0` 用全展开形式（含尾界检查）。
+* 静态列表加入 K=5376（31B hidden，尾 256 元素）；Q4_0 加入 `kVecStaticK`
+  （微基准 139.5→114.1 µs/product）。
+* Q6_K 明确排除出 `kVecStaticK`：constexpr K 使其变慢（265 vs 224 µs/product），
+  其散 2B 读取是主导，留待 block 解码重构。
+* 移除死代码：失败的 smem 暂存核（staged kernel，1.8× 慢）与 j-chunking 实验。
+
+验收（V100-32GB，2026-10-24）：
+
+| 项 | 基线 | 落地后 | 变化 |
+|---|---|---|---|
+| Q4_K vec 微基准（K=5376 T=5，纯 DRAM） | 125.6 µs / 493 GB/s | 109.5 µs / 565 GB/s | +13% |
+| Q4_K vec 微基准（K=5376 T=1） | 97.1 µs | 96.3 µs | +1% |
+| 31B bench `tg128`（MTP-4，int8 KV，chunk 2048） | 96.5 tok/s | 98.44 tok/s | +2.0% |
+| 31B bench `pp2048` | 759.0 tok/s | 759.2 tok/s | 不变 |
+| 31B bench `tg128` no-spec | — | 29.09 tok/s | 无回归 |
+| oracle（`ninfer_linear_gguf_test`） | — | 全绿 | — |
+| Gemma 4 kernels / KV tests | — | 全绿 | — |
+
+26B MoE 结构上不受影响（hidden 2816，vec 全在运行时路径）。serve 二进制已重链，
+`ninfer-gemma4-31b` 容器已用新二进制重启。
+
+剩余：Q6_K 的散 2B 块解码（占 31B vec 时间 22%）尚无可行加速——smem 暂存、j-chunk、
+权重/激活预取全部实测为负（寄存器墙：per-it 权重 512 B = 128 寄存器，96 寄存器基线
+已在 5 block/SM 边界）。Q4_K 距 DRAM 上限 65%，剩余差距为 DRAM 延迟；进一步需要
+布局级 prepack（31B 在本卡 VRAM 预算下不可行）或 block 解码重构。
 
 ### S4 MoE 专家投影的 Volta 路径 ☐
 

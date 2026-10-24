@@ -18,11 +18,13 @@
 namespace ninfer::ops::gguf::detail {
 
 // Types whose vector kernels are also built for the static K of the 27B text matrices.
+// Q6_K is deliberately absent: its scattered 2-byte decode reads make the constexpr-K codegen
+// slower than the runtime form (265 vs 224 us/product for K=5376 T=5 on sm_70).
 template <ggml_type type>
 inline constexpr bool kVecStaticK =
     type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS ||
-    type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS ||
-    type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K;
+    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ2_S ||
+    type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K;
 
 inline constexpr int kVecWarps = 4;
 
@@ -692,17 +694,17 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
                 for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
             }
         };
-        if constexpr (KS != 0) {
-            static_assert(KS % 1024 == 0);
-            if constexpr (T == 1) {
+        // A single loop over the slice index. With the static K, `slices` is a compile-time
+        // constant and the compiler picks the unrolling. On sm_70 the measured winners for
+        // Q4_K K=5376 are: T=1 fully unrolled (96 us/product), wider T one small loop body
+        // (110 us); a `#pragma unroll 1` kFull/tail split measured 132 us and the simple loop
+        // with a constexpr K measured 100 us at T=1, so the two forms below are kept separate.
+        // The runtime K path is the simple loop with a runtime bound.
+        static_assert(KS == 0 || (KS % 32 == 0 && (KS % 1024 == 0 || KS % 1024 == 256)));
+        if constexpr (KS != 0 && T == 1) {
 #pragma unroll
-                for (int it = 0; it < KS / 1024; ++it) { slice(it); }
-            } else {
-                // Wider T: keep the slice body in one small loop body. The fully unrolled form
-                // bloats the code past the Volta L1I (measured ~1/3 of warp stalls were instruction
-                // fetch); the loop branch costs far less than the cache misses.
-#pragma unroll 1
-                for (int it = 0; it < KS / 1024; ++it) { slice(it); }
+            for (int it = 0; it < slices / 32 + 1; ++it) {
+                if (lane + 32 * it < slices) { slice(it); }
             }
         } else {
             for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
@@ -755,6 +757,7 @@ void launch_k(const VecArgs& args, cudaStream_t stream) {
     if constexpr (kVecStaticK<type>) {
         switch (args.k) {
         case 5120: return launch<type, T, Fused, 5120>(args, stream);
+        case 5376: return launch<type, T, Fused, 5376>(args, stream);
         case 6144: return launch<type, T, Fused, 6144>(args, stream);
         case 10240: return launch<type, T, Fused, 10240>(args, stream);
         case 17408: return launch<type, T, Fused, 17408>(args, stream);
