@@ -17,14 +17,21 @@
 
 namespace ninfer::ops::gguf::detail {
 
-// Types whose vector kernels are also built for the static K of the 27B text matrices.
-// Q6_K is deliberately absent: its scattered 2-byte decode reads make the constexpr-K codegen
-// slower than the runtime form (265 vs 224 us/product for K=5376 T=5 on sm_70).
+// Types whose vector kernels are also built for the static K of the 27B text matrices (5120,
+// 6144, 10240, 17408) and the 26B Gemma 4 matrices (2816, 4096, 2112, 704). Q6_K is deliberately
+// absent: its scattered 2-byte decode reads make the constexpr-K codegen slower than the runtime
+// form (265 vs 224 us/product for K=5376 T=5 on sm_70).
 template <ggml_type type>
 inline constexpr bool kVecStaticK =
     type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS ||
-    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ2_S ||
-    type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K;
+    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0 ||
+    type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS ||
+    type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K;
+
+// The routed-expert kernels of the 26B Gemma 4 MoE (gate/up K=2816, down K=704).
+template <ggml_type type>
+inline constexpr bool kMoeStaticK =
+    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0;
 
 inline constexpr int kVecWarps = 4;
 
@@ -695,12 +702,12 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
             }
         };
         // A single loop over the slice index. With the static K, `slices` is a compile-time
-        // constant and the compiler picks the unrolling. On sm_70 the measured winners for
-        // Q4_K K=5376 are: T=1 fully unrolled (96 us/product), wider T one small loop body
-        // (110 us); a `#pragma unroll 1` kFull/tail split measured 132 us and the simple loop
-        // with a constexpr K measured 100 us at T=1, so the two forms below are kept separate.
-        // The runtime K path is the simple loop with a runtime bound.
-        static_assert(KS == 0 || (KS % 32 == 0 && (KS % 1024 == 0 || KS % 1024 == 256)));
+        // constant and the compiler picks the unrolling. On sm_70 the measured winners:
+        // T=1 fully unrolled at K=5376 (96 us vs 97 runtime; the unrolled form regressed the 26B
+        // K=2816/4096 shapes, so static K at T=1 is dispatched for 5376 only), wider T one small
+        // loop body (Q4_K K=5376 T=5: 110 us vs 125 runtime). Everything else keeps the runtime
+        // loop.
+        static_assert(KS == 0 || KS % 32 == 0);
         if constexpr (KS != 0 && T == 1) {
 #pragma unroll
             for (int it = 0; it < slices / 32 + 1; ++it) {
@@ -754,11 +761,19 @@ void launch(const VecArgs& args, cudaStream_t stream) {
 
 template <ggml_type type, int T, bool Fused>
 void launch_k(const VecArgs& args, cudaStream_t stream) {
-    if constexpr (kVecStaticK<type>) {
+    if constexpr (kVecStaticK<type> && T == 1) {
+        // Only K=5376 measured a win for the unrolled T=1 form (96 vs 97 us, Q4_K sm_70);
+        // K=2816/4096 regressed, so they stay on the runtime loop.
+        if (args.k == 5376) { return launch<type, T, Fused, 5376>(args, stream); }
+    } else if constexpr (kVecStaticK<type>) {
         switch (args.k) {
-        case 5120: return launch<type, T, Fused, 5120>(args, stream);
-        case 5376: return launch<type, T, Fused, 5376>(args, stream);
-        case 6144: return launch<type, T, Fused, 6144>(args, stream);
+        case 704:   return launch<type, T, Fused, 704>(args, stream);
+        case 2112:  return launch<type, T, Fused, 2112>(args, stream);
+        case 2816:  return launch<type, T, Fused, 2816>(args, stream);
+        case 4096:  return launch<type, T, Fused, 4096>(args, stream);
+        case 5120:  return launch<type, T, Fused, 5120>(args, stream);
+        case 5376:  return launch<type, T, Fused, 5376>(args, stream);
+        case 6144:  return launch<type, T, Fused, 6144>(args, stream);
         case 10240: return launch<type, T, Fused, 10240>(args, stream);
         case 17408: return launch<type, T, Fused, 17408>(args, stream);
         default: break;
@@ -786,7 +801,7 @@ void launch_columns(const VecArgs& args, int columns, cudaStream_t stream) {
 // The MoE form: block (x, y) takes rows of the y-th active expert for every pair routed to it, T of
 // them per pass over the rows. A pair's activation column is pair / column_group. Fused: the first
 // table holds the gate rows and the second the up rows, and each output row is silu(gate) * up.
-template <ggml_type type, int T, bool Fused>
+template <ggml_type type, int T, bool Fused, int KS = 0>
 __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
@@ -807,7 +822,7 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
     const std::uint8_t* second     = Fused ? p.second[expert] : nullptr;
     const int warp                 = threadIdx.x >> 5;
     const int lane                 = threadIdx.x & 31;
-    const int k                    = p.k;
+    const int k                    = KS != 0 ? KS : p.k;
     const int slices               = k / 32;
     const int step                 = Fused ? 1 : kRows;
     const std::int64_t lane_offset = std::int64_t(lane / kPerBlock) * D::kBlockBytes;
@@ -840,7 +855,7 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
 #pragma unroll
                 for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
             }
-            for (int it = 0; lane + 32 * it < slices; ++it) {
+            const auto slice = [&](int it) {
                 const int s = lane + 32 * it;
                 int a[T][8];
                 float d[T], sum[T];
@@ -869,6 +884,18 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
 #pragma unroll
                     for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
                 }
+            };
+            // Same loop forms as the vector kernel: the static K makes `slices` a compile-time
+            // constant (precomputed activation base addresses); T=1 fully unrolls, the rest take
+            // one small loop body.
+            static_assert(KS == 0 || KS % 32 == 0);
+            if constexpr (KS != 0 && T == 1) {
+#pragma unroll
+                for (int it = 0; it < slices / 32 + 1; ++it) {
+                    if (lane + 32 * it < slices) { slice(it); }
+                }
+            } else {
+                for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
             }
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
@@ -913,29 +940,39 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
     }
 }
 
-template <ggml_type type, int T, bool Fused>
+template <ggml_type type, int T, bool Fused, int KS = 0>
 void moe_launch_chunk(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
     const int per_block = kVecWarps * (Fused ? 1 : 2);
     const int groups    = (args.rows + per_block - 1) / per_block;
-    moe_kernel<type, T, Fused><<<dim3(groups, max_active, 1), kVecWarps * 32, 0, stream>>>(args);
+    moe_kernel<type, T, Fused, KS><<<dim3(groups, max_active, 1), kVecWarps * 32, 0, stream>>>(args);
     check(cudaGetLastError(), "moe product launch");
 }
 
-template <ggml_type type, bool Fused>
+template <ggml_type type, bool Fused, int KS = 0>
 void moe_launch_fused(const MoeVecArgs& args, int max_active, int chunk, cudaStream_t stream) {
     switch (chunk) {
     case 1:
-        return moe_launch_chunk<type, 1, Fused>(args, max_active, stream);
+        return moe_launch_chunk<type, 1, Fused, KS>(args, max_active, stream);
     case 2:
-        return moe_launch_chunk<type, 2, Fused>(args, max_active, stream);
+        return moe_launch_chunk<type, 2, Fused, KS>(args, max_active, stream);
     case 4:
-        return moe_launch_chunk<type, 4, Fused>(args, max_active, stream);
+        return moe_launch_chunk<type, 4, Fused, KS>(args, max_active, stream);
     case 8:
-        return moe_launch_chunk<type, 8, Fused>(args, max_active, stream);
+        return moe_launch_chunk<type, 8, Fused, KS>(args, max_active, stream);
     default:
         break;
     }
     throw std::invalid_argument("gguf moe product: chunk must be 1, 2, 4 or 8");
+}
+
+template <ggml_type type, int KS>
+void moe_launch_k(const MoeVecArgs& args, int max_active, int chunk, bool fused,
+                  cudaStream_t stream) {
+    if (fused) {
+        moe_launch_fused<type, true, KS>(args, max_active, chunk, stream);
+    } else {
+        moe_launch_fused<type, false, KS>(args, max_active, chunk, stream);
+    }
 }
 
 // --- The MoE of one decode or verification call in few launches --------------------------------
@@ -1688,11 +1725,17 @@ void moe_launch(const MoeVecArgs& args, int max_active, int chunk, bool fused,
         max_active <= 0 || max_active > 65535) {
         throw std::invalid_argument("gguf moe product: unsupported geometry");
     }
-    if (fused) {
-        vec::moe_launch_fused<type, true>(args, max_active, chunk, stream);
-    } else {
-        vec::moe_launch_fused<type, false>(args, max_active, chunk, stream);
+    if constexpr (kMoeStaticK<type>) {
+        switch (args.k) {
+        case 704:
+            return vec::moe_launch_k<type, 704>(args, max_active, chunk, fused, stream);
+        case 2816:
+            return vec::moe_launch_k<type, 2816>(args, max_active, chunk, fused, stream);
+        default:
+            break;
+        }
     }
+    vec::moe_launch_k<type, 0>(args, max_active, chunk, fused, stream);
 }
 
 template <ggml_type type>

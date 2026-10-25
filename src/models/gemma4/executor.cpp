@@ -890,7 +890,14 @@ struct Executor::Impl {
         auto* middle = static_cast<__nv_bfloat16*>(
             workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
         if (t <= gguf::kMaxVectorColumns) {
-            const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
+            // Pair columns per c0 pass. The c0 loop iterates the pairs of one expert in chunks of
+            // T; an expert with fewer than T pairs pads the rest and wastes the dots. An active
+            // expert serves about pairs / min(pairs, e) pairs on average, so take the chunk as that
+            // rounded up to a power of two (T=1 when the routing is sparse, as in the 26B A4B
+            // decode: 24 pairs over 128 experts).
+            const int per_expert = pairs / std::min(pairs, e);
+            int chunk            = 1;
+            while (chunk < per_expert && chunk < 8) chunk <<= 1;
             void* act = xq != nullptr ? xq->base : nullptr;
             if (act == nullptr) {
                 act = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;

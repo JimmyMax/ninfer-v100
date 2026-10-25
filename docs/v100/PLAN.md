@@ -484,17 +484,47 @@ kFull/tail 分裂循环（132 µs）比简单循环慢；T=1 全展开（96.3 µ
 | oracle（`ninfer_linear_gguf_test`） | — | 全绿 | — |
 | Gemma 4 kernels / KV tests | — | 全绿 | — |
 
-26B MoE 结构上不受影响（hidden 2816，vec 全在运行时路径）。serve 二进制已重链，
-`ninfer-gemma4-31b` 容器已用新二进制重启。
+### S3 进展（26B MoE 覆盖，2026-10-25）
+
+26B decode 的 kernel 分解（nvprof，2048 prompt，200 token，MTP-2）：GGUF 反量化 GEMM 族
+占 ~74%，其中 `vec::moe_kernel`（路由专家）37% 与 `vec::kernel`（稠密 + 共享专家）37%。
+26B 的 K 集合 {2816, 4096, 2112, 704} 此前全在运行时路径（5376 静态列表只覆盖 31B/27B）。
+
+改动（同文件 + `src/models/gemma4/executor.cpp`）：
+
+* 静态 dispatch 加入 K=704/2112/2816/4096；Q5_0、Q8_0 加入 `kVecStaticK`
+  （微基准：Q8_0 K=2816 T=3 +5.7%，Q4_K K=2816 T=4 +7.5%）。
+* `moe_kernel` 加同一 constexpr K 机制（K=704/2816，Q4_K/Q5_0/Q8_0）。
+* MoE chunk 规则：原按 t 取 1/2/4/8；改为按 pairs/active-experts 期望值取最小 2 的幂。
+  26B decode（24 pairs / 128 专家）从 T=4 降为 T=1——原 T=4 对每专家 ~1.9 对的一半列
+  是纯填充浪费。单项贡献 +4.7%（隔离测量：constexpr K +1.6%，chunk +4.7%）。
+* T=1 的静态 K 只对 K=5376 生效：全展开形式在 26B 形状实测变慢（Q4_K K=4096 +5.6%、
+  Q5_0 K=2816 +8.7%），其余 T=1 保持运行时形式。
+
+验收（V100-32GB，2026-10-25，int8 KV，chunk 2048，`tg128`）：
+
+| 配置 | 基线 | 落地后 | 变化 |
+|---|---|---|---|
+| 26B no-spec | 128.17 tok/s | 127.79 tok/s | −0.3%（MoE T=1 静态的代价） |
+| 26B MTP-1 | 190.67 tok/s | 192.78 tok/s | +1.1% |
+| 26B MTP-2（主配置） | 216.24 tok/s | 229.91 tok/s | **+6.3%** |
+| 26B `pp2048` | 2502 tok/s | 2500 tok/s | 不变 |
+| 31B `tg128`（MTP-4） | 98.44 tok/s | 98.31 tok/s | 不变（31B 无 {704,2112,2816,4096} 形状，结构不受影响） |
+| 31B `tg128` no-spec | 29.09 tok/s | 29.06 tok/s | 不变 |
+| oracle（linear GGUF + MoE GeGLU） | — | 全绿 | — |
+
+serve 二进制已重链；`ninfer-gemma4-31b` 容器结构上等价（31B 路径不变）。
 
 剩余：Q6_K 的散 2B 块解码（占 31B vec 时间 22%）尚无可行加速——smem 暂存、j-chunk、
 权重/激活预取全部实测为负（寄存器墙：per-it 权重 512 B = 128 寄存器，96 寄存器基线
 已在 5 block/SM 边界）。Q4_K 距 DRAM 上限 65%，剩余差距为 DRAM 延迟；进一步需要
 布局级 prepack（31B 在本卡 VRAM 预算下不可行）或 block 解码重构。
 
-### S4 MoE 专家投影的 Volta 路径 ☐
+### S4 MoE 专家投影的 Volta 路径 ☐（部分：constexpr K 与 chunk 规则已并入 S3）
 
-Gemma 4 是 128 专家 × 8/token、专家宽度 704，A4B 的算力几乎全在专家上。
+Gemma 4 是 128 专家 × 8/token、专家宽度 704，A4B 的算力几乎全在专家上。S3 已把路由
+专家核（`vec::moe_kernel`）纳入 constexpr K 并把 chunk 从按 t 改为按 pairs/专家取最小
+2 的幂（26B decode T=4→T=1，单项 +4.7%）。剩余的是专家权重本身的块解码结构与布局。
 
 * 借鉴 fork：`437e9f98`（按 route 选流水线深度、按工作量定 grid）、
   `7f14d963`（MoE down 尾部预热下一层投影的 L2）、`ce954918`（共享专家 down 权重预取）。
