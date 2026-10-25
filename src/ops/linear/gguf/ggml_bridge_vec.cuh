@@ -28,6 +28,9 @@ inline constexpr bool kVecStaticK =
     type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS ||
     type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K;
 
+// Q6_K stays out: its scattered 2B scale reads dominate, and constexpr K only bought
+// 1.5% at K=2816 T=3 (vs 13% for Q4_K K=5376) while regressing at K=5376 T=5.
+
 // The routed-expert kernels of the 26B Gemma 4 MoE (gate/up K=2816, down K=704).
 template <ggml_type type>
 inline constexpr bool kMoeStaticK =
@@ -768,12 +771,15 @@ void launch_k(const VecArgs& args, cudaStream_t stream) {
     } else if constexpr (kVecStaticK<type>) {
         switch (args.k) {
         case 704:   return launch<type, T, Fused, 704>(args, stream);
+        case 1024:  return launch<type, T, Fused, 1024>(args, stream);
         case 2112:  return launch<type, T, Fused, 2112>(args, stream);
         case 2816:  return launch<type, T, Fused, 2816>(args, stream);
         case 4096:  return launch<type, T, Fused, 4096>(args, stream);
         case 5120:  return launch<type, T, Fused, 5120>(args, stream);
         case 5376:  return launch<type, T, Fused, 5376>(args, stream);
+        case 5632:  return launch<type, T, Fused, 5632>(args, stream);
         case 6144:  return launch<type, T, Fused, 6144>(args, stream);
+        case 8192:  return launch<type, T, Fused, 8192>(args, stream);
         case 10240: return launch<type, T, Fused, 10240>(args, stream);
         case 17408: return launch<type, T, Fused, 17408>(args, stream);
         default: break;
