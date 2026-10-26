@@ -128,10 +128,17 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
         take(weights.mtp->input_projection);
         ffn(weights.mtp->layer);
     }
-    // 本仓库 V100 增量：proposal 头就是 MTP/DFlash 的输出头（同一个参数，load.cpp 把它赋给
-    // mtp->output_head / draft->output_head）。GGUF 27B 制品里它是 Q6_K（131072x5120），每轮
-    // 一次，是 MTP 解码里最大的一笔 Q6_K 读取。
-    if (weights.proposal) { take(weights.proposal->head); }
+    // 本仓库 V100 增量：GGUF 制品的 proposal 头（MTP/DFlash 的输出头）是 Q6_K（131072x5120），
+    // 每轮一次，是 MTP 解码里最大的一笔 Q6_K 读取——把它纳入 projections 名单让它走密集重排。
+    // 只在格式确实是 GGUF Q6_K 时纳入：NVFP4 制品的 proposal 头是 Q4_G64，若进名单会被 panel
+    // 重排，而草稿头的消费路径要求 RowSplit，重排后草稿静默失效（接受率归零）。
+    if (weights.proposal) {
+        bool q6k_head = false;
+        for (const auto& part : bindings.at(weights.proposal->head).reference.binding.parts) {
+            q6k_head |= bindings.binder.reader().geometry(part.object).format == QType::GGUF_Q6_K;
+        }
+        if (q6k_head) { take(weights.proposal->head); }
+    }
     // 本仓库 V100 增量（docs/v100/PLAN.md）：输出头（248320x5120 FP8，每轮一次）也纳入——
     // sm_70 上 QPN 读预打包片段序比行主序快 ~1.5x（实测 1.61 ms vs 2.5 ms 一次），master
     // 也是这么做的。词表嵌入虽然同形状，但不在 projections 名单里（它按行 gather），所以
