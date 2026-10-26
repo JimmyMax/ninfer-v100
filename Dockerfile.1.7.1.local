@@ -1,0 +1,20 @@
+# Dockerfile.1.7.1.local — 单镜像双架构：sm_70 (Tesla V100) + sm_89 (RTX 4080 SUPER)
+#
+# 同一个 ninfer-serve 可执行内含两个架构的 cubin（CMAKE_CUDA_ARCHITECTURES="70;89"，
+# CUDA 12.8 工具链），运行时按卡的计算能力选择自己的核。替代 1.7.0(sm_70) 与
+# 1.7.0-sm89 两个镜像。
+#
+#   mkdir -p docker-runtime/1.7.1 && cp /mnt/data/ninfer-build-7089/apps/ninfer-serve docker-runtime/1.7.1/
+#   docker build -f Dockerfile.1.7.1.local -t ninfer:1.7.1 .
+#
+# 基底沿用 1.7.0-sm89（CUDA 12.8 runtime + cublas + ffmpeg + curl），两张卡同主机同驱动，
+# 运行时库相同。
+
+FROM ninfer:1.7.0-sm89
+
+COPY docker-runtime/1.7.1/ninfer-serve /usr/local/bin/ninfer-serve
+RUN chmod +x /usr/local/bin/ninfer-serve
+
+WORKDIR /workspace
+EXPOSE 8000
+CMD ["ninfer-serve", "--help"]
