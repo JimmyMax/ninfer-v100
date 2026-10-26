@@ -13,6 +13,11 @@ ninfer_add_op_test(ninfer_linear_fp8_qpn_prepack_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_qpn_prepack.cpp"
   LIBRARIES ninfer_linear_test_support)
 
+# 本仓库 V100 增量（docs/v100/PLAN.md）：Q6_K 的加载时密集 6-bit 码字流 prepack 的数值 oracle。
+ninfer_add_op_test(ninfer_linear_q6k_dense_prepack_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q6k_dense_prepack.cpp"
+  LIBRARIES ninfer_linear_test_support ninfer_artifact)
+
 ninfer_add_op_test(ninfer_linear_q4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

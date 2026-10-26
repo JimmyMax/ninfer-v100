@@ -3,6 +3,7 @@
 #include "artifact/framing.h"
 #include "artifact/permute_fp8_qpn.h"
 #include "artifact/permute_nvfp4_qpn.h"
+#include "artifact/permute_q6k_dense.h"
 #include "artifact/permute_row_split.h"
 #include "artifact/transcode.h"
 
@@ -147,6 +148,18 @@ void Binder::qpn_prepack_device(ObjectHandle object) {
     demand.qpn_prepack = true;
 }
 
+void Binder::q6k_dense_device(ObjectHandle object) {
+    const auto& tensor = reader_.directory().tensor(object);
+    auto& demand       = demands_.at(object.index);
+    if (!demand.device) {
+        throw ArtifactError(tensor.id + ": the dense Q6_K prepack requires a device placement");
+    }
+    if (!q6k_dense_prepack_supported(reader_.geometry(object))) {
+        throw ArtifactError(tensor.id + ": object cannot take the dense Q6_K prepack");
+    }
+    demand.q6k_dense = true;
+}
+
 void Binder::evict_device(ObjectHandle object, std::uint32_t rank) {
     const auto& tensor = reader_.directory().tensor(object);
     auto& demand       = demands_.at(object.index);
@@ -276,7 +289,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         const auto offset   = align_up(capacity, demand.alignment, "device offset");
         plan.device_objects.push_back({ObjectHandle{index}, offset, bytes, demand.alignment,
                                        demand.transcode, rank, demand.tail, demand.panel,
-                                       demand.qpn_prepack});
+                                       demand.qpn_prepack, demand.q6k_dense});
         capacity = checked_add(checked_add(offset, bytes, "device capacity"), demand.tail,
                                "device capacity");
     };

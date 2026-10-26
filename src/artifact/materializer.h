@@ -37,6 +37,10 @@ struct DevicePlacement {
     // after every upload (Binder::qpn_prepack_device); the device parent then carries
     // QuantLayout::VoltaQpnPrepacked.
     bool qpn_prepack = false;
+    // 本仓库 V100 增量：Set when the GGUF Q6_K object is permuted into the dense per-row 6-bit
+    // value stream after every upload (Binder::q6k_dense_device); the device parent then carries
+    // QuantLayout::VoltaQ6KDense.
+    bool q6k_dense = false;
 };
 
 // Offset inside the one page-locked Host block (Residency::Pinned).

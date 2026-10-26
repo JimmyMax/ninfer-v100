@@ -162,6 +162,10 @@ int main(int argc, char** argv) {
         engine_options.prefill_a8            = options.prefill_a8;
         engine_options.prefill_cublas        = options.prefill_cublas;
         engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
+        engine_options.lm_head_q4                 = options.lm_head_q4;
+        engine_options.lm_head_q6                 = options.lm_head_q6;
+        engine_options.embedding_q4               = options.embedding_q4;
+        engine_options.gdn_state_fp16             = options.gdn_state_fp16;
         engine_options.expert_residency      = options.expert_residency;
         engine_options.expert_cache_bytes    = options.expert_cache_bytes;
 

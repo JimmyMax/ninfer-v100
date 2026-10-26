@@ -2,12 +2,14 @@
 
 #include "artifact/permute_fp8_qpn.h"    // 本仓库 V100 增量：FP8 QPN 加载时重排
 #include "artifact/permute_nvfp4_qpn.h" // 本仓库 V100 增量：NVFP4 QPN 加载时重排
+#include "artifact/permute_q6k_dense.h" // 本仓库 V100 增量：Q6_K 密集 6-bit 码字流加载时重排
 #include "artifact/permute_row_split.h"
 #if defined(NINFER_TIER_VOLTA)
 // 本仓库 V100 增量：加载时预留 GDN 输入投影的 FP16 激活暂存区（图捕获之前）。
 #    include "ops/linear/fp8/fp8_launch.h"
 #endif
 
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -126,6 +128,10 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
         take(weights.mtp->input_projection);
         ffn(weights.mtp->layer);
     }
+    // 本仓库 V100 增量：proposal 头就是 MTP/DFlash 的输出头（同一个参数，load.cpp 把它赋给
+    // mtp->output_head / draft->output_head）。GGUF 27B 制品里它是 Q6_K（131072x5120），每轮
+    // 一次，是 MTP 解码里最大的一笔 Q6_K 读取。
+    if (weights.proposal) { take(weights.proposal->head); }
     // 本仓库 V100 增量（docs/v100/PLAN.md）：输出头（248320x5120 FP8，每轮一次）也纳入——
     // sm_70 上 QPN 读预打包片段序比行主序快 ~1.5x（实测 1.61 ms vs 2.5 ms 一次），master
     // 也是这么做的。词表嵌入虽然同形状，但不在 projections 名单里（它按行 gather），所以
@@ -195,6 +201,15 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
                 only_projections.at(part.object.index) &&
                 artifact::fp8_qpn_prepack_supported(geometry)) {
                 bindings.binder.qpn_prepack_device(part.object);
+            }
+            // 本仓库 V100 增量（docs/v100/PLAN.md）：GGUF Q6_K 的投影在加载时重排成逐行密集 6-bit
+            // 码字流：sm_70 的向量解码内核每个 32 值切片只读 3 个 64-bit 字而不是 16 个 2-byte
+            // 字，27B 形状实测快 17–24%（~550 → ~720 GB/s）。该布局的全部消费路径都支持它：
+            // t ≤ 8 走密集向量解码，t 9–64 交回 8 列分块向量路线（矩阵内核不认该布局），
+            // sm70 反量化与 embedding gather 各有密集分支。MoE 专家与别的角色绑定的对象保持超块序。
+            if (geometry.format == QType::GGUF_Q6_K && only_projections.at(part.object.index) &&
+                artifact::q6k_dense_prepack_supported(geometry)) {
+                bindings.binder.q6k_dense_device(part.object);
             }
         }
     }

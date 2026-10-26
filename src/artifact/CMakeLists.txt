@@ -13,6 +13,8 @@ add_library(ninfer_artifact STATIC
   # 本仓库 V100 增量：NVFP4 的 QPN 片段序（加载时/恢复时原地施加）
   permute_nvfp4_qpn.cu
   permute_fp8_qpn.cu
+  # 本仓库 V100 增量：Q6_K 的逐行密集 6-bit 码字流（Volta 向量内核 64-bit 读取）
+  permute_q6k_dense.cu
   views.cpp
 )
 ninfer_internal_includes(ninfer_artifact)

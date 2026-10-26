@@ -100,6 +100,11 @@ enum class QuantLayout : std::uint16_t {
     // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 权重在加载时被就地重排成 Volta QPN2 片段顺序
     // （nvfp4_prepack_sm70.cu）。载荷大小不变，从不存入 `.ninfer`。
     VoltaQpnPrepacked = 7,
+    // 本仓库 V100 增量：GGUF Q6_K 的逐行密集 6-bit 码字流。存储的 256 元素超块被原地重排为
+    // [192*nblk 码字字节][k/16 个 int8 切片尺度][2*nblk 个 half d]：元素 e 在位 6e，尺度对 s 在
+    // 3k/4 + 2s，块 d 在 3k/4 + k/16 + 2b。载荷大小不变（210 B/超块），从不存入 `.ninfer`，由
+    // 加载时的 permute_q6k_to_dense 生成，让向量内核用 64-bit 读取代替 16 个 2-byte 读取。
+    VoltaQ6KDense = 8,
 };
 
 // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the
@@ -119,6 +124,12 @@ static_assert((1 << kRowSplitPanelShift) == kRowSplitPanelRows,
 [[nodiscard]] constexpr bool is_volta_qpn_prepacked_fp8(QType format,
                                                         QuantLayout layout) noexcept {
     return layout == QuantLayout::VoltaQpnPrepacked && format == QType::FP8_E4M3FN_ROW_BF16;
+}
+
+// 本仓库 V100 增量：加载期置换生成的设备端密集 Q6_K 布局（permute_q6k_to_dense），只与
+// GgufBlocks 的 Q6_K 几何互换，从不存入 `.ninfer`。
+[[nodiscard]] constexpr bool is_volta_q6k_dense(QType format, QuantLayout layout) noexcept {
+    return format == QType::GGUF_Q6_K && layout == QuantLayout::VoltaQ6KDense;
 }
 
 [[nodiscard]] constexpr bool is_volta_qpn_prepacked_nvfp4(QType format,

@@ -86,9 +86,11 @@ struct VectorOutput {
 
 // out[r, c] <- epilogue(sum_k W[r, k] x[k, c]) for rows [0, rows) and columns [0, columns),
 // columns <= kMaxVectorColumns. `weight` points at row 0; rows are `row_bytes` apart.
+// 本仓库 V100 增量：`dense` selects the Q6_K dense per-row layout (QuantLayout::VoltaQ6KDense);
+// it is valid for Q6_K only and must match the weight's stored layout.
 void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, const VectorOutput& out,
-                    cudaStream_t stream);
+                    cudaStream_t stream, bool dense = false);
 
 // out[r, c] = act(gate_r . x_c) * (up_r . x_c) where gate row r and up row r are rows r and
 // rows + r of one parent of this type.
@@ -320,16 +322,17 @@ void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k
                                     void* out, cudaStream_t stream);
 
 // out[i, :] = dequantize(W[row_ids ? row_ids[i] : i, :]) as BF16, rows `out_row_stride` apart.
+// 本仓库 V100 增量：`dense` selects the Q6_K dense per-row layout (QuantLayout::VoltaQ6KDense).
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __nv_bfloat16* out,
-                     std::int64_t out_row_stride, cudaStream_t stream);
+                     std::int64_t out_row_stride, cudaStream_t stream, bool dense = false);
 // The same rows in FP32, where every value is exact.
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, float* out,
-                     std::int64_t out_row_stride, cudaStream_t stream);
+                     std::int64_t out_row_stride, cudaStream_t stream, bool dense = false);
 // The same rows in FP16, the operand type of sm_70's tensor cores (ops/linear/sm70).
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __half* out,
-                     std::int64_t out_row_stride, cudaStream_t stream);
+                     std::int64_t out_row_stride, cudaStream_t stream, bool dense = false);
 
 } // namespace ninfer::ops::gguf

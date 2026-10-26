@@ -520,6 +520,107 @@ serve 二进制已重链；`ninfer-gemma4-31b` 容器结构上等价（31B 路�
 已在 5 block/SM 边界）。Q4_K 距 DRAM 上限 65%，剩余差距为 DRAM 延迟；进一步需要
 布局级 prepack（31B 在本卡 VRAM 预算下不可行）或 block 解码重构。
 
+### S3 进展（26B prefill MoE matmul 定位，2026-10-25）
+
+26B prefill 的 kernel 分解（nvprof，2048 chunk）：`moe_mul_mat_q`（路由专家 DP4A 矩阵核）
+**55%**（438 ms/遍）、`flash_attn_ext_f16` 24%（190 ms）、`cutlass::Kernel2`（dense FP16 GEMM）
+11%（88 ms）。MoE 矩阵核是 26B prefill 的单一大项。
+
+实测（微基准，128 专家 × 1408×128，K=2816，uniform routing）：
+- `moe_matrix_product`（DP4A INT8）：gate_up **10.3 TOPS**、down（Q8_0）8.1 TOPS。
+- 同形状 dense `matrix_product`：12.8 TOPS。MoE 相对 dense 只多 ~19% 开销 ⇒ 瓶颈在
+  底层 DP4A mmq 核本身（~17–21% of the ~60 TOPS DP4A 峰值），不是 MoE 路由间接。
+
+**关键发现——Volta 无原生 BF16 tensor core**（cuBLAS GEMM 实测，V100-32GB）：
+
+| cuBLAS GEMM | 2048² 方形 | MoE gate_up 形状 | MoE down 形状 |
+|---|---|---|---|
+| **FP16**（`sm70_project` 用的） | 64.1 TFLOPS | 60.2 TFLOPS | 49.0 TFLOPS |
+| **BF16**（`dequantized_product` 用的） | 8.8 TFLOPS | 9.3 TFLOPS | 9.0 TFLOPS |
+
+即 **dense prefill 早已走 `sm70_project`（BF16 激活→FP16 + 权重 slab 反量化→FP16 + cuBLAS
+FP16，60+ TFLOPS），而 MoE prefill 仍卡在 DP4A mmq（10–13 TOPS）**——这是不对称的根源。
+BF16 cuBLAS 在 Volta 只 ~9 TFLOPS（无原生 BF16），是错误方向；FP16 才快。
+
+**MoE FP16 路径（可行，~1.8× MoE matmul ⇒ ~20–30% 26B prefill）**：
+每层每专家：激活按路由 gather 到 FP16（padding 到 max pairs/专家）、专家权重反量化到 FP16
+（复用 `dequantize_rows`）、cuBLAS FP16 GEMM（复用 `sm70::gemm`，per-expert 或 strided-batch）。
+- 反量化流量是下界：gate_up 1.3 GB/遍（286 MB packed 读 + 1.01 GB FP16 写 + GEMM 读）
+  ≈ 1.5 ms@875 GB/s + GEMM 2.16 ms ≈ 3.7 ms/专家矩阵（vs 当前 6.27 ms）。
+- **加载期全量 FP16 常驻不可行**：26B MoE 专家 Q4_K ~14 GB → FP16 ~28 GB，+KV 超 32 GB 预算；
+  必须按层运行时反量化（峰值 +~1.7 GB workspace）。
+- 需激活 FP16 scatter（路由间接，新核）+ 数值验证（oracle）+ executor 接线。
+
+验收目标：`pp2048` 26B 2500 → ~3000–3250 tok/s（+20–30%）。预估 3–5 天。只影响 26B
+（MoE）；31B dense prefill 已在快路径上，不受影响。
+
+### S3 进展（27B Q4_K_M 制品优化路径，2026-10-25）
+
+目标制品：`Swift-1.5-Qwen3.8-27B-Q4_K_M-ninfer-v3.ninfer`（16.95 GiB，Qwen3_5ForCausalLM，
+hidden 5120、64 层、vocab 248320）。文本 decode GEMM 的格式分布：Q4_K 10.66 GiB（~64%）、
+**Q6_K 4.35 GiB（~26%）**、Q8_0 1.30 GiB（~8%）、Q4_0 0.22、Q5_K 0.11 GiB。Q6_K 的 70 个对象
+全部是 K ∈ {5120, 6144, 17408} 的投影/头部（GDN 输入/输出投影、MLP gate/up/down、文本输出头、
+MTP gate、proposal 头），27B 是 dense 模型，MoE 专家里没有 Q6_K。
+
+**P0 基线**（V100-32GB，int8 KV，chunk 2048，tg128）：no-spec `tg128=35.09`、
+`pp2048=875.3`；MTP-3（rk8v4 KV）**54.13** 最佳（MTP-2 52.43、MTP-4 49.45、MTP-5 41.55）。
+
+**P1 零代码调参 A/B**：rk8v4 KV **+4.1%**（MTP 接受率提升，定为正式配置）；gdn-state-fp16
+−3.9%（回退）；prefill 1024 chunk、adaptive-5、ngram-16 均中性或更差。`--lm-head-q4` 在 Q8_G32
+头要求之外，不适用本制品。
+
+**nvprof decode 分解（MTP-3）**：vec 家族 ~85% GPU 时间（Q4_K ~44%、**Q6_K ~33%**、
+Q8_0 ~8%），GDN ~7%，attention ~2.4%。Q4_K T=1 已在 800 GB/s（~91% 峰值）；Q6_K 停在
+541–552 GB/s（T=1）、469–476（T=4）——与 Q4_K 的 30% 差距就是 27B 的剩余杠杆。
+
+**constexpr-K 已穷尽（全部负结果/中性，不改）**：
+- T=1 静态 K（全展开与简单循环两种形态，编译器产出相同代码）在 27B 形状全部回退
+  （q4_k K=5120 +11%、q8_0 K=5120 +37%……）——死路。
+- Q6_K 加入 constexpr-K（T=4）：±0.1% 中性；Q5_K 同理（且只有 0.11 GiB）。
+- 结论：27B 没有剩余的 constexpr-K 杠杆，vec 核的差距在 Q6_K 的 2-byte 读取模式上。
+
+**P2：Q6_K 密集 6-bit 码字流 prepack（加载时设备侧重排，尺寸不变）**：
+- 动机：标准超块序每 32 值切片要 16 个 2-byte 读取（ql 4-bit 低半 + qh 2-bit 高半）；sm_70 的
+  vec 核是延迟受限（long_scoreboard 54%），这正是 Q6_K ~550 vs Q4_K ~800 GB/s 的来源。
+- 布局：行 = [3k/4 字节码字流，元素 e 在位 6e][k/16 个 int8 切片尺度][2k/128 个 half d]；
+  32 值切片 = 24 B = 3 个 64-bit 字（码字 10 跨 W0/W1、21 跨 W1/W2）；总尺寸 210 B/超块不变。
+- 判定门（原型生产 harness A/B，N=40960 行，全部逐位一致）：
+
+| 形状 | std | dense | Δ |
+|---|---|---|---|
+| K=5120 T=1 | 313.7 µs（548 GB/s） | 239.3 µs（719） | **−23.7%** |
+| K=6144 T=1 | 381.7 µs（541） | 302.1 µs（683） | −20.9% |
+| K=17408 T=1 | 1060.1 µs（552） | 815.3 µs（717） | −23.1% |
+| K=5120 T=4 | 365.7 µs（470） | 288.2 µs（597） | −21.2% |
+| K=6144 T=4 | 439.5 µs（470） | 365.5 µs（565） | −16.8% |
+| K=17408 T=4 | 1229.5 µs（476） | 931.4 µs（628） | −24.2% |
+
+  17–24% > 10% 门 → 通过，全量实施。
+- 实现（Option B：与 `VoltaQpnPrepacked` 同一模式，不改编制格式、不改转换器）：
+  `QuantLayout::VoltaQ6KDense`（设备端专用）+ `permute_q6k_to_dense`（加载时每次上传后原地
+  重排，scratch + D2D 拷贝，与 QPN 同位置）+ binder `q6k_dense_device` + materializer 布局标记
+  + `storage_trades.cpp` 的 Volta 门禁选择（只选非专家投影 + 文本输出头 + proposal 头；
+  k%1024==0 才支持）+ vec 密集解码核（t≤8）、8 列分块向量路线（t 9–64，矩阵核不认该布局）、
+  sm70 反量化密集分支（t≥65 与 embedding gather）。Q6_K 是偏置 32 编码（值 = 码字 − 32），
+  密集解码用同一符号技巧，逐位一致。
+- 制品特性：27B 的 17 层 MLP 是 gate=Q4_K、up=Q6_K 混合格式（没有一层两者都是 Q6_K），
+  分开 gate/up 的两个产品各自独立分发，swiglu 不要求两者同布局（融合的 `[gate; up]` 父矩阵
+  保持存储布局、不预打包）。
+- 预言（按 nvprof 占比推算）：no-spec +5.9%（35.09 → ~37.2）、MTP-3 +4–5%；prefill 不变
+  （t≥65 走反量化 + cuBLAS，反量化流量不变）。
+
+**P2 结果（V100-32GB，int8 KV，chunk 2048，tg128，-r 3）**：
+
+| 配置 | dense 关 | dense 开 | Δ |
+|---|---|---|---|
+| no-spec tg128 | 35.09 | **38.14** | **+8.7%** |
+| MTP-3 tg128（rk8v4） | 54.14 | **57.16** | **+5.6%**（接受率 183/3 两臂相同） |
+| pp2048 | 875.65 | 875.70 | 不变 |
+
+nvprof decode 分解证实：Q6_K vec 核 1810 → 1349 µs/轮（−25.5%），Q4_K 与其它所有核不变，
+decode GPU 总时间 −6.7%。oracle：t≤8 / t=129 / dequantize / embedding 逐位一致，t 9–64 两臂
+对独立 FP64 参考 ≤ 0.56%（Q8_1 激活量化差，在仓库 2% 预算内）。
+
 ### S4 MoE 专家投影的 Volta 路径 ☐（部分：constexpr K 与 chunk 规则已并入 S3）
 
 Gemma 4 是 128 专家 × 8/token、专家宽度 704，A4B 的算力几乎全在专家上。S3 已把路由

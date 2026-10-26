@@ -3,6 +3,7 @@
 #include "artifact/framing.h"
 #include "artifact/permute_fp8_qpn.h"
 #include "artifact/permute_nvfp4_qpn.h"
+#include "artifact/permute_q6k_dense.h"
 #include "artifact/permute_row_split.h"
 #include "artifact/transcode.h"
 #include "artifact/reader.h"
@@ -338,6 +339,16 @@ UploadTotals upload_device_objects(const Reader& reader,
         }
         permuted_rank[placement.rank] = true;
     }
+    // 本仓库 V100 增量（docs/v100/PLAN.md）：Q6_K 的密集 6-bit 码字流同样在每次上传之后原地施加，
+    // 所以模型挂起后重新上传不会退回 artifact 的超块序。
+    for (const auto& placement : placements) {
+        if (!placement.q6k_dense) { continue; }
+        const ScopedRank bound(device, placement.rank);
+        const WeightGeometry geometry = placement_geometry(reader, placement);
+        std::byte* const base         = bases[placement.rank] + placement.offset;
+        permute_q6k_to_dense(geometry, base, nullptr);
+        permuted_rank[placement.rank] = true;
+    }
     for (std::size_t rank = 0; rank < permuted_rank.size(); ++rank) {
         if (!permuted_rank[rank]) { continue; }
         const ScopedRank bound(device, rank);
@@ -530,6 +541,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 throw ArtifactError("a QPN prepack placement names an object without the layout");
             }
             geometry.layout = QuantLayout::VoltaQpnPrepacked;
+        }
+        if (placement.q6k_dense) {
+            // 本仓库 V100 增量：密集 Q6_K 要求 GgufBlocks 的 Q6_K 几何（尺寸不变的逐行重排）。
+            if (!q6k_dense_prepack_supported(geometry)) {
+                throw ArtifactError("a dense Q6_K placement names an object without the layout");
+            }
+            geometry.layout = QuantLayout::VoltaQ6KDense;
         }
         auto& object = out.objects_.at(placement.object.index);
         if (placement.rank >= rank_count) {

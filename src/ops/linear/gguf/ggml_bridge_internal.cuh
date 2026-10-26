@@ -118,6 +118,12 @@ template <ggml_type type, typename dst_t>
 void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const std::int32_t* row_ids,
                       int rows, dst_t* out, std::int64_t out_row_stride, cudaStream_t stream);
 
+// 本仓库 V100 增量：Q6_K 密集逐行布局的同形 slice 反量化（只有 Q6_K，QType 由布局判定）。
+template <typename dst_t>
+void slice_dequantize_q6k_dense(const void* weight, std::int64_t row_bytes, int k,
+                                const std::int32_t* row_ids, int rows, dst_t* out,
+                                std::int64_t out_row_stride, cudaStream_t stream);
+
 // Byte offset of the scales inside a planar vector activation of `columns` x `k`.
 [[nodiscard]] constexpr std::size_t vec_scales_offset(int k, int columns) {
     return (std::size_t(k) * columns + 15) / 16 * 16;
@@ -125,6 +131,10 @@ void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const s
 
 template <ggml_type type>
 void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t stream);
+
+// 本仓库 V100 增量：Q6_K 密集布局（QuantLayout::VoltaQ6KDense）的向量路线，见 ggml_bridge_vec.cuh。
+template <ggml_type type>
+void vec_launch_dense(const VecArgs& args, int columns, cudaStream_t stream);
 
 // SiLU from correctly rounded operations (ops/common/silu.h): the CPU's GGUF expert products
 // compute the same bits.

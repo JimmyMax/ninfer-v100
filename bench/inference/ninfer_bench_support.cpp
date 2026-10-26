@@ -329,6 +329,9 @@ std::string usage_text(std::string_view program) {
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --no-prefill-a8             full prefill tiles keep their A16 routes\n"
+        << "  --lm-head-q4 | --lm-head-q6   store the output head as Q4 or Q6 while loading\n"
+        << "  --embedding-q4                store the token embedding as Q4 while loading\n"
+        << "  --gdn-state-fp16              keep the GDN recurrent state in FP16\n"
         << "  --prefill-cublas            hand wide prefill GEMMs to cuBLAS (quality trade; wants a "
            "larger --prefill-chunk)\n"
         << "  --no-prefill-cublas-projections  keep attention/GDN input projections off that route\n"
@@ -410,6 +413,14 @@ BenchOptions parse_args(int argc, char** argv) {
             options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
+        } else if (arg == "--lm-head-q4") {
+            options.lm_head_q4 = true;
+        } else if (arg == "--lm-head-q6") {
+            options.lm_head_q6 = true;
+        } else if (arg == "--embedding-q4") {
+            options.embedding_q4 = true;
+        } else if (arg == "--gdn-state-fp16") {
+            options.gdn_state_fp16 = true;
         } else if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
         } else if (arg == "--prefill-cublas") {

@@ -148,12 +148,13 @@ void sm70_project(const Tensor& x, std::span<const GgufProduct> products, Worksp
             found = activations.end() - 1;
         }
         const auto type         = gguf_type(w.qtype);
+        const bool dense        = is_volta_q6k_dense(w.qtype, w.layout);
         const bool direct       = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
         const std::int32_t slab = detail::sm70::slab_rows(w.n, k);
         for (std::int32_t first = 0; first < w.n; first += slab) {
             const std::int32_t count = std::min(slab, w.n - first);
             gguf::dequantize_rows(type, static_cast<const char*>(w.qdata) + first * row_bytes(w),
-                                  row_bytes(w), k, nullptr, count, weights, k, stream);
+                                  row_bytes(w), k, nullptr, count, weights, k, stream, dense);
             if (direct) {
                 detail::sm70::gemm(weights, count, k, found->data, t, p.f32 + p.row + first,
                                    p.f32_rows, stream);
@@ -197,8 +198,11 @@ gguf::GgmlType gguf_type(QType format) {
 
 void require_gguf(const Weight& w, const char* label) {
     const auto block = gguf_block_shape(w.qtype);
-    if (!is_gguf(w.qtype) || w.layout != QuantLayout::GgufBlocks || w.qdata == nullptr ||
-        w.n <= 0 || w.k <= 0 || w.k % block.elements != 0 || w.k % 32 != 0) {
+    // 本仓库 V100 增量：Q6_K 还接受加载时重排的密集逐行布局（VoltaQ6KDense）。
+    const bool dense = is_volta_q6k_dense(w.qtype, w.layout);
+    if (!is_gguf(w.qtype) ||
+        (w.layout != QuantLayout::GgufBlocks && !dense) ||
+        w.qdata == nullptr || w.n <= 0 || w.k <= 0 || w.k % block.elements != 0 || w.k % 32 != 0) {
         throw std::invalid_argument(std::string(label) +
                                     ": expected a resident GGUF matrix over whole blocks");
     }
@@ -220,7 +224,9 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
             throw std::invalid_argument("gguf workspace: unsupported product geometry");
         }
         const auto type = gguf_type(shape.qtype);
-        if (gguf::has_matrix_kernel(type)) {
+        // 本仓库 V100 增量：Q6_K 可能处于密集布局（没有矩阵核），保守地把两种路线的
+        // 工作区都保留——形状描述不携带布局，无法在这里区分。
+        if (gguf::has_matrix_kernel(type) && type != gguf::GgmlType::Q6_K) {
             const int layout = gguf::matrix_activation_layout(type);
             if (std::find(layouts.begin(), layouts.end(), layout) == layouts.end()) {
                 layouts.push_back(layout);
@@ -294,7 +300,8 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                 found = activations.end() - 1;
             }
             gguf::vector_product(gguf_type(w.qtype), w.qdata, row_bytes(w), w.n, k, found->data,
-                                 t, output(p, 0), stream);
+                                 t, output(p, 0), stream,
+                                 is_volta_q6k_dense(w.qtype, w.layout));
         }
         return;
     }
@@ -309,7 +316,8 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     bool dequantized        = false;
     for (const auto& p : products) {
         plane_rows = std::max(plane_rows, p.weight->n);
-        dequantized |= !matrix_kernel(*p.weight);
+        dequantized |=
+            !matrix_kernel(*p.weight) || is_volta_q6k_dense(p.weight->qtype, p.weight->layout);
     }
     auto* plane = static_cast<float*>(
         workspace.alloc_bytes(std::size_t(plane_rows) * t * sizeof(float)).data);
@@ -325,10 +333,12 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     for (const auto& p : products) {
         const Weight& w  = *p.weight;
         const auto type  = gguf_type(w.qtype);
+        const bool dense  = is_volta_q6k_dense(w.qtype, w.layout);
         const bool direct = p.f32 != nullptr && p.epilogue == GgufEpilogue::Store;
         float* out        = direct ? p.f32 + p.row : plane;
         const std::int64_t stride = direct ? p.f32_rows : w.n;
-        if (gguf::has_matrix_kernel(type)) {
+        // 本仓库 V100 增量：密集布局没有 DP4A 矩阵核，走分块向量路线。
+        if (gguf::has_matrix_kernel(type) && !dense) {
             const int layout = gguf::matrix_activation_layout(type);
             auto found = std::find_if(activations.begin(), activations.end(), [&](const Activation& a) {
                 return a.layout == layout && a.columns == w.input_columns;
@@ -357,10 +367,14 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
                 gguf::quantize_vector_activation(xb + std::int64_t(first) * k, k, columns,
                                                  w.input_columns, vector_activation, stream);
                 gguf::vector_product(type, w.qdata, row_bytes(w), w.n, k, vector_activation,
-                                     columns, output(p, first), stream);
+                                     columns, output(p, first), stream, dense);
             }
             continue;
         } else {
+            if (dense) {
+                throw std::invalid_argument(
+                    "gguf product: dense Q6_K must stay within the chunked vector route");
+            }
             const __nv_bfloat16* source = xb;
             if (w.input_columns != nullptr) {
                 auto* gathered = static_cast<__nv_bfloat16*>(
@@ -405,6 +419,11 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& 
                  gguf::GateActivation activation) {
     require_activation(x, "gguf swiglu");
     require_gguf(gate, "gguf swiglu gate");
+    if (up != nullptr) { require_gguf(*up, "gguf swiglu up"); }
+    // 本仓库 V100 增量：密集布局的 Q6_K 只走独立的非融合路线；[gate; up] 融合父矩阵不选密集布局。
+    if (up == nullptr && is_volta_q6k_dense(gate.qtype, gate.layout)) {
+        throw std::invalid_argument("gguf swiglu: dense Q6_K parents must be non-fused");
+    }
     const std::int32_t t    = x.ne[1];
     const std::int32_t rows = out.ne[0];
     if (out.dtype != DType::BF16 || !out.is_contiguous() || out.ne[1] != t) {
@@ -430,7 +449,6 @@ void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& 
         up_rows.n   = rows;
         up_rows.qdata = static_cast<const std::byte*>(gate.qdata) + std::int64_t(rows) * row_bytes(gate);
     } else {
-        require_gguf(*up, "gguf swiglu up");
         if (gate.n != rows || up->n != rows || up->k != gate.k) {
             throw std::invalid_argument("gguf swiglu: gate and up must both be [N,K]");
         }
@@ -459,7 +477,7 @@ void gguf_embedding(const Weight& table, const Tensor& ids, Tensor& out, cudaStr
     gguf::dequantize_rows(gguf_type(table.qtype), table.qdata, row_bytes(table), table.k,
                           static_cast<const std::int32_t*>(ids.data),
                           static_cast<int>(ids.numel()), static_cast<__nv_bfloat16*>(out.data),
-                          table.k, stream);
+                          table.k, stream, is_volta_q6k_dense(table.qtype, table.layout));
 }
 
 } // namespace ninfer::ops::detail

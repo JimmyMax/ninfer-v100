@@ -72,6 +72,10 @@ struct BenchOptions {
     bool prefill_a8       = true;
     bool prefill_cublas   = false;
     bool prefill_cublas_projections = true;
+    bool lm_head_q4            = false;
+    bool lm_head_q6            = false;
+    bool embedding_q4          = false;
+    bool gdn_state_fp16        = false;
     bool profile_measured = false;
     OutputFormat output   = OutputFormat::Table;
     std::string output_file;
