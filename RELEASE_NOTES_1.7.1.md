@@ -35,19 +35,29 @@ Q4_K_M 27B, V100, int8 KV:
 | plain decode (tg128) | 35.1 | **38.1** | **+8.7%** |
 | MTP d3 decode (tg128) | 54.1 | **57.2** | **+5.7%** |
 
-## vs v1.5.0 (NVFP4 27B artifact, greedy, int8 KV, one V100-32GB)
+## vs v1.5.0 (NVFP4 27B artifact, greedy, INT8 group-64 KV, `--max-context 200000`, one V100-32GB)
 
-| scenario | v1.5.0 | v1.7.1 |
-|---|---:|---:|
-| plain decode, short prompt | 33.9 | **34.3** |
-| plain decode, 7K prompt | 32.7 | **33.0** |
-| MTP d3, 7K prompt | 76.0 | **78.8** |
-| MTP d3, 27K prompt | 77.4 | **78.5** |
-| MTP d4, three-prompt | 70.8 | **78.5** |
-| prefill, 27K, chunk 4096 | 965.6 | **982.0** |
+Matched to the v1.5.0 release protocol: `--spec mtp --draft-tokens 4`, 1024 generated
+tokens per run, four prompts of the same content on both builds:
 
-Decode wins at every prompt length, with acceptance at parity. Prefill trails by 0.8–2.7%
-at chunk 2048 and leads at chunk 4096, which v1.5.0 does not benefit from.
+| prompt | tokens | v1.5.0 decode | v1.5.0 round | v1.7.1 decode | v1.7.1 round |
+|---|---:|---:|---:|---:|---:|
+| code | 7,093 | 81.8 | 43.7 ms | 81.7 | **40.4 ms** |
+| code | 30,837 | 75.3 | 46.6 ms | **82.3** | **42.8 ms** |
+| Chinese | 6,365 | 77.7 | 43.9 ms | **86.4** | **40.5 ms** |
+| Chinese | 25,485 | 73.7 | 45.6 ms | **81.0** | **42.4 ms** |
+
+The round time is the drift-free quantity: v1.7.1 is 7–8% faster per round at every
+length, so at equal draft acceptance it decodes faster. On three of the four prompts it
+also takes the acceptance (MTP d4: 57.8–62.2% vs 58.8–63.3%, prompt-dependent trajectory
+drift, both directions) and wins decode by 9–11%; on the 7K code prompt the acceptance
+runs 6.5 pp lower and exactly offsets the round gain (81.7 vs 81.8).
+
+The v1.5.0 release's headline numbers (101.1 @ 7.4K code, 94.8 @ 31.5K code) are
+acceptance-driven and prompt-specific: this same v1.5.0 build gives 81.8 and 75.3 on
+the code prompts above, so the gap to those figures is prompt predictability, not a
+version regression. Prefill: 1.07k tok/s at 7K on both builds; at 27K, 957.7 (v1.7.1)
+vs 965.5 (v1.5.0) at chunk 2048 and 982.0 (v1.7.1) vs 965.6 (v1.5.0) at chunk 4096.
 
 ## Build
 
