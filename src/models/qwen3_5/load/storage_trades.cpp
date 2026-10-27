@@ -104,8 +104,21 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
         }
     };
     const auto dense = [&](const DenseWeights& d) {
-        take(d.gate);
-        take(d.up);
+        // A fused [gate; up] parent (gate and up stored row-contiguously in one object, as the
+        // fused-swiglu recipes do) keeps the stored layout: the dense permute is per-object and
+        // the fused swiglu kernel family reads standard GGUF blocks only, so prepacking the
+        // parent would break that path (gguf swiglu guards it).
+        const auto& gate_parts = bindings.at(d.gate).reference.binding.parts;
+        const auto& up_parts   = bindings.at(d.up).reference.binding.parts;
+        const bool fused_parent =
+            !gate_parts.empty() && !up_parts.empty() &&
+            gate_parts.back().object == up_parts.front().object &&
+            gate_parts.back().end == up_parts.front().begin &&
+            bindings.binder.reader().geometry(gate_parts.back().object).format == QType::GGUF_Q6_K;
+        if (!fused_parent) {
+            take(d.gate);
+            take(d.up);
+        }
         take(d.down);
     };
     const auto ffn = [&](const BlockWeights& block) {
