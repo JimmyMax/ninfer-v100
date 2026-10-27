@@ -260,7 +260,7 @@ void small_project(const Activation& x, const Weight& w, std::span<const Destina
         destinations.size() > kMaxDestinations) {
         throw std::invalid_argument("sm70 small-T: unsupported weight or destinations");
     }
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
     DestinationEpilogue epilogue;
     for (const Destination& d : destinations) { epilogue.set[epilogue.count++] = d; }
     epilogue.factor = row_factor(w);
@@ -295,7 +295,7 @@ void small_swiglu(const Activation& x, const Weight& gate, const Weight* up, Ten
                    !small_shape(*up)))) {
         throw std::invalid_argument("sm70 small-T swiglu: unsupported weights or output");
     }
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
     const std::int32_t up_first   = joined ? rows : 0;
     const std::int32_t gate_limit = joined ? rows : gate.n;
     const std::int32_t up_limit   = joined ? 2 * rows : up_weight.n;

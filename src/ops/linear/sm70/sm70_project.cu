@@ -152,7 +152,7 @@ bool covered_format(QType format, std::int32_t k) {
     // The small-T route's chunks: one T2 G128 group, 64 values of the other formats.
     const std::int32_t chunk = format == QType::T2_G128_FP16 ? 128 : 64;
     if (!dequantizable_format(format) || k % chunk != 0) { return false; }
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：QPN 支持的 FP8 形状由 QPN/CUTLASS 内核拥有全部宽度
     // （与 fork 一致），sm_70 的 SIMT 反量化路线不再认领——否则加载时重排
     // （VoltaQpnPrepacked）的权重会被按行主序误读。
@@ -165,7 +165,7 @@ bool covers(const Weight& w, std::int32_t tokens) {
     if (!enabled() || tokens < 1 || !covered_format(w.qtype, w.k) || !dequantizable(w)) {
         return false;
     }
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：解码宽度上 Q8/Q4 各有专用解码核
     // （q8_rowsplit_gemm_simt / q4_rowsplit_gemv），kernel 级剖析（nsys，同一张 V100）显示
     // 它们比 sm_70 的通用 small_project 快得多：Q8 150 us 对 282 us，并直接决定 MTP 层

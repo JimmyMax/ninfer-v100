@@ -5,7 +5,7 @@
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh"
 #include "ops/kv_cache/plane_types.h"
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
 #    include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
 #endif
 
@@ -20,7 +20,7 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
                          PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                          std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                          Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
     if (current_device_volta()) {
         // Volta's own kernel (small_t_sm70.cuh): the same grid, splits and partial outputs. The
         // tiled kernel is the other tiers'; a build of Volta alone does not compile it.

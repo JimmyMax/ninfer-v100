@@ -1,19 +1,26 @@
 # Dockerfile.1.7.1.local — 单镜像双架构：sm_70 (Tesla V100) + sm_89 (RTX 4080 SUPER)
 #
-# 同一个 ninfer-serve 可执行内含两个架构的 cubin（CMAKE_CUDA_ARCHITECTURES="70;89"，
-# CUDA 12.8 工具链），运行时按卡的计算能力选择自己的核。替代 1.7.0(sm_70) 与
-# 1.7.0-sm89 两个镜像。
+# 一张镜像内含两个单架构 ninfer-serve 二进制，/usr/local/bin/ninfer-serve 是一个调度
+# 脚本，按容器内可见 GPU 的计算能力选择对应二进制（nvidia-smi 在 --gpus 限定的容器里
+# 只能看到分配的卡）。替代 1.7.0(sm_70) 与 1.7.0-sm89 两个镜像。
 #
-#   mkdir -p docker-runtime/1.7.1 && cp /mnt/data/ninfer-build-7089/apps/ninfer-serve docker-runtime/1.7.1/
+# 为什么不是 70;89 双架构合编：合编时少数 int8/splitk 内核单元在 sm_89 ptxas 通道
+# 病理性放大 30-174 倍（单文件最慢 345 分钟，全树 ~10h），而两个单架构增量构建各
+# 几分钟。二进制分发按卡选择，运行时行为与合编完全一致。
+#
+#   mkdir -p docker-runtime/1.7.1
+#   cp /mnt/data/ninfer-build-gemma4/apps/ninfer-serve docker-runtime/1.7.1/ninfer-serve.sm70
+#   cp /mnt/data/ninfer-build-sm89/apps/ninfer-serve   docker-runtime/1.7.1/ninfer-serve.sm89
 #   docker build -f Dockerfile.1.7.1.local -t ninfer:1.7.1 .
 #
-# 基底沿用 1.7.0-sm89（CUDA 12.8 runtime + cublas + ffmpeg + curl），两张卡同主机同驱动，
-# 运行时库相同。
+# 基底沿用 1.7.0-sm89（CUDA 12.8 runtime + cublas + ffmpeg + curl，两张卡同主机同驱动）。
 
 FROM ninfer:1.7.0-sm89
 
+COPY docker-runtime/1.7.1/ninfer-serve.sm70 /opt/ninfer/ninfer-serve.sm70
+COPY docker-runtime/1.7.1/ninfer-serve.sm89 /opt/ninfer/ninfer-serve.sm89
 COPY docker-runtime/1.7.1/ninfer-serve /usr/local/bin/ninfer-serve
-RUN chmod +x /usr/local/bin/ninfer-serve
+RUN chmod +x /opt/ninfer/ninfer-serve.sm70 /opt/ninfer/ninfer-serve.sm89 /usr/local/bin/ninfer-serve
 
 WORKDIR /workspace
 EXPOSE 8000

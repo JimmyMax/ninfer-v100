@@ -9,7 +9,7 @@
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
 #    include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
 #endif
 #include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
@@ -159,7 +159,7 @@ std::int32_t causal_small_t_launch_capacity(CausalAttentionExecutionEnvelope env
 // tier when it routes one.
 template <typename Geometry>
 int i8_partial_ctas_per_sm(std::int32_t tokens, std::int32_t window, KvCacheStorage storage) {
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
     if (current_device_volta()) {
         // Volta's kernel (small_t_sm70.cuh) holds its own count, from its registers and shared
         // memory.
@@ -235,7 +235,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
         CUDA_CHECK(cudaGetLastError());
     };
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
     if (current_device_volta()) {
         // Volta's own kernel (small_t_sm70.cuh): same grid, splits and partial outputs.
         launch(causal_attention_small_t_sm70_bf16_kernel<Geometry, TokenTile, MultiBatch, Masked,

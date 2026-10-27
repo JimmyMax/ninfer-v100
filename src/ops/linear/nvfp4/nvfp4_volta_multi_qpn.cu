@@ -8,7 +8,7 @@
 
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
 #    include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_output.cuh"
 #    include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_output.cuh"
 #    include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"

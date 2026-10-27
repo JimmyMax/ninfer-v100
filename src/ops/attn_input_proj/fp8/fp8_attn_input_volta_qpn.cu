@@ -6,7 +6,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_TIER_VOLTA
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
 
 // The attention projections are where the model's FP8 weights actually live -- two per layer for
 // all 64 layers -- so the quadpair route matters here more than it does in plain Linear. The

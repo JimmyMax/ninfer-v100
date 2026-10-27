@@ -1,7 +1,7 @@
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_volta_sm70.h"
 
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
 #    include <cuda_bf16.h>
 #    include <cuda_fp16.h>
 

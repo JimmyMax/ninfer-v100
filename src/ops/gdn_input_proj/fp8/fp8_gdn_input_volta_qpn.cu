@@ -6,7 +6,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_TIER_VOLTA
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
 
 // See the attention sibling: same kernel, same reason, different epilogue.
 void launch_fp8_gdn_input_volta_qpn(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,

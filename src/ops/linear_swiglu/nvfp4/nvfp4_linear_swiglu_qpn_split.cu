@@ -9,7 +9,7 @@
 
 namespace ninfer::ops::detail {
 
-#ifdef NINFER_TIER_VOLTA
+#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)
 
 namespace {
 constexpr std::int32_t kIntermediate = 17408; // Nvfp4MlpGateUpGeometry::kOutputRows / 2
