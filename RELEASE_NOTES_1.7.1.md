@@ -1,50 +1,65 @@
-# NInfer v1.7.1
+# NInfer V100 v1.7.1
 
-V100 (sm_70) + RTX 4080 SUPER (sm_89) 单镜像双架构发布。一张镜像跑两张卡。
+Prebuilt **Tesla V100 (sm_70)** binary, compiled with CUDA 12.8 on Ubuntu 24.04 (glibc 2.39).
+The V100 runtime hard-requires compute capability 7.0 — other GPUs are rejected at startup.
+The same image also carries an **sm_89** binary (RTX 40 series); a dispatch script in
+`/usr/local/bin/ninfer-serve` selects the right one from the visible GPU's compute
+capability, so one image serves both cards. `NINFER_IMAGE_ARCH=sm70|sm89` overrides the
+choice.
 
-## 镜像
+## NVFP4 MTP acceptance restored
 
-`ninfer:1.7.1` — 内含 `ninfer-serve.sm70` 与 `ninfer-serve.sm89` 两个单架构二进制，
-`/usr/local/bin/ninfer-serve` 调度脚本按容器内可见 GPU 的 compute capability 自动选择
-（7.0 → sm_70，其余 → sm_89，`NINFER_IMAGE_ARCH` 环境变量可强制覆盖）。
+The Q6_K dense-prepack change in this release pulled the proposal head into the Volta
+device-layout list unconditionally. On NVFP4 artifacts the proposal head is Q4_G64, so it
+got panel-prepacked, the draft scores broke, MTP acceptance fell to ~0 (decode dropped to
+~28 tok/s) and DFlash2 failed at startup. The layout pass now takes the proposal head only
+when it is actually Q6_K ([`0311d39`](../../commits/0311d39)).
 
-构建方式变更：v1.7.0 及之前按架构分镜像（`1.7.0` / `1.7.0-sm89`）。`70;89` 双架构合编
-实测不可行——少数 int8/splitk 内核单元在 sm_89 ptxas 通道病理性放大 30-174 倍
-（单文件最慢 345 分钟，全树 ~10 小时）；两个单架构增量构建各几分钟。二进制分发 +
-按卡调度，运行时行为与合编完全一致。
+NVFP4 27B, V100, int8 KV, `--spec mtp --draft-tokens 3`: **65.5 tok/s** (44.2% acceptance)
+after the fix, vs ~28 tok/s before. `--full-draft-head` is no longer needed as a workaround.
 
-## 修复
+## GGUF Q6_K projections prepack into a dense 6-bit stream
 
-- **NVFP4 制品 MTP 接受率归零**（`0311d39`）：Q6_K dense prepack 把 proposal 头
-  无条件纳入 Volta 布局重排名单，NVFP4 制品的 Q4_G64 proposal 头被 panel 重排后
-  草稿全错（decode 28 tok/s，接受率 0），DFlash2 直接启动失败。修复后 NVFP4 27B
-  MTP 恢复 65.5 tok/s（bench tg128，接受率 0.44）。
-- **多架构编译守卫**（`ec1d53a`）：19 个 Volta `.cu` 的 `NINFER_TIER_VOLTA` 守卫
-  在非 Volta 设备编译通道误生效，补 `__CUDA_ARCH__ == 700` 条件。
+Of a Q4_K_M 27B artifact's weights, Q6_K is ~26% and its vec kernel reads 210-byte rows
+that are only 2-byte aligned, which caps the load width at 54–63% of the card's bandwidth.
+The projections (dense and MTP, ~4.35 GiB of a 16.95 GiB artifact) are now repacked at load
+time, device-side and in place, into a same-size dense 6-bit stream the vec kernel reads
+with 64-bit loads ([`bd052b2`](../../commits/bd052b2)). MoE experts keep the standard
+layout; the permute is a no-op for artifacts without Q6_K projections, so NVFP4 and IQ
+artifacts are unaffected.
 
-## 性能（相对 v1.7.0）
+Q4_K_M 27B, V100, int8 KV:
 
-- GGUF Q4_K_M 27B：Q6_K dense prepack，decode +8.7%（35.1 → 38.1 tok/s nospec，
-  MTP-3 54.1 → 57.2）。
-- Gemma 4 26B/31B：constexpr-K 内核分派 + 滑窗 decode attention 重写
-  （`573e460`/`c6e1d73`/`10bac0d`）。
+| mode | 1.7.0 | 1.7.1 | change |
+|---|---:|---:|---:|
+| plain decode (tg128) | 35.1 | **38.1** | **+8.7%** |
+| MTP d3 decode (tg128) | 54.1 | **57.2** | **+5.7%** |
 
-## 与 v1.5.0 全面对比（V100，NVFP4 27B 制品，greedy + int8 KV）
+## vs v1.5.0 (NVFP4 27B artifact, greedy, int8 KV, one V100-32GB)
 
-| 场景 | v1.5.0 | v1.7.1 | 结果 |
-|---|---|---|---|
-| nospec decode 短/7K | 33.9 / 32.7 | 34.3 / 33.0 | 胜 |
-| MTP d3 散文 | 68.8 | 71.5 | 胜 |
-| MTP d4 三 prompt | 70.8 | 78.5 | 胜 +10.9% |
-| MTP d3 7K / 27K | 76.0 / 77.4 | 78.8 / 78.5 | 胜 |
-| prefill 27K chunk4096 | 965.6 | 982.0 | 胜 +1.7% |
+| scenario | v1.5.0 | v1.7.1 |
+|---|---:|---:|
+| plain decode, short prompt | 33.9 | **34.3** |
+| plain decode, 7K prompt | 32.7 | **33.0** |
+| MTP d3, 7K prompt | 76.0 | **78.8** |
+| MTP d3, 27K prompt | 77.4 | **78.5** |
+| MTP d4, three-prompt | 70.8 | **78.5** |
+| prefill, 27K, chunk 4096 | 965.6 | **982.0** |
 
-decode 全场景胜出，接受率持平或更高。prefill 在 chunk 2048 下略负（−0.8~−2.7%），
-chunk 4096 下反超——v1.5.0 对大 chunk 无收益，v1.7.1 有。
+Decode wins at every prompt length, with acceptance at parity. Prefill trails by 0.8–2.7%
+at chunk 2048 and leads at chunk 4096, which v1.5.0 does not benefit from.
 
-## 升级
+## Build
 
-- V100 服务：`image: ninfer:1.7.1`，无需其他改动。
-- 4080 服务：`image: ninfer:1.7.1`（替代 `ninfer:1.7.0-sm89`），无需其他改动。
-- NVFP4 制品 MTP 不再需要 `--full-draft-head` 绕过。
-- 回退：V100 用 `ninfer:1.7.0`，4080 用 `ninfer:1.7.0-sm89`。
+Dual-arch (`70;89`) compilation of this tree is pathologically slow on a few int8/splitk
+units (30–174× on the sm_89 ptxas pass, ~10 h total), so the image is built from two
+single-arch trees and packaged with the dispatcher above. Runtime behavior is identical to
+a dual-arch build. The Volta kernel guards gained an explicit `__CUDA_ARCH__ == 700`
+clause so the tree also compiles cleanly as one unit for several architectures
+([`ec1d53a`](../../commits/ec1d53a)).
+
+## Upgrade
+
+- V100 services: `image: ninfer:1.7.1`, no other changes.
+- NVFP4 artifact MTP: drop `--full-draft-head` if you added it as a workaround.
+- Rollback: `ninfer:1.7.0`.
