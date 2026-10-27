@@ -563,6 +563,32 @@ On the V100, decode after 1,024 and 8,192 tokens is 45.4 and 44.9 tok/s without 
 and 64.3 with MTP 3 (64.2 after 32,768) and 53.4 and 53.1 with DFlash2 5; prompt time is 1.18 s at
 1,024 tokens and 8.3 s at 8,192.
 
+### Against the NVFP4 OrcaRouter artifact, one V100-PCIE-32GB
+
+`ninfer_bench`, INT8 group-64 KV, `--max-context 200000`, prefill chunk 2048, greedy, 3 measured
+repetitions plus one warmup; the same four prompts on both artifacts, tokenized with the
+artifact's own tokenizer and chat template. The NVFP4 artifact is the OrcaRouter
+fine-tune (18.9 GiB of weights); IQ3_S is 11.6 GiB on the device. The bases differ, so this is an
+end-to-end artifact comparison. MTP 4 decodes 1,024 tokens; the no-drafter row decodes
+256. Prefill is the measured prompt rate of the MTP run:
+
+| prompt | tokens | MTP 4, IQ3_S | MTP 4, NVFP4 | no drafter, IQ3_S | no drafter, NVFP4 | prefill, IQ3_S / NVFP4 |
+|---|---:|---:|---:|---:|---:|---:|
+| code | 7,051 | 102.1 (0.84) | **107.3** (0.84) | **41.1** | 33.2 | 975 / **1,089** |
+| code | 30,795 | 97.7 (0.85) | **104.2** (0.86) | **38.0** | 31.1 | 870 / **960** |
+| Chinese | 6,323 | 75.3 (0.55) | **78.2** (0.54) | **41.2** | 33.3 | 959 / **1,070** |
+| Chinese | 25,443 | 72.7 (0.56) | **75.8** (0.55) | **38.7** | 31.6 | 894 / **986** |
+
+NVFP4 decodes 4–7% faster under MTP 4 with acceptance within 1.5 points on every prompt
+(13.4–14.2 ms per verify round against 14.2–15.0), so the gap is per-round format speed,
+not trajectory. Without a drafter IQ3_S decodes 22–24% faster — the 11.6 GiB against 18.9 GiB
+of device weight bytes in the bandwidth-bound round — and NVFP4 prompts 10–12% faster. IQ3_S keeps
+7.2 GiB of VRAM free relative to the NVFP4 artifact.
+
+IQ3_S stores five Q6_K objects, all in its MTP layer; the fused `[gate; up]` parent of the MTP
+MLP keeps its stored layout (the dense prepack's fused-parent exclusion) while the other Q6_K
+projections take the dense layout.
+
 ### Engine and CLI rates
 
 Prompt and decode in tok/s:
