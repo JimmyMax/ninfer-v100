@@ -25,8 +25,16 @@ that are only 2-byte aligned, which caps the load width at 54–63% of the card'
 The projections (dense and MTP, ~4.35 GiB of a 16.95 GiB artifact) are now repacked at load
 time, device-side and in place, into a same-size dense 6-bit stream the vec kernel reads
 with 64-bit loads ([`bd052b2`](../../commits/bd052b2)). MoE experts keep the standard
-layout; the permute is a no-op for artifacts without Q6_K projections, so NVFP4 and IQ
-artifacts are unaffected.
+layout; the permute is a no-op for artifacts without Q6_K projections, so NVFP4 artifacts
+are unaffected. Artifacts whose recipes store a fused `[gate; up]` Q6_K parent (for example
+the IQ3_S 27B, whose MTP layer stores gate and up row-contiguously in one object) keep that
+parent in the stored layout: the fused swiglu kernel family reads standard GGUF blocks only,
+and the dense permute is per-object (`fused parents stay standard` fix below).
+
+A follow-up fix keeps exactly those fused Q6_K parents out of the prepack. Before it, such an
+artifact failed to start on sm_70 with `gguf swiglu: dense Q6_K parents must be non-fused`,
+because the prepack selected the shared parent object and permuted it while the fused swiglu
+route could not read the dense layout.
 
 Q4_K_M 27B, V100, int8 KV:
 
