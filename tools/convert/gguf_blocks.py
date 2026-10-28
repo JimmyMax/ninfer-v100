@@ -31,7 +31,7 @@ from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
 from .methods import AuxiliaryValue, cast_direct, grouped_absmax, import_encoded
 from .official_recipes import Q4, Q5, Q6, Q8
-from .sources.gguf import GGUFFile
+from .sources.gguf import GGUFFile, TYPE_NAMES
 from .sources.logical import EncodedRows, LogicalSource, array_source
 from .ternary import (
     ATTENTION_HEAD_DIM,
@@ -61,7 +61,10 @@ from .ternary import (
 
 MTP_BLOCK = LAYERS
 # The storage the GDN controls may have (gdn_control_source).
-GDN_CONTROL_TYPES = ("BF16", "Q8_0", "F32")
+# The GDN A/B controls may be stored as any ggml block type as well; they dequantise to the
+# Engine's BF16 operand like the Q8_0 and F32 storages (the exporter's quantization error is
+# the source file's, not the importer's).
+GDN_CONTROL_TYPES = ("BF16", "Q8_0", "F32", *sorted({TYPE_NAMES[t] for t in GGUF_FORMATS_BY_TYPE}))
 
 EXPECTED_HEADER = {
     "general.architecture": "qwen35",
@@ -273,7 +276,7 @@ def block_source(
 
 def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
     """A GDN A/B control as its BF16 operand, its value heads in the grouped order: BF16 words
-    as stored, Q8_0 values rounded to BF16, F32 values rounded to BF16."""
+    as stored, any stored ggml block type or F32 values dequantised and rounded to BF16."""
 
     if gguf.info(tensor).type_id == GGML_Q8_0:
         values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
@@ -282,6 +285,13 @@ def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
         )
     if gguf.info(tensor).type_name == "F32":
         values = untile(gguf.read_direct(tensor), 1)
+        return array_source(
+            torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
+        )
+    if gguf.info(tensor).type_id in GGUF_FORMATS_BY_TYPE:
+        # An exporter's quantised control (Q4_K and similar): the ggml block codec dequantises
+        # it, the values reach the operand rounded to BF16, as with the Q8_0 and F32 storages.
+        values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
         return array_source(
             torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
         )

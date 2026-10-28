@@ -10,6 +10,7 @@ from tools.convert import gguf_blocks
 from tools.convert.sources.gguf import GGUFFile, write_gguf
 
 TYPE_Q8_0 = 8
+TYPE_Q4_K = 12
 TYPE_F32 = 0
 
 # ggml-common.h: block values and bytes of every type the importer keeps.
@@ -129,3 +130,77 @@ def test_f32_gdn_controls_round_to_bf16_in_grouped_head_order(tmp_path):
     grouped = [r * 16 + k for k in range(16) for r in range(3)]
     assert values.dtype == torch.bfloat16
     assert torch.equal(values, torch.from_numpy(f32[grouped]).to(torch.bfloat16))
+
+
+def _q4_k_blocks(rows: int, superblocks: int, seed: int) -> np.ndarray:
+    """Q4_K superblocks with controlled codes and scales: d/dmin small halves, 6-bit scale and
+    min codes, 4-bit element codes."""
+
+    generator = np.random.default_rng(seed)
+    blocks = generator.integers(0, 256, size=(rows, superblocks, 144), dtype=np.uint8)
+    d = generator.uniform(0.005, 0.02, size=(rows, superblocks)).astype(np.float16)
+    dmin = generator.uniform(-0.05, 0.05, size=(rows, superblocks)).astype(np.float16)
+    blocks[:, :, 0:2] = d.view(np.uint8).reshape(rows, superblocks, 2)
+    blocks[:, :, 2:4] = dmin.view(np.uint8).reshape(rows, superblocks, 2)
+    # 12 scale bytes: sc 0-3 in the low 6 bits of bytes 0-3, mn 0-3 in the low 6 bits of bytes
+    # 4-7; sc 4-7 and mn 4-7 split their top two bits into the high nibbles of bytes 8-11.
+    sc = generator.integers(0, 64, size=(rows, superblocks, 8))
+    mn = generator.integers(0, 64, size=(rows, superblocks, 8))
+    scale_bytes = np.zeros((rows, superblocks, 12), dtype=np.uint8)
+    scale_bytes[:, :, 0:4] = sc[:, :, 0:4]
+    scale_bytes[:, :, 4:8] = mn[:, :, 0:4]
+    # Bytes 8-11 pack the second scale/min nibble set: low nibble is sc 4-7, the next two bits
+    # are the top of sc 0-3, the high nibble is mn 4-7 and the top two bits of the byte are the
+    # top of mn 0-3, exactly the ggml k4 packing the Engine and gguf-py both unpack.
+    scale_bytes[:, :, 8:12] = (
+        (sc[:, :, 4:8] & 0x0F)
+        | ((sc[:, :, 0:4] >> 2) & 0x30)
+        | ((mn[:, :, 4:8] & 0x0F) << 4)
+        | (((mn[:, :, 0:4] >> 2) & 0x30) << 8)
+    )
+    blocks[:, :, 4:16] = scale_bytes
+    return blocks
+
+
+def _q4_k_values(blocks: np.ndarray) -> np.ndarray:
+    """Independent ggml Q4_K dequantization from the block bytes: value j of subblock m is
+    d * sc[m] * code - dmin * mn[m], with the 6-bit scale/min codes packed as the ggml k4 layout."""
+
+    rows, superblocks = blocks.shape[0], blocks.shape[1]
+    d = blocks[:, :, 0:2].copy().view(np.float16).astype(np.float32).reshape(rows, superblocks)
+    dmin = blocks[:, :, 2:4].copy().view(np.float16).astype(np.float32).reshape(rows, superblocks)
+    s = blocks[:, :, 4:16].copy()
+    sc = np.concatenate(
+        [(s[:, :, 0:4] & 0x3F), ((s[:, :, 8:12] & 0x0F) | ((s[:, :, 0:4] >> 2) & 0x30))], axis=-1
+    ).astype(np.float32)
+    mn = np.concatenate(
+        [(s[:, :, 4:8] & 0x3F), ((s[:, :, 8:12] >> 4) | ((s[:, :, 4:8] >> 2) & 0x30))], axis=-1
+    ).astype(np.float32)
+    # Subblock 2g reads the low nibbles of byte group g (bytes 32g..32g+31), subblock 2g+1 the
+    # high nibbles of the same 32 bytes.
+    qg = blocks[:, :, 16:].copy().reshape(rows, superblocks, 4, 32)
+    codes = np.stack([qg & 0x0F, qg >> 4], axis=-2).reshape(rows, superblocks, 8, 32).astype(
+        np.float32
+    )
+    return (
+        d[:, :, None, None] * sc[:, :, :, None] * codes - dmin[:, :, None, None] * mn[:, :, :, None]
+    ).reshape(rows, -1)
+
+
+def test_q4_k_gdn_controls_dequantize_to_bf16_in_grouped_head_order(tmp_path):
+    # This export's quantiser stored ssm_alpha/ssm_beta as Q4_K superblocks: their values reach
+    # the Engine's BF16 operand through the ggml Q4_K codec, the exporter's tiled value heads
+    # back in the grouped order.
+    heads = gguf_blocks.GDN_VALUE_HEADS
+    blocks = _q4_k_blocks(heads, 1, 7)
+    path = tmp_path / "q4k.gguf"
+    write_gguf(
+        path,
+        {"general.architecture": "qwen35"},
+        [("blk.0.ssm_alpha.weight", (heads, 256), TYPE_Q4_K, blocks.tobytes())],
+    )
+    with GGUFFile(path) as gguf:
+        values = gguf_blocks.gdn_control_source(gguf, "blk.0.ssm_alpha.weight").rows(0, heads)
+    grouped = [r * 16 + k for k in range(16) for r in range(3)]
+    assert values.dtype == torch.bfloat16
+    assert torch.equal(values, torch.from_numpy(_q4_k_values(blocks)[grouped]).to(torch.bfloat16))
