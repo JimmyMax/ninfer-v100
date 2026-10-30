@@ -315,6 +315,17 @@ std::string usage_text(std::string_view program) {
         << "  --expert-residency <device|host|disk>  routed MoE experts on the GPU (default), in "
            "pinned host memory, or in the artifact files\n"
         << "  --expert-cache-mib <N|auto> persistent device expert cache (default: auto)\n"
+        << "  --expert-dma-share <F|auto> host/disk experts: GPU share of cache misses, 0..1 "
+           "(default: 1); below 1 lets the CPU compute the rest\n"
+        << "  --expert-misses <staged|mapped>  how the expert kernels get host experts (default: "
+           "staged)\n"
+        << "  --expert-tail-skip <N>      leave out uncached experts ranked past N (1..9); "
+           "changes results\n"
+        << "  --expert-cpu-threads <N>    CPU workers for the CPU expert share, 1..256 (default: "
+           "automatic)\n"
+        << "  --expert-prefill-buffers <1|2>  device buffers for a long prompt's uncached "
+           "experts (default: 1)\n"
+        << "  --expert-cache-adaptive     replace cold cached experts between calls\n"
         << "  --ngram-table PATH          Qwen3.8-Flash-Next: the n-gram table artifact for a "
            "model published without its table\n"
         << "  --no-ngram-table            Qwen3.8-Flash-Next: run without the n-gram table "
@@ -409,6 +420,53 @@ BenchOptions parse_args(int argc, char** argv) {
                 options.expert_cache_bytes = std::uint64_t(parse_u32(mib, "expert-cache-mib", true))
                                              << 20;
             }
+        } else if (arg == "--expert-dma-share") {
+            const std::string share = value("--expert-dma-share");
+            if (share == "auto") {
+                options.hybrid_experts.dma_share_auto = true;
+            } else {
+                float parsed = 0;
+                const auto [end, error] =
+                    std::from_chars(share.data(), share.data() + share.size(), parsed);
+                if (error != std::errc{} || end != share.data() + share.size() ||
+                    !std::isfinite(parsed) || parsed < 0 || parsed > 1) {
+                    throw std::invalid_argument("--expert-dma-share takes a finite value in 0..1 "
+                                                 "or auto");
+                }
+                options.hybrid_experts.dma_share = parsed;
+            }
+        } else if (arg == "--expert-misses") {
+            const std::string mode = value("--expert-misses");
+            if (mode == "staged") {
+                options.hybrid_experts.mapped_misses = false;
+            } else if (mode == "mapped") {
+                options.hybrid_experts.mapped_misses = true;
+            } else {
+                throw std::invalid_argument("--expert-misses must be staged or mapped");
+            }
+        } else if (arg == "--expert-tail-skip") {
+            const std::uint32_t rank =
+                parse_u32(value("--expert-tail-skip"), "expert-tail-skip", true);
+            if (rank < 1 || rank > 9) {
+                throw std::invalid_argument("--expert-tail-skip takes 1..9");
+            }
+            options.hybrid_experts.tail_skip_rank = rank;
+        } else if (arg == "--expert-cpu-threads") {
+            const std::uint32_t threads =
+                parse_u32(value("--expert-cpu-threads"), "expert-cpu-threads", true);
+            if (threads > 256) {
+                throw std::invalid_argument("--expert-cpu-threads takes 1..256");
+            }
+            options.hybrid_experts.cpu_threads = threads;
+        } else if (arg == "--expert-prefill-buffers") {
+            const std::uint32_t buffers =
+                parse_u32(value("--expert-prefill-buffers"), "expert-prefill-buffers", true);
+            if (buffers < 1 || buffers > 2) {
+                throw std::invalid_argument("--expert-prefill-buffers takes 1 or 2");
+            }
+            options.hybrid_experts.prefill_buffers = buffers;
+        } else if (arg == "--expert-cache-adaptive") {
+            options.hybrid_experts.adaptive_cache = true;
         } else if (arg == "--ngram-table") {
             options.ngram_table.path = value("--ngram-table");
         } else if (arg == "--no-ngram-table") {

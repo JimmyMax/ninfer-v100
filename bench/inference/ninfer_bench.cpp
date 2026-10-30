@@ -169,6 +169,7 @@ int main(int argc, char** argv) {
         engine_options.expert_residency      = options.expert_residency;
         engine_options.expert_cache_bytes    = options.expert_cache_bytes;
         engine_options.ngram_table           = options.ngram_table;
+        engine_options.hybrid_experts        = options.hybrid_experts;
 
         ninfer::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;
