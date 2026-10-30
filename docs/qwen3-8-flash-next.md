@@ -286,6 +286,13 @@ through the OS page cache, which then keeps a 4 KiB page for each row it read; `
 OS page cache, so every row-cache miss reads from the drive; `mmap` copies the rows out
 of a read-only mapping of the file.
 
+A hash slot no corpus trigram trained holds nothing the model learned. The published tables leave
+those slots as uninitialised bytes, so the decoder treats a row as empty when its block scale is
+non-finite or above `1e-3`, the envelope of every trained row (measured over 400,000 rows) and
+contributes zeros for it, which is what a correctly built table stores for a slot nothing reached.
+Without that guard about 0.9% of the rows carry finite scales up to 65504 (values of order 1e6),
+which poison the PLE stack and garble every reply.
+
 `disk` keeps recently read rows in a four-way CLOCK cache. `--ngram-ram-mib` bounds its
 allocation including row tags and CLOCK state, independent of the table's size. The cache is off
 by default; for example, `--ngram-ram-mib 4096` enables a 4 GiB budget. Its empty index and row storage use demand-paged
