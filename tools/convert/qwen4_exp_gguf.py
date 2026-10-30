@@ -325,18 +325,29 @@ def validate_mtp(gguf: GGUFFile, experts: int) -> None:
     embedding and head."""
 
     for key, expected in MTP_HEADER.items():
-        if gguf.kv.get(key) != expected:
-            raise ValueError(f"{gguf.path}: {key} = {gguf.kv.get(key)!r}, expected {expected!r}")
+        value = gguf.kv.get(key)
+        # Older MTP exports omit nextn_shared_target_tensors; the block then always
+        # shares the target embedding and head, i.e. the required value True.
+        if value is None and key == "qwen4exp.nextn_shared_target_tensors":
+            continue
+        if value != expected:
+            raise ValueError(f"{gguf.path}: {key} = {value!r}, expected {expected!r}")
     if gguf.kv.get("qwen4exp.expert_count") != experts:
         raise ValueError(
             f"{gguf.path}: {gguf.kv.get('qwen4exp.expert_count')} experts in the MTP block, the "
             f"mtp component {experts}"
         )
     expected = expected_mtp_tensors(experts)
-    if set(gguf.tensors) != set(expected):
-        missing = sorted(set(expected) - set(gguf.tensors))[:5]
-        extra = sorted(set(gguf.tensors) - set(expected))[:5]
-        raise ValueError(f"{gguf.path}: tensor set mismatch (missing {missing}, extra {extra})")
+    missing = set(expected) - set(gguf.tensors)
+    # Older MTP exports also store the shared embedding and output head in the mtp
+    # block (token_embd.weight / output.weight) instead of referencing the target's;
+    # both encodings are equivalent, so allow them as extras.
+    extra = set(gguf.tensors) - set(expected)
+    if missing or not extra <= {"token_embd.weight", "output.weight"}:
+        raise ValueError(
+            f"{gguf.path}: tensor set mismatch (missing {sorted(missing)[:5]}, "
+            f"extra {sorted(extra)[:5]})"
+        )
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
         if info.shape != shape or not _stored(info, kind):
