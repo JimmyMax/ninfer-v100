@@ -371,6 +371,16 @@ ninfer_add_op_test(ninfer_gguf_expert_cpu_test
 target_include_directories(ninfer_gguf_expert_cpu_test PRIVATE
   "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
 
+# The fast ggml-cpu arithmetic of the CPU experts: its own FP64-oracle qualification and its
+# drift from the exact path.
+ninfer_add_op_test(ninfer_gguf_expert_cpu_ggml_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_expert_cpu_ggml.cpp"
+  LIBRARIES ninfer_ops)
+target_include_directories(ninfer_gguf_expert_cpu_ggml_test PRIVATE
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src"
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/include"
+  "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src/ggml-cpu")
+
 
 # The vendored ggml CUDA headers' two host helpers: the test links them, so a missing definition is
 # a build failure here rather than a Debug-build report from a user (issue #2).

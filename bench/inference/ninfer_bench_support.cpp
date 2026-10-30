@@ -323,6 +323,9 @@ std::string usage_text(std::string_view program) {
            "changes results\n"
         << "  --expert-cpu-threads <N>    CPU workers for the CPU expert share, 1..256 (default: "
            "automatic)\n"
+        << "  --expert-cpu-arithmetic <exact|ggml>  CPU arithmetic for the host experts the CPU "
+           "computes (default: exact, bit for bit with the GPU; ggml: faster, not bit for bit, "
+           "formats ggml-cpu does not cover keep the exact products)\n"
         << "  --expert-prefill-buffers <1|2>  device buffers for a long prompt's uncached "
            "experts (default: 1)\n"
         << "  --expert-cache-adaptive     replace cold cached experts between calls\n"
@@ -458,6 +461,15 @@ BenchOptions parse_args(int argc, char** argv) {
                 throw std::invalid_argument("--expert-cpu-threads takes 1..256");
             }
             options.hybrid_experts.cpu_threads = threads;
+        } else if (arg == "--expert-cpu-arithmetic") {
+            const std::string mode = value("--expert-cpu-arithmetic");
+            if (mode == "exact") {
+                options.hybrid_experts.cpu_ggml = false;
+            } else if (mode == "ggml") {
+                options.hybrid_experts.cpu_ggml = true;
+            } else {
+                throw std::invalid_argument("--expert-cpu-arithmetic must be exact or ggml");
+            }
         } else if (arg == "--expert-prefill-buffers") {
             const std::uint32_t buffers =
                 parse_u32(value("--expert-prefill-buffers"), "expert-prefill-buffers", true);

@@ -111,3 +111,32 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
       COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
   endif()
 endif()
+
+# The CPU experts' fast arithmetic: ggml-cpu's vecdot kernels, vendored as C translation units
+# (llama.cpp a25c9865, MIT), plus the C++ wrapper in the ops directory.
+set(ggml_cpu_dir "${PROJECT_SOURCE_DIR}/third_party/ggml-quants")
+set(ggml_cpu_includes "-I${ggml_cpu_dir}/include;-I${ggml_cpu_dir}/src;-I${ggml_cpu_dir}/src/ggml-cpu")
+if(NOT MSVC)
+  set(ggml_cpu_includes "${ggml_cpu_includes};${gguf_cpu_no_contract}")
+endif()
+target_sources(ninfer_ops PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_ggml.cpp"
+  "${ggml_cpu_dir}/src/ggml-quants.c"
+  "${ggml_cpu_dir}/src/ggml-cpu/quants.c"
+  "${ggml_cpu_dir}/src/ggml-cpu/quants_host.c")
+set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_ggml.cpp"
+  PROPERTIES COMPILE_OPTIONS "${ggml_cpu_includes}")
+set_source_files_properties("${ggml_cpu_dir}/src/ggml-quants.c"
+  "${ggml_cpu_dir}/src/ggml-cpu/quants.c"
+  "${ggml_cpu_dir}/src/ggml-cpu/quants_host.c"
+  PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes}")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  target_sources(ninfer_ops PRIVATE "${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c")
+  if(MSVC)
+    set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
+      PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};/arch:AVX2")
+  else()
+    set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
+      PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};-mavx2;-mfma")
+  endif()
+endif()

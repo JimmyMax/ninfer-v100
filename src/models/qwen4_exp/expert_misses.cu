@@ -2,6 +2,7 @@
 
 #include "core/file_read_error.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
+#include "ops/moe_experts/gguf_expert_cpu_ggml.h"
 
 #include <cuda/atomic>
 #include <cuda_bf16.h>
@@ -530,6 +531,7 @@ struct ExpertMisses::Impl {
         std::vector<std::int32_t> pairs, tokens; // pair index and its token, per column
         std::array<const std::uint8_t*, 3> bytes{};
         ops::GgufCpuActivation input, input_up, middle; // input_up: an up of another format
+        ops::GgmlCpuActivation input_ggml, input_up_ggml, middle_ggml; // the ggml arithmetic's
         std::vector<float> gate, up, down;
         std::vector<std::uint16_t> middle_bf16;
     };
@@ -769,6 +771,16 @@ struct ExpertMisses::Impl {
         const auto& down_p = layer.projections[2];
         // Inputs and outputs per expert; workers then split rows.
         std::vector<std::uint16_t> columns;
+        // Per-projection arithmetic: ggml's vecdot where its kernels cover the stored format,
+        // the exact q8_1 products otherwise (a GSQ-RCO artifact's Q2_0 down stays exact).
+        const auto ggml_layout = [](QType format) {
+            return (format == QType::GGUF_IQ4_NL || format == QType::GGUF_Q8_0)
+                       ? ops::GgmlActLayout::Q8_0
+                       : ops::GgmlActLayout::Q8K;
+        };
+        const bool gate_ggml = options.cpu_ggml && ops::gguf_ggml_supported(gate_p.format);
+        const bool up_ggml   = options.cpu_ggml && ops::gguf_ggml_supported(up_p.format);
+        const bool down_ggml = options.cpu_ggml && ops::gguf_ggml_supported(down_p.format);
         for (auto& job : cpu_experts) {
             const auto n = static_cast<int>(job.tokens.size());
             columns.resize(std::size_t(n) * kHidden);
@@ -777,14 +789,35 @@ struct ExpertMisses::Impl {
                             m + std::size_t(job.tokens[j]) * kHidden, kHidden * 2);
             }
             const int capacity = int(options.token_capacity);
-            if (job.input.k() != kHidden) { job.input = ops::GgufCpuActivation(capacity, kHidden); }
-            if (job.middle.k() != kWidth) { job.middle = ops::GgufCpuActivation(capacity, kWidth); }
-            job.input.prepare_bf16(gate_p.format, columns.data(), kHidden, n);
-            if (up_p.format != gate_p.format) {
-                if (job.input_up.k() != kHidden) {
-                    job.input_up = ops::GgufCpuActivation(capacity, kHidden);
+            if (gate_ggml) {
+                if (job.input_ggml.k() != kHidden) {
+                    job.input_ggml = ops::GgmlCpuActivation(capacity, kHidden);
                 }
-                job.input_up.prepare_bf16(up_p.format, columns.data(), kHidden, n);
+                job.input_ggml.prepare_bf16(ggml_layout(gate_p.format), columns.data(), kHidden, n);
+            } else {
+                if (job.input.k() != kHidden) { job.input = ops::GgufCpuActivation(capacity, kHidden); }
+                job.input.prepare_bf16(gate_p.format, columns.data(), kHidden, n);
+            }
+            if (up_p.format != gate_p.format) {
+                if (up_ggml) {
+                    if (job.input_up_ggml.k() != kHidden) {
+                        job.input_up_ggml = ops::GgmlCpuActivation(capacity, kHidden);
+                    }
+                    job.input_up_ggml.prepare_bf16(ggml_layout(up_p.format), columns.data(),
+                                                  kHidden, n);
+                } else {
+                    if (job.input_up.k() != kHidden) {
+                        job.input_up = ops::GgufCpuActivation(capacity, kHidden);
+                    }
+                    job.input_up.prepare_bf16(up_p.format, columns.data(), kHidden, n);
+                }
+            }
+            if (down_ggml) {
+                if (job.middle_ggml.k() != kWidth) {
+                    job.middle_ggml = ops::GgmlCpuActivation(capacity, kWidth);
+                }
+            } else if (job.middle.k() != kWidth) {
+                job.middle = ops::GgufCpuActivation(capacity, kWidth);
             }
             job.gate.resize(std::size_t(n) * kWidth);
             job.up.resize(std::size_t(n) * kWidth);
@@ -801,8 +834,15 @@ struct ExpertMisses::Impl {
             const int end    = std::min(begin + kRowsPerTask, kWidth);
             const auto& p    = is_up ? up_p : gate_p;
             const ops::GgufCpuMatrix w{p.format, job.bytes[is_up ? 1 : 0], p.row_bytes, p.rows, p.k};
-            const auto& x = is_up && up_p.format != gate_p.format ? job.input_up : job.input;
-            ops::gguf_cpu_rows(w, x, begin, end, (is_up ? job.up : job.gate).data(), kWidth, backend);
+            if (is_up ? up_ggml : gate_ggml) {
+                const auto& xx =
+                    is_up && up_p.format != gate_p.format ? job.input_up_ggml : job.input_ggml;
+                ops::gguf_cpu_rows_ggml(w, xx, begin, end, (is_up ? job.up : job.gate).data(), kWidth);
+            } else {
+                const auto& x = is_up && up_p.format != gate_p.format ? job.input_up : job.input;
+                ops::gguf_cpu_rows(w, x, begin, end, (is_up ? job.up : job.gate).data(), kWidth,
+                                  backend);
+            }
         });
         // The middle in BF16, as the GPU's up kernel stores it before quantizing it.
         for (auto& job : cpu_experts) {
@@ -810,7 +850,12 @@ struct ExpertMisses::Impl {
             job.middle_bf16.resize(job.gate.size());
             ops::gguf_cpu_swiglu_bf16(job.gate.data(), job.up.data(), job.gate.size(),
                                       job.middle_bf16.data(), backend);
-            job.middle.prepare_bf16(down_p.format, job.middle_bf16.data(), kWidth, n);
+            if (down_ggml) {
+                job.middle_ggml.prepare_bf16(ggml_layout(down_p.format), job.middle_bf16.data(),
+                                             kWidth, n);
+            } else {
+                job.middle.prepare_bf16(down_p.format, job.middle_bf16.data(), kWidth, n);
+            }
         }
         const int down_tasks = kHidden / 128;
         pool->run(cpu_experts.size() * std::size_t(down_tasks), [&](std::size_t i) {
@@ -818,7 +863,13 @@ struct ExpertMisses::Impl {
             const int begin = int(i % down_tasks) * 128;
             const ops::GgufCpuMatrix w{down_p.format, job.bytes[2], down_p.row_bytes, down_p.rows,
                                        down_p.k};
-            ops::gguf_cpu_rows(w, job.middle, begin, begin + 128, job.down.data(), kHidden, backend);
+            if (down_ggml) {
+                ops::gguf_cpu_rows_ggml(w, job.middle_ggml, begin, begin + 128, job.down.data(),
+                                       kHidden);
+            } else {
+                ops::gguf_cpu_rows(w, job.middle, begin, begin + 128, job.down.data(), kHidden,
+                                  backend);
+            }
         });
         auto* pairs = static_cast<std::int32_t*>(rank.product_pairs->data());
         std::int32_t count = 0;

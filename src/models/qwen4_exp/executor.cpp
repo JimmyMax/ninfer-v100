@@ -1552,6 +1552,7 @@ struct Executor::Impl {
         miss.cpu_balance    = options.hybrid_experts.dma_share_auto;
         miss.cpu_share      = miss.cpu_balance ? 0.0 : 1.0 - double(options.hybrid_experts.dma_share);
         miss.cpu_threads    = options.hybrid_experts.cpu_threads;
+        miss.cpu_ggml       = options.hybrid_experts.cpu_ggml;
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
         misses              = std::make_unique<ExpertMisses>(

@@ -61,6 +61,9 @@ struct MissOptions {
     // 1..9: a call leaves out each missing expert that all its tokens rank past this many places
     // of their top ten (lossy); 0 serves every miss.
     std::uint32_t tail_skip_rank = 0;
+    // The CPU's host experts run on ggml-cpu's vecdot kernels (faster, not bit for bit) where its
+    // kernels cover the stored format; other stored formats keep the exact q8_1 products.
+    bool cpu_ggml           = false;
 };
 
 struct MissStats {

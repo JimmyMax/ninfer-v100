@@ -524,6 +524,11 @@ struct HybridExpertOptions {
     // buffer's memory from the expert cache; 1 (default) keeps one.
     std::uint32_t prefill_buffers = 1;
     bool adaptive_cache = false;
+    // CPU arithmetic for the host experts the CPU computes: false (default) reproduces the
+    // GPU's decode results bit for bit (q8_1 activations); true runs the stored blocks through
+    // ggml-cpu's vecdot kernels (q8_K / q8_0 activations) -- faster, not bit for bit. Projections
+    // ggml-cpu does not cover (e.g. GSQ-RCO's Q2_0) keep the exact products.
+    bool cpu_ggml = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
 };

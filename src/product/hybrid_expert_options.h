@@ -27,6 +27,12 @@ inline constexpr const char* kHybridExpertHelp =
     "                                uncached experts (default 1); 2 copies the next layer's\n"
     "                                while this one runs, with memory from the expert cache\n"
     "  --expert-cpu-threads N        CPU workers, 1..256 (default automatic)\n"
+    "  --expert-cpu-arithmetic exact|ggml CPU arithmetic for the host experts the CPU computes:\n"
+    "                                exact (default) reproduces the GPU's results bit for bit;\n"
+    "                                ggml runs ggml-cpu's AVX2 vecdot kernels -- faster, not bit\n"
+    "                                for bit; stored formats ggml-cpu does not cover (every format\n"
+    "                                other than IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,\n"
+    "                                IQ4_NL and Q8_0) keep the exact products\n"
     "  --expert-cache-adaptive       replace cold cached experts between calls;\n"
     "                                changes the CPU/GPU arithmetic partition\n"
     "  --expert-profile FILE         fill the host expert cache from recorded counts\n"
@@ -71,6 +77,15 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
             throw std::invalid_argument("--expert-prefill-buffers takes 1 or 2");
         }
         out.prefill_buffers = count == "2" ? 2 : 1;
+    } else if (option == "--expert-cpu-arithmetic") {
+        const std::string_view mode(value());
+        if (mode == "exact") {
+            out.cpu_ggml = false;
+        } else if (mode == "ggml") {
+            out.cpu_ggml = true;
+        } else {
+            throw std::invalid_argument("--expert-cpu-arithmetic takes exact or ggml");
+        }
     } else if (option == "--expert-misses") {
         const std::string_view mode(value());
         if (mode == "staged") {

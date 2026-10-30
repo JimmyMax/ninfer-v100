@@ -711,6 +711,33 @@ plain decode's, token for token:
 
 A prose answer keeps 38.6% of three drafts and gains nothing.
 
+### CPU arithmetic for the host experts, one V100
+
+The host experts the CPU computes (the `--expert-dma-share` share of a call's missing experts)
+run on the exact q8_1 products (the default, bit for bit with the GPU) or on ggml-cpu's AVX2
+vecdot kernels (`--expert-cpu-arithmetic ggml`), which quantize the activation to q8_K for the
+i-quant gate/up and to q8_0 for the IQ4_NL and Q8_0 down; a projection ggml-cpu does not cover
+(GSQ-RCO's Q2_0) keeps the exact products. The Q2_0 artifact's down projections and every other
+projection the exact path covers stay exact, so both modes run the same artifact.
+
+Tesla V100-PCIE-32GB, the IQ3_S release, host experts, an 8,192-position context, INT8 KV, MTP
+with three drafts, a 512-token prompt and 128 generated tokens of a 7,051-token code corpus,
+two repetitions; the expert cache holds 24,118 MiB. Decode tok/s, the drafts accepted:
+
+| CPU share of the misses | Arithmetic | Decode, tok/s | Drafts accepted |
+|---|---|---:|---:|
+| 0% (all on the GPU) | exact | 30.0 | 62.5% |
+| 0% (all on the GPU) | ggml | 30.1 | 62.5% |
+| 50% | exact | 26.0 | 62.5% |
+| 50% | ggml | 26.5 | 63.6% |
+| balanced | ggml | 25.4 | 60.1% |
+
+The host CPU is a Xeon E5-2696 v3 (18 cores, AVX2). At a 50% share the CPU computes a round's
+share of the missing experts in about 20 ms, more than the round's slack at ~30 tok/s, so the
+second stage waits on it and the hybrid loses to the all-GPU miss path (30.0-30.1 tok/s); the
+vecdot kernels are +1.8% over the exact q8_1 products for the share they compute. The default
+(exact arithmetic, all misses on the GPU) stays the fastest configuration on this host.
+
 ### Serving with host experts on one RTX 3090
 
 `ninfer-serve`, INT8 KV, an 8,192-position context, one request at a time; three prompts (Python
