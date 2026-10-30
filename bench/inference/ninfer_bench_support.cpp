@@ -315,6 +315,10 @@ std::string usage_text(std::string_view program) {
         << "  --expert-residency <device|host|disk>  routed MoE experts on the GPU (default), in "
            "pinned host memory, or in the artifact files\n"
         << "  --expert-cache-mib <N|auto> persistent device expert cache (default: auto)\n"
+        << "  --ngram-table PATH          Qwen3.8-Flash-Next: the n-gram table artifact for a "
+           "model published without its table\n"
+        << "  --no-ngram-table            Qwen3.8-Flash-Next: run without the n-gram table "
+           "(experimental, degrades output)\n"
         << "  --kv-dtype <bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4>  KV cache storage "
            "(default: bf16)\n"
         << "  --fast-prefill-kernel       fast INT8-KV prompt kernel, wave-aligned chunks\n"
@@ -405,6 +409,10 @@ BenchOptions parse_args(int argc, char** argv) {
                 options.expert_cache_bytes = std::uint64_t(parse_u32(mib, "expert-cache-mib", true))
                                              << 20;
             }
+        } else if (arg == "--ngram-table") {
+            options.ngram_table.path = value("--ngram-table");
+        } else if (arg == "--no-ngram-table") {
+            options.ngram_table.disabled = true;
         } else if (arg == "--fast-prefill-kernel") {
             options.fast_prefill_kernel = true;
         } else if (arg == "--spec") {

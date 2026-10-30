@@ -168,6 +168,7 @@ int main(int argc, char** argv) {
         engine_options.gdn_state_fp16             = options.gdn_state_fp16;
         engine_options.expert_residency      = options.expert_residency;
         engine_options.expert_cache_bytes    = options.expert_cache_bytes;
+        engine_options.ngram_table           = options.ngram_table;
 
         ninfer::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;

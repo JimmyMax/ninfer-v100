@@ -76,6 +76,7 @@ struct BenchOptions {
     bool lm_head_q6            = false;
     bool embedding_q4          = false;
     bool gdn_state_fp16        = false;
+    NgramTableOptions ngram_table;
     bool profile_measured = false;
     OutputFormat output   = OutputFormat::Table;
     std::string output_file;
