@@ -738,6 +738,26 @@ second stage waits on it and the hybrid loses to the all-GPU miss path (30.0-30.
 vecdot kernels are +1.8% over the exact q8_1 products for the share they compute. The default
 (exact arithmetic, all misses on the GPU) stays the fastest configuration on this host.
 
+### Q2_0 on one V100
+
+The [Q2_0 release](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3)
+(40.7 GiB; the n-gram table is the shared one). Tesla V100-PCIE-32GB, experts in pinned host
+memory with every miss on the GPU (`--expert-dma-share 1`), an 8,192-position context, INT8 KV,
+a 512-token prompt and 128 generated tokens of a 7,051-token code corpus, two repetitions;
+the expert cache holds 25,759 MiB (nospec) / 25,638 MiB (MTP). Greedy, one request:
+
+| Drafter | Prefill, tok/s | Decode, tok/s | Drafts accepted | Misses served by |
+|---|---:|---:|---:|---|
+| none | 224.8 | 44.0 | | GPU, 67.0% cache hits |
+| MTP 3 | 241.3 | 69.6 | 70.7% | GPU, 73.1% cache hits |
+
+Against the IQ3_S release under the same protocol on the same sitting: nospec 33.6 tok/s and
+MTP 3 44.0 tok/s (62.5% accepted). The Q2_0 experts are 1.32 MiB against IQ3_S's 3.27 MiB, so a
+round's miss traffic falls by the same factor; the cache holds 19,539 of the 24,576 experts
+(79.5%) instead of 7,372 (30.0%). Prefill rises from 157 to 225 tok/s on the same protocol.
+Q2_0's perplexity on this card is 2.6509 (14-window protocol, llama.cpp 2.6502) against IQ3_S's
+2.1317; on the same smoke prompt the MTP answer is identical to the plain decode's.
+
 ### Serving with host experts on one RTX 3090
 
 `ninfer-serve`, INT8 KV, an 8,192-position context, one request at a time; three prompts (Python
