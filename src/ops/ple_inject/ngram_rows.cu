@@ -18,6 +18,17 @@ namespace {
 
 constexpr std::int32_t kRowWidth = 160;
 
+// Trained rows of the published Flash-Next n-gram tables keep every block scale
+// below 1e-3 (measured: 99.06% of a 400k-row scan; every row above it is garbage).
+// Untrained hash slots, however, are uninitialised memory in the published
+// artifacts: most carry a non-finite scale (exponent all-ones), but a sizeable
+// minority carry finite scales of unreasonable magnitude (up to 65504). Both
+// kinds must contribute nothing rather than poison the PLE stack.
+constexpr float kMaxTrainedScale = 1e-3f;
+__device__ inline float guarded_scale(__half_raw scale_raw, float scale) {
+    return ((scale_raw.x & 0x7C00) == 0x7C00 || fabsf(scale) > kMaxTrainedScale) ? 0.0f : scale;
+}
+
 __global__ void __launch_bounds__(kRowWidth)
     ngram_fp8_rows_kernel(const std::uint8_t* __restrict__ rows, std::int64_t row_count,
                           __nv_bfloat16* __restrict__ embedding) {
@@ -28,9 +39,10 @@ __global__ void __launch_bounds__(kRowWidth)
     __half_raw scale_raw;
     scale_raw.x = static_cast<unsigned short>(source[kRowWidth] | (source[kRowWidth + 1] << 8));
     const float scale = __half2float(__half(scale_raw));
+    const float s     = guarded_scale(scale_raw, scale);
     __nv_fp8_e4m3 code;
     code.__x = source[j];
-    embedding[row * kRowWidth + j] = __float2bfloat16_rn(static_cast<float>(code) * scale);
+    embedding[row * kRowWidth + j] = __float2bfloat16_rn(static_cast<float>(code) * s);
 }
 
 // ggml's IQ4_NL codebook.
@@ -49,9 +61,10 @@ __global__ void __launch_bounds__(kRowWidth)
     __half_raw scale_raw;
     scale_raw.x                    = static_cast<unsigned short>(block[0] | (block[1] << 8));
     const float scale              = __half2float(__half(scale_raw));
+    const float s                  = guarded_scale(scale_raw, scale);
     const int i                    = j % 32;
     const int code                 = i < 16 ? (block[2 + i] & 0xF) : (block[2 + i - 16] >> 4);
-    embedding[row * kRowWidth + j] = __float2bfloat16_rn(scale * float(kIq4NlValues[code]));
+    embedding[row * kRowWidth + j] = __float2bfloat16_rn(s * float(kIq4NlValues[code]));
 }
 
 void require(bool condition, const char* message) {
