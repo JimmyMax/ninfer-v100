@@ -830,6 +830,39 @@ rather than hiding it), and the cache cannot grow further without taking VRAM fr
 residency (which removes the staging) needs 53.7 GiB of VRAM for IQ3_S, which the 32 GB card
 cannot hold.
 
+### Prefill of host experts, one V100
+
+Prefill is staging-bound the same way decode is. A wide pass (≤2,048 tokens, one pass) runs each
+layer serially: the router needs the layer's input, so the experts the next layer will route to
+are only known after the current layer's MoE; the staged copy of a layer's routed experts and its
+MoE cannot overlap across layers. A long prompt (>2,048 tokens) goes through the span path, which
+stages each layer's uncached experts once per span (up to 8 chunks) instead of once per pass. The
+measured per-prompt expert staging is nearly fixed:
+
+| Prompt | Staging transferred | Prefill, tok/s | Per token |
+|---|---:|---:|---:|
+| 512 | 19.4-21.5 GB | 157.5 (clean) | ~38-42 MiB |
+| 2,048 | 21.3 GB | 402.9 | 10.4 MiB |
+| 4,096 | 25.4 GB | 695.2 | 6.2 MiB |
+
+(the 2,048/4,096 rates from one sitting; the 512 rate clean, the same protocol as the table above).
+The 512-token 157.5 tok/s is therefore a small-prompt artifact: the per-prompt staging floor is
+~19-25 GB of routed experts plus the decode-bound admissions, ~1.5 s of PCIe 3.0 time plus ~1.6 s
+of compute, and the measured 3.25 s sits on that floor. A cold first prompt (no warm-up overlap)
+measures the same staging (19.4 GB, 10.1% cache hits) because the pool stages the routed subset,
+not the whole bank. Disk residency costs −60% of prefill (page-cache reads instead of pinned DMA
+plus a second staging).
+
+`--expert-prefill-buffers 2` double-buffers the span path so the next layer's bank is copied while
+the current layer computes. Interleaved A/B at a 4,096-token prompt, same sitting: 363.7 / 338.7
+(one buffer) against 428.1 / 430.8 (two) — +17.7% / +27.0%. At a 512-token prompt it is neutral to
+negative (113.8 / 52.1 against 58.5 / 55.5 interleaved; 59.0 against 50.3 cold), because a single
+pass cannot prefetch across layers at all. The second buffer holds 1.1 GiB, taken from the expert
+cache (24,192 → 22,983 MiB, ~5% of its 30% coverage); the Flash-Next service enables it for its
+long prompts. The remaining levers for prefill on this card are the bus itself (a PCIe 4.0 host
+doubles it), the artifact's expert size (Q2_0's 1.32 MiB experts: 224.8 tok/s at 512, +43%, at the
+perplexity cost noted above), or device residency (53.7 GiB, which this card cannot hold).
+
 ### Serving with host experts on one RTX 3090
 
 `ninfer-serve`, INT8 KV, an 8,192-position context, one request at a time; three prompts (Python

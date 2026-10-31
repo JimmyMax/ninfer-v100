@@ -433,6 +433,18 @@ host 驻留的暂存结构而非本卡独有。
   位精确）——本卡 dma=1 下无收益，但在 CPU 更快的主机上可把 CPU 份额从 −35% 拉回
 * Q2_0 制品支持验证：GPU/精确 CPU/AVX2 三路径均覆盖，69.6 tok/s 已测（SHA256 验证的官方制品）
 
+**Prefill 同场分析（2026-10-31）**：用户问“prefill 也太慢了吧”（157 tok/s @512）。结论：
+**157 是小 prompt 固定暂存成本 artifact，且已近本卡地板**。单 pass（≤2048 tok）每层串行
+router→暂存路由专家→MoE（下一层路由依赖当前层 MoE 输出，无法跨层预取）；span 路径（>2048 tok）
+每层每 span 整 bank 暂存一次。实测每 prompt 暂存 ≈ 固定 19.4–25.4 GB（512/2048/4096：
+19.4–21.5 / 21.3 / 25.4 GB）→ prefill 157 / 403 / 695 tok/s，每 token 38–42 / 10.4 / 6.2 MiB。
+512 的 3.25 s ≈ 1.5 s PCIe（~19–21 GB/13 GB/s）+ 1.6 s 计算，贴地板。冷启动（warmup=0）暂存相同
+（pool 只暂存路由子集非整 bank）。`--expert-prefill-buffers 2`（span 双缓冲预取）4096 交错 A/B
+**+22%**（363.7/338.7 vs 428.1/430.8），512 无收益（单 pass 结构上不能跨层预取），代价 1.1 GiB
+显存（cache −5%）→ **flashnext 服务已启用**（长 prompt 场景）。剩余杠杆：PCIe 4.0 主机（总线×2）、
+Q2_0（1.32 MiB/expert，512 prefill 224.8 tok/s，+43%，质量档代价）、设备驻留（53.7 GiB 放不下）。
+详见 `docs/performance.md` “Prefill of host experts, one V100”。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
