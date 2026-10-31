@@ -798,6 +798,13 @@ What a decode round spends on (nvprof over the measured region, MTP 3, all misse
 | cuBLAS GEMMs (embed, router, shared expert) | 3.1% |
 | MoE first stage, vector ops, routing, PLE, KV | ~24% |
 
+The numbers above predate the S0.24 changes; they are the baseline this section's
+levers are measured against. With the prompt-pollution fix and a mixed-corpus seed, the
+same 512+128 protocol on a same-sitting old-versus-new A/B (MTP 3, double-buffered)
+measured decode 28.1 → 28.9 tok/s and hit rate 77.7% → 91.8% on a degraded sitting
+(the clean-sitting levels of that configuration are pending a clean GPU window; the
+clean old-code baseline above is 43.5-44.0 without a seed).
+
 In steady state a round's four tokens route about forty expert slots per layer, and the cache
 misses a few of them (about 4.6, from the round's 1.36 ms layer budget and the 80.4 µs average
 copy); staging those 4.6 × 2.18 MiB through PCIe 3.0 (≈13 GB/s effective) is ~0.8 ms per layer,
