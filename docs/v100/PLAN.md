@@ -507,6 +507,31 @@ kernel 侧四项均无廉价杠杆；955 tok/s 已在本卡地板 ~15% 以内。
 
 触发条件：产品需要单流 decode >50 tok/s 时启动（与 S0.23 可并行，~1–2 周）。
 
+### S0.25 Flash-Next IQ3_S 的三个总线杠杆（2026-11-01 完成）☑
+
+承接 S0.22/S0.24 的结论（decode 受 miss 暂存字节约束），实现并测量三个杠杆。同协议
+（512+128、8192 ctx、MTP d3、seed profile、`--expert-cpu-arithmetic ggml`）：
+
+1. ☑ **CPU 算的专家不过总线**（杠杆 1）：`serve_request` 里 CPU 份额不再走
+   `admit_behind` 拷进 device 槽，直接从 pinned host 块算出 products 在设备上 join。
+   实测：50% CPU 份额把单轮 host→device 专家流量从 104 GB 砍到 66 GB（−37%），但本机
+   Xeon E5-2696 v3 的 i-quant vecdot 远慢于总线，decode 同 sitting 27.7（全 GPU）→ 23.9
+   （50% CPU），service 9.1 → 12.5 s。结论不变：本机 CPU 是更慢的资源，替代暂存而非隐藏
+   它；dma=1 仍是最快。改动保留（对更快的 CPU 主机是正确默认，且不影响 dma=1 路径）。
+2. ☑ **拷贝放大归因**（杠杆 2）：cache 现在按类别计数（`seed` / `rebalance` / `admit`），
+   bench 报 `expert_seed/rebalance/admit_bytes` 与 `expert_cpu_routes`。104 GB 分解为：
+   一次性 profile 种子 23.1 GiB（warm start，随进程摊薄）+ pass 末预算 4.9 GiB + 稳态
+   miss 进槽 38.0 GiB + 两段暂存 bank 拷贝 38.0 GiB。稳态流量一半是进槽、一半是暂存
+   bank：miss 既被 admit 进槽、又在本轮需要它之前被暂存；从未进槽的长尾每轮路由都
+   暂存一次。76 GiB 稳态流量由 miss 率 × 专家尺寸决定，不是可移除的冗余拷贝。
+3. ☑ **自适应平衡填满总线空窗**（杠杆 3）：`--expert-dma-share auto` 让 `balance()` 按
+   拟合耗时分配。实测 24.9 tok/s，不如固定 dma=1 的 27.7（同 sitting）——因为 CPU 慢，
+   平衡只会把更多份额推给慢资源。与杠杆 1 一致。
+
+结论：三杠杆都实现并测量，本机 IQ3_S 的最优配置仍是 dma=1、MTP d3、~44 tok/s（clean
+sitting）。70+ 需要 Q2_0（1.32 MiB 专家，69.6，perplexity 代价）或双卡 pipeline。详见
+`docs/performance.md` 的 IQ3_S 一节。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
