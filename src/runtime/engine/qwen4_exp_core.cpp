@@ -855,6 +855,9 @@ struct Qwen4ExpCore::Impl {
                                            .cpu_routes        = cache.cpu_routes,
                                            .admitted          = cache.admitted,
                                            .transferred_bytes = cache.copied_bytes,
+                                           .seed_bytes        = cache.seed_bytes,
+                                           .rebalance_bytes   = cache.rebalance_bytes,
+                                           .admit_bytes       = cache.admit_bytes,
                                            .slots             = cache.slots,
                                            .service_seconds   = cache.service_seconds};
         std::uint32_t running = 0, prefilling = 0, decoding = 0;

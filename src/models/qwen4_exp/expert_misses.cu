@@ -1181,9 +1181,9 @@ struct ExpertMisses::Impl {
                     }
                 }
             }
-            // The CPU's experts also take slots, copied in behind this call: their victims leave
-            // the tables before the copies, they join after, and the next pass waits for both.
-            if (layer.admit) { admit_behind(rank, layer, layer_index, in_use); }
+            // The CPU's experts never cross the bus: their products are computed from the pinned
+            // host block and joined on the device, so admitting them into a slot would only add
+            // staging traffic the round could not spend. The GPU's share keeps the cache policy.
             compute_cpu(layer, rank);
             if (options.cpu_balance) {
                 cpu_time.add(cpu_work_done,

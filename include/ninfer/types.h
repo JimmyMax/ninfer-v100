@@ -1739,6 +1739,9 @@ struct ExpertResidencyStats {
     std::uint64_t cpu_routes        = 0;
     std::uint64_t admitted          = 0;
     std::uint64_t transferred_bytes = 0;
+    std::uint64_t seed_bytes        = 0; // the profile's one-time startup copies
+    std::uint64_t rebalance_bytes   = 0; // the pass-end budget's copies
+    std::uint64_t admit_bytes       = 0; // a miss request's copies (steady state)
     std::uint32_t slots             = 0;
     double service_seconds          = 0.0; // host time from a miss request to readiness, summed
 };

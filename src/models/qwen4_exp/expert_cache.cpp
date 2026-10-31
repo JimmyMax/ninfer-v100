@@ -201,6 +201,7 @@ void ExpertCache::rebalance(std::uint64_t byte_budget, bool handed_over_too) {
                                            layer.banks.stream));
                 layer.current[k][expert] = target;
                 stats_.copied_bytes += std::uint64_t(bank.expert_bytes);
+                stats_.rebalance_bytes += std::uint64_t(bank.expert_bytes);
             }
             layer.slot_of[expert] = slot;
             layer.expert_of[slot] = expert;
@@ -255,6 +256,7 @@ void ExpertCache::seed(const std::vector<std::vector<std::uint64_t>>& counts) {
                                            layer.banks.stream));
                 layer.current[k][std::size_t(expert)] = target;
                 stats_.copied_bytes += std::uint64_t(bank.expert_bytes);
+                stats_.seed_bytes += std::uint64_t(bank.expert_bytes);
             }
             layer.slot_of[std::size_t(expert)] = std::int32_t(slot);
             layer.expert_of[slot]             = expert;
@@ -344,6 +346,7 @@ bool ExpertCache::admit(std::size_t index, std::int32_t expert,
         out.slot[k]              = base + layer.offset(k);
         layer.current[k][expert] = out.slot[k];
         stats_.copied_bytes += std::uint64_t(layer.bank(k).expert_bytes);
+        stats_.admit_bytes += std::uint64_t(layer.bank(k).expert_bytes);
     }
     layer.slot_of[std::size_t(expert)] = slot;
     layer.expert_of[std::size_t(slot)] = expert;

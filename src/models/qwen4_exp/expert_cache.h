@@ -38,7 +38,10 @@ struct ExpertCacheStats {
     std::uint64_t routes       = 0; // (token, expert) pairs observed
     std::uint64_t hits         = 0; // of them, served from a slot
     std::uint64_t admitted     = 0; // experts copied into slots
-    std::uint64_t copied_bytes = 0;
+    std::uint64_t copied_bytes = 0; // all expert bytes copied to slots
+    std::uint64_t seed_bytes   = 0; // the profile's one-time startup copies
+    std::uint64_t rebalance_bytes = 0; // the pass-end budget's copies
+    std::uint64_t admit_bytes  = 0; // a miss request's copies (steady state)
     std::uint32_t slots        = 0;
     std::uint64_t cpu_routes   = 0; // native hybrid: routed (token, expert) pairs computed on CPU
     std::uint64_t dma_routes   = 0; // native hybrid: uncached pairs staged to GPU slots
