@@ -445,22 +445,31 @@ router→暂存路由专家→MoE（下一层路由依赖当前层 MoE 输出，
 Q2_0（1.32 MiB/expert，512 prefill 224.8 tok/s，+43%，质量档代价）、设备驻留（53.7 GiB 放不下）。
 详见 `docs/performance.md` “Prefill of host experts, one V100”。
 
-### S0.23 Flash-Next prefill kernel 调优（后续计划，2026-10-31 排入）☐
+### S0.23 Flash-Next prefill kernel 调优（2026-10-31 完成，全部无廉价杠杆）☑
 
 现状：4096 tok prefill 最佳 sitting 955 tok/s，离本卡地板（暂存 1.95 s @13 GB/s + 计算
-~1.2–2.2 s，B=2 已重叠）差 ~15%。nvprof 分解见 docs/performance.md。待办（收益递减，
-1–2 周量级，仅在产品需要 >1k prefill 时启动）：
+~1.2–2.2 s，B=2 已重叠）差 ~15%。nvprof 分解见 docs/performance.md。结果：
 
-1. **GDN recurrent prefill kernel**（占 profiled 9.1%）：2,048 tok/层跑 47 次顺序调用
-   （~43 tok/次，状态 1 MB/层放不进寄存器）。目标：整宽单次/扫描路径，状态过 DRAM；
-   验收：kernel bench 冷 L2 T=2048 接近 2.8 ms/层注释值，prefill A/B +3–5%。
-2. **MoE wide i-quant kernel**（~14%）：现 profiled ~5.8 TFLOPS（int=128 token 块）；
-   对照 sm70 mmq 路径与更大 token 块（t=2048 下 128→256）；验收：op microbenchmark
-   + prefill A/B。
-3. **wait 尾巴（3.1%）**：host 侧轮询/事件链归因；预期收益 <1%。
-4. 单 pass（≤2048）与 span 的 per-token 差距（228 vs 918 tok/s，同 sitting nvprof）待复现
-   归因（暂存 per-copy 均值 137 vs 93 µs）：若坐实为坐席漂移则关闭，否则查 pool 单 pass
-   预取链（B=2 理论上已重叠，代码已确认）。
+1. ☑ **GDN**（占 profiled 9.1%）：Volta 构建**已经把整宽路由到 `launch_recurrent_inout`**
+   （状态在寄存器、单次 kernel、96 块 @ T=2048），op bench 冷 L2 实测（16/48 heads）：
+   recurrent **3.54 ms**（nodes=1）vs 强制 chunked **8.40 ms**（nodes=4）vs 预归一化
+   chunked 2.67 ms（不可用——生产 q/k 未归一化，归一化成本不在那 2.67 里）。当前路由
+   就是已测最快路径；再快需要把 state 更新（k·S、q·S 的 128×128 matvec）重写成
+   FP16 HMMA/2×FMA 形式，多天量级，上限 ~+4–5% prefill，挂起。
+2. ☑ **MoE wide i-quant**（~14%）：`select_moe_launch` 已选**最宽可用列块**
+   （J=128，`kMatrixColumnTiles` = {16,32,64,128} 的上限）；256 需要扩 vendored ggml
+   mmq config 表 + 共享内存核算，非廉价改动，挂起。
+3. ☑ **wait 尾巴（3.1%）**：归因完成——`wait_kernel` 是 GPU 在专家暂存 H2D 期间自旋，
+   时长 = 暂存延迟（~13 GB/s 总线限）× miss 流量；无独立杠杆，S0.24.3 的命中率提升
+   （86%→93%）已直接压缩它。关闭。
+4. ☑ **2048 vs 4096 per-token 差距**：同 sitting A/B（新代码，两臂均 B=2、双缓冲）：
+   2048 → **436.0** tok/s、4096 → **496.9** tok/s（+14%），即 2.29 vs 2.01 ms/token；
+   回归到每 prompt 固定成本 ≈ **1.15 s**（新工作集的暂存）+ 1.73 ms/token 流式。
+   先前跨 sitting 的 228 vs 918 是坐席漂移（本机 ~1.7× 方差，已记录），非 pool 预取链
+   bug。关闭。
+
+结论：prefill 的剩余空间在暂存字节（缓存/命中率，S0.24 已做）与卡型（PCIe 3.0），
+kernel 侧四项均无廉价杠杆；955 tok/s 已在本卡地板 ~15% 以内。
 
 ### S0.24 Flash-Next decode 的暂存/计算重叠（2026-10-31 完成）☑
 

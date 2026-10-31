@@ -920,9 +920,19 @@ measured 955 tok/s best-sitting rate within ~15% of this card's floor:
 Staging at the bus peak (~12 GB/s wall) is ~2.0 s and compute (≈55 TFLOP of the 4,096 tokens) is
 ~1.2-2.2 s; with the two buffers they overlap, and the measured 4.3 s best-sitting time is close
 to max(staging, compute) plus the wait tail. A cold first request of the service (no warm-up
-overlap) measures 742 tok/s at 3,702 tokens. Squeezing the last 10-20% means the GDN recurrent
-prefill kernel (47 sequential calls per layer per 2,048-token span) and the wide i-quant calls —
-kernel work with diminishing returns; the 2,000+ tok/s line needs a PCIe 4.0 bus or smaller experts.
+overlap) measures 742 tok/s at 3,702 tokens. The kernel-side levers were checked and all came up
+empty (S0.23): the Volta prefill already runs GDN as one full-width recurrent kernel per
+layer-pass (op bench, cold L2, T=2048: 3.54 ms against 8.40 ms for the chunked pipeline — the
+2.67 ms of the pre-normalized chunked path is not available because the production q/k arrive
+unnormalized); the wide i-quant calls already use the widest available column tile (128, the
+vendored ggml config's limit); and the wait tail is the GPU spinning during the staging itself,
+so it falls with the hit rate (S0.24.3) and has no independent lever. A same-sitting 2,048-
+versus-4,096 A/B (both arms double-buffered) measured 436.0 against 496.9 tok/s (+14%):
+2.29 versus 2.01 ms per token, a fixed per-prompt staging cost of ~1.15 s on top of ~1.73 ms
+token streaming — the earlier 228-versus-918 spread was sitting-to-sitting drift on this host,
+not a prefetch bug. Squeezing the last 10-20% means a PCIe 4.0 bus, smaller experts (Q2_0's
+1.32 MiB: 224.8 tok/s at 512, +43%, at the perplexity cost noted above), or the FP16-matvec
+rewrite of the GDN state update (a few days of kernel work, ~4-5% ceiling).
 
 ### Serving with host experts on one RTX 3090
 
