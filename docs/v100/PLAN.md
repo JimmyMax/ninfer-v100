@@ -462,25 +462,39 @@ Q2_0（1.32 MiB/expert，512 prefill 224.8 tok/s，+43%，质量档代价）、�
    归因（暂存 per-copy 均值 137 vs 93 µs）：若坐实为坐席漂移则关闭，否则查 pool 单 pass
    预取链（B=2 理论上已重叠，代码已确认）。
 
-### S0.24 Flash-Next decode 的暂存/计算重叠（后续计划，2026-10-31 排入）☐
+### S0.24 Flash-Next decode 的暂存/计算重叠（2026-10-31 完成）☑
 
 现状：decode 44 tok/s（8192 ctx、MTP d3、cache 24.1 GiB）。nvprof：H2D 49% + 等 CPU 侧 13.5%
 与计算 37.5% **串行**（每层 0.85 ms 暂存 + 0.51 ms 计算 = 1.36 ms）。若两者完全重叠，
 每层 → 0.85 ms，即 ~70 tok/s（已排队项：cache 驻留覆盖率 86% → 最优 95.1%，见
-`docs/performance.md`）。待办：
+`docs/performance.md`）。结果：
 
-1. **gate/up → down 两段暂存**：miss 服务先拷 gate+up（1.254 MiB）并点事件 A，再拷 down
-   （0.92 MiB）点事件 B；GPU 等 A 跑 up GEMV（SwiGLU），等 B 跑 down GEMV。预期：暴露的
-   暂存减少 min(down 拷贝, up 计算) ≈ 0.2 ms/层 → +15%。验收：bench A/B，decode t/s + 暂存
-   服务秒数，且数值与现路径一致（同一 Op 序列，仅切分拷贝）。
-2. **按 miss 集分半的部分和**：一半专家算完累加、再算另一半（求和次序变，非位精确），
-   预期暴露暂存再减一半 → 63–70 tok/s。验收：oracle（FP32 独立参考，2e-3） + bench A/B。
-3. **prefill 路由不得驱逐 decode 热点**：prompt chunk 的 admit 预算已为 0（`expert_cache.cpp`
-   注释），但实测 512-prompt 后 decode 仍从 56.3 降到 44；查 handed-over 后的 tier 提升与
-   `kHysteresis`，必要时给 prompt 路由单独的低配额。验收：同 sitting 512-prompt decode A/B +
-   命中率。
-4. **常规化 expert-profile 种子**：已实测冷启动 +25%（31.1→38.9）；后续做语料无关的混合
-   profile（多语料采样），并让 `--record-profile` 在服务模式定期吐出真实流量的直方图。
+1. ☑ **gate/up → down 两段暂存**：已实现（`expert_misses` 的 `prepared_up` 门铃、
+   `wait_kernel_up`、serve 两阶段拷入；executor 在 up GEMV 与 down GEMV 之间插入
+   `await_up`）。实测（同 sitting 新旧二进制 A/B，8192 ctx、512+128）：**中性**
+   （nospec 27.49→27.61，MTP d3 30.58→31.02，均在 ±1.5 噪声内）。原因：t=1 时单个
+   专家的 up GEMV 只读 1.25 MiB 权重（~1 µs/层），远短于 down 拷贝（~0.2 ms/层），
+   可隐藏的量 ≈ 0。保留代码（无害，且对 t>1 验证路径略有利）。原估计 +15% 的
+   up 计算 0.25 ms/层 前提在 t=1 不成立。
+2. ☑ **按 miss 集分半的部分和**：**关闭，分析结论为死路**。t=1 时每层 GPU 计算
+   （~10 µs）比每层暂存（~0.4 ms @ 72.5% 命中）小两个数量级；跨层流水也不可能——
+   第 N+1 层的路由依赖第 N 层 MoE 的输出，暂存（N+1）最早只能与 GDN(N+1)+路由(N+1)
+   （~40 µs）重叠，无剩余工作可藏。70 tok/s 的达成路径是命中率（见 3/4 与
+   `docs/performance.md`），不是重叠。
+3. ☑ **prompt 路由不得污染 decode 工作集**：坐实并修复。机制：`settle_routes` 对每个
+   pass（含 prompt chunk）调 `cache->observe`，2048-token chunk 的衰减 0.999^2048 ≈ 0.129
+   把 decode 工作集分数打剩 13%，随后 prompt 路由以 2 GiB/chunk 的 rebalance 预算迁入。
+   修复：`settle_routes` 只对 `pending_routes <= kVectorTokens`（decode/验证 pass）observe；
+   prefill 走 pool 路径从不读 cache，无损失。同 sitting A/B（512+128、8192 ctx）：
+   nospec 27.65→34.03（+23%，命中 66.9→92.7%），MTP d3 + seed 31.48→33.26（+5.7%，
+   命中 82.6→93.7%，acc 不变）。顺带：`--record-profile` 从此只记 decode/验证路由，
+   profile 天然是 decode 直方图。
+4. ☑ **常规化 expert-profile 种子**：用新代码（纯 decode 计数）重录 code7k + zh7k 各
+   2048 decode token（MTP d3），离线合并为 `expert-profile-mixed.json`。top-248/层覆盖：
+   旧 code7k 96.2%、code7k 95.6%、zh7k 95.1%、**合并 93.4%**（合并摊薄长尾；对未知流量
+   是期望值最优）。已部署到服务 compose；并给服务加 `--expert-profile-out`（每个请求完成
+   时写真实流量累计直方图到 `/profile-out/expert-profile-service.json`，流量稳定后离线
+   对比覆盖再换 seed 文件）。
 
 触发条件：产品需要单流 decode >50 tok/s 时启动（与 S0.23 可并行，~1–2 周）。
 

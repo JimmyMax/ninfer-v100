@@ -134,6 +134,7 @@ private:
 struct Mailbox {
     alignas(64) std::uint32_t requested = 0; // device: the last posted request
     std::uint32_t layer = 0, tokens = 0, missing = 0;
+    alignas(64) std::uint32_t prepared_up = 0; // host: the last request's gate+up tables ready
     alignas(64) std::uint32_t prepared = 0; // host: the last request ready
 };
 
@@ -232,6 +233,14 @@ __global__ void wait_kernel(Mailbox* box, const std::uint32_t* need) {
     const std::uint32_t sequence = *need;
     if (sequence == 0) { return; }
     while (Atomic(box->prepared).load(cuda::memory_order_acquire) != sequence) { __nanosleep(128); }
+}
+
+// Stage one of a two-stage request: the request's gate+up tables are ready, its down table's
+// data may still be on the bus, so the caller runs only the up GEMV behind this wait.
+__global__ void wait_kernel_up(Mailbox* box, const std::uint32_t* need) {
+    const std::uint32_t sequence = *need;
+    if (sequence == 0) { return; }
+    while (Atomic(box->prepared_up).load(cuda::memory_order_acquire) != sequence) { __nanosleep(128); }
 }
 
 // One thread per token: its pairs whose expert is cached keep their id, with the token's weights
@@ -480,6 +489,13 @@ struct ExpertMisses::Impl {
         cudaStream_t copies    = nullptr;
         cudaEvent_t copying    = nullptr; // balance only: before a request's copies
         cudaEvent_t copied     = nullptr; // after them (timed for the balance)
+        cudaEvent_t copied_up  = nullptr; // after the request's gate+up copies
+        // Per-expert staging plan, filled by stage one and consumed by stage two: 0 = mapped
+        // (the GPU reads the expert where it is), 1 = admitted (its slot is in admit_plan),
+        // 2 = staged (its offset in the staging half is in staged_off).
+        std::array<unsigned char, kMaxExperts> kind{};
+        std::array<std::uint64_t, kMaxExperts> staged_off{};
+        std::array<ExpertCache::Admitted, kMaxExperts> admit_plan{};
         std::uint32_t served   = 0;
         // Balance: this device's copy times, and requests since one copied or computed.
         TimeFit copy_time{10.0, 50.0}; // about 20 GB/s
@@ -634,6 +650,7 @@ struct ExpertMisses::Impl {
             const unsigned timing = options.cpu_balance ? cudaEventDefault : cudaEventDisableTiming;
             if (options.cpu_balance) { CUDA_CHECK(cudaEventCreate(&rank.copying)); }
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.copied, timing));
+            CUDA_CHECK(cudaEventCreateWithFlags(&rank.copied_up, cudaEventDisableTiming));
             for (auto& event : rank.behind) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
             }
@@ -641,6 +658,8 @@ struct ExpertMisses::Impl {
             // device for this service could wait for that layer (see the executor's pass()).
             patch_kernel<<<1, 32, 0, rank.copies>>>(nullptr, nullptr, nullptr, nullptr, 0);
             wait_kernel<<<1, 1, 0, rank.copies>>>(rank.box, static_cast<const std::uint32_t*>(rank.need->data()));
+            wait_kernel_up<<<1, 1, 0, rank.copies>>>(rank.box,
+                                                     static_cast<const std::uint32_t*>(rank.need->data()));
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaStreamSynchronize(rank.copies));
         }
@@ -671,6 +690,7 @@ struct ExpertMisses::Impl {
             if (rank.copies) { cudaStreamDestroy(rank.copies); }
             if (rank.copying) { cudaEventDestroy(rank.copying); }
             if (rank.copied) { cudaEventDestroy(rank.copied); }
+            if (rank.copied_up) { cudaEventDestroy(rank.copied_up); }
             for (auto event : rank.behind) {
                 if (event) { cudaEventDestroy(event); }
             }
@@ -967,13 +987,16 @@ struct ExpertMisses::Impl {
         std::array<bool, kMaxExperts> on_gpu{};
         std::uint64_t used = 0, file_used = 0, staged_bytes = 0;
         std::uint64_t staged = 0, mapped = 0;
-        bool copies = false;
+        bool copies_up = false, copies_down = false;
         auto* patches       = static_cast<TablePatch*>(rank.patches->data());
         int patch_count     = 0;
         std::array<unsigned char, kMaxExperts> in_use{};
         for (std::uint32_t p = 0; p < pairs; ++p) {
             if (ids[p] >= 0 && ids[p] < kMaxExperts) { in_use[std::size_t(ids[p])] = 1; }
         }
+        // The request is staged in two halves so the layer's up GEMV can run while its down table
+        // is still on the bus: stage one moves each missing expert's gate+up (and the pairs' ids
+        // the second stage reads), stage two its down table and the tail zeros.
         if (rank.copying && gpu_count > 0) { CUDA_CHECK(cudaEventRecord(rank.copying, rank.copies)); }
         for (std::size_t i = 0; i < gpu_count; ++i) {
             const std::int32_t e = order[i].second;
@@ -982,7 +1005,9 @@ struct ExpertMisses::Impl {
             if (layer.admit &&
                 cache->admit(layer_index, e, last_use_host(layer_index),
                              {in_use.data(), in_use.size()}, admitted)) {
-                for (int k = 0; k < 3; ++k) {
+                rank.admit_plan[i] = admitted;
+                rank.kind[i]        = 1;
+                for (int k = 0; k < 2; ++k) {
                     const auto& p = layer.projections[std::size_t(k)];
                     CUDA_CHECK(cudaMemcpyAsync(admitted.slot[std::size_t(k)], p.host[std::size_t(e)],
                                                std::size_t(p.expert_bytes), cudaMemcpyHostToDevice,
@@ -990,21 +1015,25 @@ struct ExpertMisses::Impl {
                     tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = admitted.slot[std::size_t(k)];
                     staged_bytes += std::uint64_t(p.expert_bytes);
                 }
+                // The down slot's pointer may be published now; its data follows in stage two.
+                tables[2 * kMaxExperts + std::size_t(e)] = admitted.slot[2];
                 patches[patch_count++] = TablePatch{e, {admitted.slot[0], admitted.slot[1], admitted.slot[2]}};
                 if (admitted.victim >= 0) {
                     patches[patch_count++] =
                         TablePatch{admitted.victim, {admitted.victim_host[0], admitted.victim_host[1],
                                                      admitted.victim_host[2]}};
                 }
-                copies = true;
+                copies_up = true;
                 ++staged;
                 continue;
             }
             std::uint64_t need = kTail;
             for (const auto& p : layer.projections) { need += aligned(std::uint64_t(p.expert_bytes)); }
             if (used + need <= half_bytes) {
+                rank.kind[i]       = 2;
+                rank.staged_off[i] = used;
                 std::uint64_t offset = 0;
-                for (int k = 0; k < 3; ++k) {
+                for (int k = 0; k < 2; ++k) {
                     const auto& p     = layer.projections[std::size_t(k)];
                     std::byte* target = staging + used + offset;
                     const void* source;
@@ -1020,19 +1049,17 @@ struct ExpertMisses::Impl {
                     }
                     CUDA_CHECK(cudaMemcpyAsync(target, source, std::size_t(p.expert_bytes),
                                                cudaMemcpyHostToDevice, rank.copies));
-                    if (k == 2) {
-                        CUDA_CHECK(cudaMemsetAsync(target + p.expert_bytes, 0, kTail, rank.copies));
-                    }
                     tables[std::size_t(k) * kMaxExperts + std::size_t(e)] = target;
                     offset += aligned(std::uint64_t(p.expert_bytes));
                     staged_bytes += std::uint64_t(p.expert_bytes);
                 }
+                tables[2 * kMaxExperts + std::size_t(e)] = staging + used + offset;
                 used += need;
-                copies = true;
+                copies_up = true;
                 ++staged;
             } else {
                 // The staging half is full: the GPU reads this expert where it is.
-                for (int k = 0; k < 3; ++k) {
+                for (int k = 0; k < 2; ++k) {
                     const auto& p = layer.projections[std::size_t(k)];
                     const void* where;
                     if (disk) {
@@ -1067,9 +1094,58 @@ struct ExpertMisses::Impl {
         if (gpu_count > 0) {
             CUDA_CHECK(cudaMemcpyAsync(rank.missing_device.p, missing_ids, std::size_t(pairs) * 4,
                                        cudaMemcpyHostToDevice, rank.copies));
-            copies = true;
+            copies_up = true;
         }
-        if (copies) { CUDA_CHECK(cudaEventRecord(rank.copied, rank.copies)); }
+        if (copies_up) { CUDA_CHECK(cudaEventRecord(rank.copied_up, rank.copies)); }
+        if (copies_up) { CUDA_CHECK(cudaEventSynchronize(rank.copied_up)); }
+        // Stage one is done: the layer's up GEMV may run while stage two's copies are on the bus.
+        Atomic(box.prepared_up).store(sequence, cuda::memory_order_release);
+        for (std::size_t i = 0; i < gpu_count; ++i) {
+            const std::int32_t e    = order[i].second;
+            const auto& down        = layer.projections[2];
+            const std::uint64_t offset =
+                aligned(std::uint64_t(layer.projections[0].expert_bytes)) +
+                aligned(std::uint64_t(layer.projections[1].expert_bytes));
+            if (rank.kind[i] == 1) {
+                CUDA_CHECK(cudaMemcpyAsync(rank.admit_plan[i].slot[2], down.host[std::size_t(e)],
+                                           std::size_t(down.expert_bytes), cudaMemcpyHostToDevice,
+                                           rank.copies));
+                staged_bytes += std::uint64_t(down.expert_bytes);
+                copies_down = true;
+            } else if (rank.kind[i] == 2) {
+                std::byte* target = staging + rank.staged_off[i] + offset;
+                const void* source;
+                if (disk) {
+                    if (file_used + std::uint64_t(down.expert_bytes) > file_half_bytes) {
+                        throw std::runtime_error("expert misses: file staging exhausted");
+                    }
+                    fetch(down, e, file_staging + file_used);
+                    source = file_staging + file_used;
+                    file_used += aligned(std::uint64_t(down.expert_bytes));
+                } else {
+                    source = down.host[std::size_t(e)];
+                }
+                CUDA_CHECK(cudaMemcpyAsync(target, source, std::size_t(down.expert_bytes),
+                                           cudaMemcpyHostToDevice, rank.copies));
+                CUDA_CHECK(cudaMemsetAsync(target + down.expert_bytes, 0, kTail, rank.copies));
+                staged_bytes += std::uint64_t(down.expert_bytes);
+                copies_down = true;
+            } else {
+                const void* where;
+                if (disk) {
+                    if (file_used + std::uint64_t(down.expert_bytes) > file_half_bytes) {
+                        throw std::runtime_error("expert misses: file staging exhausted");
+                    }
+                    fetch(down, e, file_staging + file_used);
+                    where = file_staging + file_used;
+                    file_used += aligned(std::uint64_t(down.expert_bytes));
+                } else {
+                    where = down.host[std::size_t(e)];
+                }
+                tables[2 * kMaxExperts + std::size_t(e)] = where;
+            }
+        }
+        if (copies_down) { CUDA_CHECK(cudaEventRecord(rank.copied, rank.copies)); }
         // The CPU's share, while the copies run.
         std::uint64_t cpu_pairs = 0;
         const auto cpu_started  = std::chrono::steady_clock::now();
@@ -1118,7 +1194,7 @@ struct ExpertMisses::Impl {
         } else if (rank.product_count) {
             *static_cast<std::int32_t*>(rank.product_count->data()) = 0;
         }
-        if (copies) { CUDA_CHECK(cudaEventSynchronize(rank.copied)); }
+        if (copies_down) { CUDA_CHECK(cudaEventSynchronize(rank.copied)); }
         if (options.cpu_balance && gpu_count > 0 && staged_bytes > 0 && mapped == 0) {
             float milliseconds = 0;
             CUDA_CHECK(cudaEventElapsedTime(&milliseconds, rank.copying, rank.copied));
@@ -1243,6 +1319,25 @@ struct ExpertMisses::Impl {
         return call;
     }
 
+    void await_up(std::size_t index, cudaStream_t stream) {
+        Rank& rank = ranks.at(layers.at(index).rank);
+        if (!capturing(stream)) {
+            // Eager: wait on the host, so a lazily loaded kernel never waits behind a GPU spin.
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const std::uint32_t sequence = *static_cast<volatile std::uint32_t*>(rank.need->data());
+            if (sequence != 0) {
+                while (Atomic(rank.box->prepared_up).load(cuda::memory_order_acquire) != sequence) {
+                    std::this_thread::yield();
+                    std::lock_guard lock(failure_mutex);
+                    if (failure) { std::rethrow_exception(failure); }
+                }
+            }
+            return;
+        }
+        wait_kernel_up<<<1, 1, 0, stream>>>(rank.box, static_cast<const std::uint32_t*>(rank.need->data()));
+        CUDA_CHECK(cudaGetLastError());
+    }
+
     void await(std::size_t index, cudaStream_t stream) {
         Rank& rank = ranks.at(layers.at(index).rank);
         if (!capturing(stream)) {
@@ -1299,6 +1394,8 @@ void ExpertMisses::drop_missing(std::size_t layer, const Tensor& ids, const Tens
     impl_->drop_missing(layer, ids, weights, kept_ids, kept_weights, stream);
 }
 void ExpertMisses::await(std::size_t layer, cudaStream_t stream) { impl_->await(layer, stream); }
+
+void ExpertMisses::await_up(std::size_t layer, cudaStream_t stream) { impl_->await_up(layer, stream); }
 void ExpertMisses::keep_alive() { impl_->keep_alive(); }
 
 void ExpertMisses::raise_failure() { impl_->raise_failure(); }

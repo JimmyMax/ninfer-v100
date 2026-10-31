@@ -6,10 +6,12 @@
 // device) without any host synchronization, so the whole pass can replay as one CUDA graph. A host
 // thread picks the request up immediately and, for each missing expert, either copies it into a
 // device staging region by the copy engine, or has the CPU compute its pairs from the bytes in RAM
-// (host experts) or from the file (disk experts). The second stage of the layer waits for the
-// request on the GPU, then runs the staged experts and adds the CPU's products. The cache's own
-// tables never change here; the staged experts are reached through a second table that only the
-// second stage reads, so the resident stage needs no host at all.
+// (host experts) or from the file (disk experts). The copies arrive in two stages: first each
+// expert's gate+up, so the layer's up GEMV runs while its down tables are still on the bus, then
+// the down tables. The second stage of the layer waits for each on the GPU, then runs the staged
+// experts and adds the CPU's products. The cache's own tables never change here; the staged experts
+// are reached through a second table that only the second stage reads, so the resident stage needs
+// no host at all.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -108,6 +110,9 @@ public:
     // routed sum: for a layer whose output only steers drafts, which verification checks.
     void drop_missing(std::size_t layer, const Tensor& ids, const Tensor& weights,
                       Tensor& kept_ids, Tensor& kept_weights, cudaStream_t stream);
+    // Enqueued: waits until the request's gate+up tables and the second stage's pairs are ready:
+    // the stage-one wait of the two-stage staging, after which only the layer's up GEMV may run.
+    void await_up(std::size_t layer, cudaStream_t stream);
     // Enqueued: waits until the request's experts are staged and its CPU products written.
     void await(std::size_t layer, cudaStream_t stream);
     // Keeps the service (and the CPU workers) spinning for the next half second; a pass calls it

@@ -1731,8 +1731,13 @@ struct Executor::Impl {
             std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
         const auto* host = static_cast<const std::int32_t*>(route_host->data());
         if (cache) {
-            const std::size_t used = std::size_t(config.num_experts_per_tok) * pending_routes;
-            if (pending_routes > 0) {
+            // Only decode and verification routes feed the working set: a prompt chunk's mix is
+            // its own, and observing it decays the decode scores by ~87% per 2048-token chunk,
+            // evicting the decode working set the decode steps are about to need. Prefill itself
+            // never reads the cache (its experts run from the pool), so nothing is lost.
+            if (pending_routes > 0 && pending_routes <= kVectorTokens) {
+                const std::size_t used =
+                    std::size_t(config.num_experts_per_tok) * pending_routes;
                 for (std::size_t i = 0; i < layers.size(); ++i) {
                     cache->observe(i, std::span(host + i * pairs, used), pending_routes);
                 }
@@ -2415,17 +2420,19 @@ struct Executor::Impl {
             return;
         }
         if (misses && t <= kVectorTokens) {
-            // The cached pairs run at once; the missing experts arrive (or the CPU computes them)
-            // meanwhile, and run in a second stage.
+            // The cached pairs run at once; the missing experts' gate+up tables arrive first
+            // (their down tables follow behind the up GEMV), and the CPU computes its share
+            // meanwhile.
             Tensor y(rank.y, DType::FP32, {h, t});
             auto scope      = ws.scope();
             const auto call = misses->begin(index, ids, mixed, t, m.banks(), s);
             if (ops::moe_experts_gguf_decode_supported(m.banks(), t)) {
                 const auto state = ops::moe_experts_gguf_decode_begin(
                     mixed, call.cached_ids, shared, m.banks(), ws, s, &rank.side);
-                misses->await(index, s);
+                misses->await_up(index, s);
                 ops::moe_experts_gguf_decode_missing(state, mixed, call.missing_ids,
                                                      call.missing_banks, s);
+                misses->await(index, s);
                 ops::moe_experts_gguf_decode_finish(state, call.cached_ids, &call.missing_ids,
                                                     weights, m.banks(), &call.missing_banks,
                                                     call.products, call.pairs, call.count, y, s);

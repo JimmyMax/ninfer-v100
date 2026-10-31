@@ -800,7 +800,7 @@ What a decode round spends on (nvprof over the measured region, MTP 3, all misse
 
 In steady state a round's four tokens route about forty expert slots per layer, and the cache
 misses a few of them (about 4.6, from the round's 1.36 ms layer budget and the 80.4 µs average
-copy); staging those 4.6 × 3.43 MiB through PCIe 3.0 (≈13 GB/s effective) is ~1.1 ms per layer,
+copy); staging those 4.6 × 2.18 MiB through PCIe 3.0 (≈13 GB/s effective) is ~0.8 ms per layer,
 most of the ~1.36 ms layer budget. The decode rate is therefore set by the miss traffic, not
 by compute: the nospec arm (33.6 tok/s) pays the same staging per token but amortizes the layer's
 fixed work (dense projections, GDN, routing, KV) over one token a round instead of 2.9;
@@ -830,6 +830,14 @@ without taking VRAM from the context. Two measurements show the remaining struct
 * An 8-token prompt with 512 decode tokens reaches **56.3 tok/s** (acceptance 71.8%) on the same
   artifact and card, because the small prompt leaves the cache to decode routing. A 512-token
   prompt that fills the cache with prompt-phase experts before the same decode drops it to ~44.
+  That drop is now explained and fixed, not an open question: every pass's routes — prompt chunks
+  included — were fed to the cache's frequency tiers, and a 2,048-token chunk decays the whole
+  working set by 0.999^2048 ≈ 13% before the prompt's own routes move it. Stopping that
+  (only decode and verification passes feed the tiers; prefill never reads the cache) measured,
+  same sitting, same 512+128 protocol: nospec **27.7 → 34.0 tok/s (+23%)**, hit rate
+  66.9% → 92.7%; MTP 3 with a seeded cache **31.5 → 33.3 tok/s (+5.7%)**, hit rate
+  82.6% → 93.7%, acceptance unchanged. (The absolute levels are a degraded GPU sitting; the
+  old/new binaries match each other within ±1.5 there, which is what the A/B is for.)
 * The recorded per-layer route histogram of a 512-token decode shows that the 248 experts per
   layer that 24.1 GiB can hold cover **95.1% of all routes** if residency were chosen by frequency
   (top-100: 75.1%, top-150: 85.9%, top-300: 98.5%; 7,663 of 25,088 experts are never routed by
@@ -838,15 +846,25 @@ without taking VRAM from the context. Two measurements show the remaining struct
 
 Seeding the cache from that histogram (`--expert-profile`, the engine's existing warm-start path)
 is already a measured win on a cold cache, same sitting: decode **31.1 → 38.9 tok/s (+25%)**, hit
-rate 38.8% → 71.5%, staging service time 2.91 → 1.67 s. The Flash-Next service seeds from
-`expert-profile-iq3s.json` (recorded on this artifact, validated by artifact id).
+rate 38.8% → 71.5%, staging service time 2.91 → 1.67 s. The Flash-Next service now seeds from a
+**mixed-corpus** profile (`expert-profile-mixed.json`: code7k + zh7k, 2,048 decode tokens each,
+recorded with the fixed, decode-only counting; top-248-per-layer coverage 93.4% vs 95.6% for
+the code-only profile — merging flattens the long tail, and for unknown traffic the mix is the
+right expectation). It also runs `--expert-profile-out`, which writes the process's cumulative
+real-traffic route histogram after every completed request; when the traffic mix stabilizes,
+that file is the seed to deploy.
 
-The path to the ~70 tok/s that an overlapped round would allow is structural, and is queued as
-S0.24 in `docs/v100/PLAN.md`: overlap the staging with the layer's own compute (stage gate+up,
-run the up GEMV while down copies, or split the miss set in halves and accumulate partial sums),
-keep prompt-phase routes from evicting decode-hot experts, and choose residency by frequency
-(seeded) rather than by arrival. Device residency (53.7 GiB for IQ3_S) and Q2_0 (69.6 here at a
-lower perplexity) remain the other two ways past the 44 tok/s line.
+The path to the ~70 tok/s that an overlapped round would allow is structural. S0.24 in
+`docs/v100/PLAN.md` closed it out: staging each miss in two stages (gate+up, then down) with the
+up GEMV behind the first stage is neutral at t=1 — a missing expert's up GEMV reads only
+1.25 MiB of weights (~1 µs per layer), far less than the 0.2 ms of down staging it hides; and
+splitting the miss set in halves (or pipelining staging across layers) is a dead end, because a
+layer's routing needs the previous layer's MoE output, so there is no GPU work left to overlap
+the staging with. What remains reachable on this card at IQ3_S quality is the hit rate: seeding
+(+25% cold), the prompt-pollution fix above (+23% nospec on a degraded sitting), and the
+difference between the 86% steady-state and the 95.1% optimal residency. Device residency
+(53.7 GiB for IQ3_S) and Q2_0 (69.6 here at a lower perplexity) remain the other two ways past
+the 44 tok/s line.
 
 For scale: a 27B model whose weights fit the card is DRAM-bound and reaches 70+ tok/s in
 llama.cpp builds because every weight is read once per token at ~875 GB/s. IQ3_S's routed experts
