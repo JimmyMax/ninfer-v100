@@ -863,6 +863,26 @@ long prompts. The remaining levers for prefill on this card are the bus itself (
 doubles it), the artifact's expert size (Q2_0's 1.32 MiB experts: 224.8 tok/s at 512, +43%, at the
 perplexity cost noted above), or device residency (53.7 GiB, which this card cannot hold).
 
+The nvprof decomposition of a 4,096-token span prefill (two buffers, one pass per layer) puts the
+measured 955 tok/s best-sitting rate within ~15% of this card's floor:
+
+| Activity | Share of profiled GPU time |
+|---|---:|
+| host-to-device expert staging (25.4 GB, 120,649 copies) | 48.5% |
+| MoE wide calls (i-quant, all layers) | ~14% |
+| GDN recurrent prefill (2,272 calls) | 9.1% |
+| cuBLAS (GDN projections, routers, hyper-connections) | 7.7% |
+| full-attention layers (12, O(T²)) | 3.9% |
+| host-side waits | 3.1% |
+| hyper-connections, routing, KV, quantize | ~10% |
+
+Staging at the bus peak (~12 GB/s wall) is ~2.0 s and compute (≈55 TFLOP of the 4,096 tokens) is
+~1.2-2.2 s; with the two buffers they overlap, and the measured 4.3 s best-sitting time is close
+to max(staging, compute) plus the wait tail. A cold first request of the service (no warm-up
+overlap) measures 742 tok/s at 3,702 tokens. Squeezing the last 10-20% means the GDN recurrent
+prefill kernel (47 sequential calls per layer per 2,048-token span) and the wide i-quant calls —
+kernel work with diminishing returns; the 2,000+ tok/s line needs a PCIe 4.0 bus or smaller experts.
+
 ### Serving with host experts on one RTX 3090
 
 `ninfer-serve`, INT8 KV, an 8,192-position context, one request at a time; three prompts (Python
