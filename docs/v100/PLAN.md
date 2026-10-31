@@ -393,6 +393,46 @@ sm_70 的 FP16 范围饱和(上游 `67778be`+`2d69547`)。
       66K −1.0%(归属:精确 NVFP4 解码 645 ms + flash 每次调用 21.2 对 21.6 ms 但多 80 次)
 * 详见 [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md)。
 
+### S0.22 Flash-Next IQ3_S 的 V100 终态优化：PCIe 暂存是天花板 ☑（2026-10-31）
+
+目标：不降质量把 Flash-Next IQ3_S（host experts）的 V100 decode 提到 60–80 tok/s。结论：
+**本卡 + 本制品的 decode 天花板 ≈ 44 tok/s（MTP d3）**，60–80 需要 Q2_0 质量档（69.6 已测，
+ppl 2.6509 vs 2.1317）或设备驻留（IQ3_S 需 53.7 GiB，32 GB 卡放不下）。全部旋钮已测完：
+
+终态配置（干净 sitting，512+128，code7k，INT8 KV，ctx 8192，cache 24,118 MiB = 30% experts）：
+`--spec mtp --draft-tokens 3 --expert-residency host --expert-dma-share 1 --kv-dtype int8
+--max-context 8192`，exact CPU 算术（默认）、CUDA graph 默认开 → **prefill 157 / decode
+43.5–44.0 / acc 62.5%**。
+
+| 旋钮 | decode | 结论 |
+|---|---:|---|
+| MTP d2 | 43.52 | 与 d3 无差（干净 sitting） |
+| **MTP d3（终态）** | **43.81 均值**（43.45/43.57/43.97/43.99） | 最佳 |
+| MTP d4 | 39.82 | −9% |
+| nospec | 33.6 | 固定开销只摊 1 token/轮 |
+| `--draft-min-p 10` | 43.8 | 无作用：没有草稿低于 10% floor（MTP 头过度自信，per_pos 67/58/42%） |
+| dma 0.8（CPU 20%） | 43.5 | 与 dma=1 相等 |
+| dma 0.7 / 0.9 / 0.6 | 28.1 / 28.6 / 27.0 | −35%：CPU i-quant vecdot ≈0.6–2 GB/s(expert 字节,compute-bound),远慢于 13 GB/s 总线,替代不了还串行化 |
+| ggml-cpu（dma=1 时） | 无变化 | dma=1 时 CPU 不算任何 miss（+1.8% 只对 CPU 份额有意义） |
+| graph off | 相等 | 32.1/32.1（同 sitting） |
+| ngram 拷贝草稿（15 token） | 结构性错误杠杆 | 混合投机稀释接受率（dense 27B：64.2 vs 78.3，S0.12）；MoE 上每多一个验证 token ≈ +10% 轮暂存 |
+| ctx 8192 vs 200000 | cache 24.1 vs 15.6 GiB | 30.0% vs 19.5% 覆盖；长上下文服务按产品需要取 200000 |
+| disk experts | decode 相等，prefill −60% | host 始终更优 |
+
+nvprof 分解（MTP d3，dma=1）：H2D 专家暂存 **49.0%**（145,603 次拷贝，均 80.4 µs）+ 等 CPU 侧
+13.5% + GDN 6.8% + MoE stage-2 3.4% + cuBLAS 3.1% + 其余 ~24%。稳态每轮每层 miss ≈4.6 个专家，
+4.6 × 3.43 MiB / 13 GB/s ≈ 1.1 ms/层，占 1.36 ms 层预算的大头 → decode 由 miss 流量而非算力
+决定。同配置在 PCIe 4.0/5.0 卡上也是 29.3–41.0 tok/s（docs/performance.md 表），印证瓶颈是
+host 驻留的暂存结构而非本卡独有。
+
+工程改动（已提交/待提交）：
+
+* bench 仪表化：`config.expert_service_seconds`（暂存服务墙钟）+ `--draft-min-p`（bench 草稿
+  floor 试验旋钮），为归因服务
+* `20aa77af6`：ggml-cpu 快速 CPU 后端（opt-in `--expert-cpu-arithmetic ggml`，exact 保持默认
+  位精确）——本卡 dma=1 下无收益，但在 CPU 更快的主机上可把 CPU 份额从 −35% 拉回
+* Q2_0 制品支持验证：GPU/精确 CPU/AVX2 三路径均覆盖，69.6 tok/s 已测（SHA256 验证的官方制品）
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。

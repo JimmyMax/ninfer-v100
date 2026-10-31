@@ -738,6 +738,21 @@ second stage waits on it and the hybrid loses to the all-GPU miss path (30.0-30.
 vecdot kernels are +1.8% over the exact q8_1 products for the share they compute. The default
 (exact arithmetic, all misses on the GPU) stays the fastest configuration on this host.
 
+The same sweep on a clean sitting (the same protocol, this host, the exact q8_1 arithmetic;
+the `--expert-dma-share` value shown, 1.0 = every miss on the GPU):
+
+| DMA share | 1.0 | 0.8 | 0.7 | 0.9 | 0.6 |
+|---|---:|---:|---:|---:|---:|
+| Decode, tok/s | 43.5 | 43.5 | 28.1 | 28.6 | 27.0 |
+
+A 20% CPU share costs nothing (the CPU's 0.2 share fits in the round's staging time); every
+other share tested costs about 35%, because the CPU's i-quant vecdot products run at a few GB/s
+of expert bytes (compute-bound on this Xeon, measured at ~0.6-2 GB/s effective), far slower than
+the 13 GB/s bus they replace, so the round ends up waiting on the CPU; the service thread also
+serializes the two. The all-GPU miss path (`--expert-dma-share 1`) is the fastest configuration
+on this host; the ggml-cpu vecdot kernels (above) matter only for the share the CPU takes,
+which is best kept at zero here.
+
 ### Q2_0 on one V100
 
 The [Q2_0 release](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3)
@@ -757,6 +772,63 @@ round's miss traffic falls by the same factor; the cache holds 19,539 of the 24,
 (79.5%) instead of 7,372 (30.0%). Prefill rises from 157 to 225 tok/s on the same protocol.
 Q2_0's perplexity on this card is 2.6509 (14-window protocol, llama.cpp 2.6502) against IQ3_S's
 2.1317; on the same smoke prompt the MTP answer is identical to the plain decode's.
+
+### IQ3_S on one V100: the final configuration
+
+The IQ3_S release, experts in pinned host memory, every miss on the GPU, MTP with three
+drafts, INT8 KV, an 8,192-position context, exact CPU arithmetic, CUDA graphs on. Tesla
+V100-PCIE-32GB, a 512-token prompt and 128 generated tokens of a 7,051-token code corpus, two
+repetitions; the expert cache holds 24,118 MiB (7,372 of 24,576 experts, 30.0%):
+
+| Drafter | Prefill, tok/s | Decode, tok/s | Drafts accepted | Per draft position |
+|---|---:|---:|---:|---|
+| none | 157.5 | 33.6 | | |
+| MTP 2 | 155.4 | 43.5 | 71.9% | 84 / 67% |
+| MTP 3 (final) | 156.8-157.4 | 43.5-44.0 | 62.5% | 67 / 58 / 42% |
+| MTP 4 | 157.4 | 39.8 | 54.0% | 62 / 49 / 34 / 30% |
+
+What a decode round spends on (nvprof over the measured region, MTP 3, all misses on the GPU):
+
+| Activity | Share of GPU time |
+|---|---:|
+| host-to-device expert staging (145,603 copies, 80.4 µs each) | 49.0% |
+| waiting on the CPU side of the round | 13.5% |
+| GDN recurrent attention | 6.8% |
+| MoE second stage (down projections, Q4_NL) | 3.4% |
+| cuBLAS GEMMs (embed, router, shared expert) | 3.1% |
+| MoE first stage, vector ops, routing, PLE, KV | ~24% |
+
+In steady state a round's four tokens route about forty expert slots per layer, and the cache
+misses a few of them (about 4.6, from the round's 1.36 ms layer budget and the 80.4 µs average
+copy); staging those 4.6 × 3.43 MiB through PCIe 3.0 (≈13 GB/s effective) is ~1.1 ms per layer,
+most of the ~1.36 ms layer budget. The decode rate is therefore set by the miss traffic, not
+by compute: the nospec arm (33.6 tok/s) pays the same staging per token but amortizes the layer's
+fixed work (dense projections, GDN, routing, KV) over one token a round instead of 2.9;
+Q2_0's 69.6 tok/s above is its 1.32 MiB experts halving that traffic (at the perplexity cost
+noted there).
+
+Levers measured on this card, same protocol, clean sittings:
+
+| Lever | Result |
+|---|---|
+| `--draft-min-p 10` | 43.8 tok/s; no draft falls below the 10% floor (the MTP head is over-confident), so the filter removes nothing |
+| `--expert-dma-share 0.8` | 43.5 tok/s (equal; a 20% CPU share fits in the staging time) |
+| `--expert-dma-share` 0.7 / 0.9 / 0.6 | 28.1 / 28.6 / 27.0 tok/s (−35%); see the CPU-arithmetic sweep above |
+| ggml-cpu arithmetic at `--expert-dma-share 1` | no effect (no miss is computed on the CPU) |
+| CUDA graphs off | equal (32.1 vs 32.1 tok/s on a degraded sitting; both the same on a clean one) |
+| n-gram copy drafting (15 tokens, `--ngram-draft-tokens 15`) | the mixed speculation dilutes the acceptance (64.2 vs 78.3 tok/s on the dense 27B, same sitting) and would add more distinct experts to this MoE model's round staging |
+| n-gram lookup drafting (one more verify token) | +1 verify token ≈ +10% of the round's staging; the extra token's own staging outweighs the draft's gain |
+| `--max-context 8192` against 200,000 (service) | 8192 frees 8.5 GiB for the expert cache (24.1 vs 15.6 GiB, 30.0% vs 19.5% coverage) |
+| disk experts (page cache) | decode equal to host, prefill −60% |
+
+The 60-80 tok/s target is out of reach for IQ3_S on this card without the quality trade: the
+round's staging is ~60-80% of the per-layer time, the bus is 13 GB/s, the CPU's i-quant products
+are far slower than the bus (a hybrid share substitutes a slower resource for the staging
+rather than hiding it), and the cache cannot grow further without taking VRAM from the weights
+(already at IQ3_S quality) or the context. The same host-residency configuration tops out at 29.3-41.0 tok/s on the PCIe 4.0 and
+5.0 cards in the table above, and Q2_0 reaches 69.6 here at a lower perplexity; device
+residency (which removes the staging) needs 53.7 GiB of VRAM for IQ3_S, which the 32 GB card
+cannot hold.
 
 ### Serving with host experts on one RTX 3090
 
