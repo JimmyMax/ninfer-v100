@@ -341,6 +341,8 @@ std::string usage_text(std::string_view program) {
         << "  --adaptive-mtp              verify an adaptive 3..K drafts per MTP round\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
         << "  --ngram-min-match <n>      copy admission 4..64 (default: 12)\n"
+        << "  --draft-min-p <0..100>     MTP: keep drafting while the head's probability stays"
+        << " above this floor, percent (default: 0 = no floor)\n"
         << "  --lm-head-draft             use the optimized proposal head (the default when the "
            "artifact stores one); requires a speculative backend\n"
         << "  --full-draft-head           use the full output head for drafts\n"
@@ -513,6 +515,9 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match =
                 parse_u32(value("--ngram-min-match"), "ngram-min-match");
+        } else if (arg == "--draft-min-p") {
+            options.speculative.draft_min_p =
+                parse_u32(value("--draft-min-p"), "draft-min-p", true) / 100.0f;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--full-draft-head") {
@@ -887,6 +892,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"expert_hits\": " << env.experts.hits << ",\n"
         << "    \"expert_admissions\": " << env.experts.admitted << ",\n"
         << "    \"expert_transferred_bytes\": " << env.experts.transferred_bytes << ",\n"
+        << "    \"expert_service_seconds\": " << env.experts.service_seconds << ",\n"
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"
         << "    \"draft_tokens\": " << env.speculative.draft_tokens << ",\n"

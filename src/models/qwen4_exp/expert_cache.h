@@ -42,6 +42,7 @@ struct ExpertCacheStats {
     std::uint32_t slots        = 0;
     std::uint64_t cpu_routes   = 0; // native hybrid: routed (token, expert) pairs computed on CPU
     std::uint64_t dma_routes   = 0; // native hybrid: uncached pairs staged to GPU slots
+    double service_seconds = 0.0; // host time from a miss request to its readiness, summed
 };
 
 class ExpertCache {

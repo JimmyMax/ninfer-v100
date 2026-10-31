@@ -3883,6 +3883,7 @@ ExpertCacheStats Executor::expert_cache_stats() const noexcept {
         const auto staged = impl_->misses->stats();
         out.cpu_routes += staged.cpu_pairs;
         out.copied_bytes += staged.staged_bytes;
+        out.service_seconds += staged.service_seconds;
     }
     return out;
 }

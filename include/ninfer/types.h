@@ -1740,6 +1740,7 @@ struct ExpertResidencyStats {
     std::uint64_t admitted          = 0;
     std::uint64_t transferred_bytes = 0;
     std::uint32_t slots             = 0;
+    double service_seconds          = 0.0; // host time from a miss request to readiness, summed
 };
 
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
