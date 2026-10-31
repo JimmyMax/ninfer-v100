@@ -462,6 +462,28 @@ Q2_0（1.32 MiB/expert，512 prefill 224.8 tok/s，+43%，质量档代价）、�
    归因（暂存 per-copy 均值 137 vs 93 µs）：若坐实为坐席漂移则关闭，否则查 pool 单 pass
    预取链（B=2 理论上已重叠，代码已确认）。
 
+### S0.24 Flash-Next decode 的暂存/计算重叠（后续计划，2026-10-31 排入）☐
+
+现状：decode 44 tok/s（8192 ctx、MTP d3、cache 24.1 GiB）。nvprof：H2D 49% + 等 CPU 侧 13.5%
+与计算 37.5% **串行**（每层 0.85 ms 暂存 + 0.51 ms 计算 = 1.36 ms）。若两者完全重叠，
+每层 → 0.85 ms，即 ~70 tok/s（已排队项：cache 驻留覆盖率 86% → 最优 95.1%，见
+`docs/performance.md`）。待办：
+
+1. **gate/up → down 两段暂存**：miss 服务先拷 gate+up（1.254 MiB）并点事件 A，再拷 down
+   （0.92 MiB）点事件 B；GPU 等 A 跑 up GEMV（SwiGLU），等 B 跑 down GEMV。预期：暴露的
+   暂存减少 min(down 拷贝, up 计算) ≈ 0.2 ms/层 → +15%。验收：bench A/B，decode t/s + 暂存
+   服务秒数，且数值与现路径一致（同一 Op 序列，仅切分拷贝）。
+2. **按 miss 集分半的部分和**：一半专家算完累加、再算另一半（求和次序变，非位精确），
+   预期暴露暂存再减一半 → 63–70 tok/s。验收：oracle（FP32 独立参考，2e-3） + bench A/B。
+3. **prefill 路由不得驱逐 decode 热点**：prompt chunk 的 admit 预算已为 0（`expert_cache.cpp`
+   注释），但实测 512-prompt 后 decode 仍从 56.3 降到 44；查 handed-over 后的 tier 提升与
+   `kHysteresis`，必要时给 prompt 路由单独的低配额。验收：同 sitting 512-prompt decode A/B +
+   命中率。
+4. **常规化 expert-profile 种子**：已实测冷启动 +25%（31.1→38.9）；后续做语料无关的混合
+   profile（多语料采样），并让 `--record-profile` 在服务模式定期吐出真实流量的直方图。
+
+触发条件：产品需要单流 decode >50 tok/s 时启动（与 S0.23 可并行，~1–2 周）。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。

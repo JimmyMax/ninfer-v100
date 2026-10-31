@@ -329,6 +329,8 @@ std::string usage_text(std::string_view program) {
         << "  --expert-prefill-buffers <1|2>  device buffers for a long prompt's uncached "
            "experts (default: 1)\n"
         << "  --expert-cache-adaptive     replace cold cached experts between calls\n"
+        << "  --expert-profile PATH       seed the expert cache from a recorded route histogram\n"
+        << "  --record-profile PATH       write this run's per-layer expert route counts there\n"
         << "  --ngram-table PATH          Qwen3.8-Flash-Next: the n-gram table artifact for a "
            "model published without its table\n"
         << "  --no-ngram-table            Qwen3.8-Flash-Next: run without the n-gram table "
@@ -481,6 +483,10 @@ BenchOptions parse_args(int argc, char** argv) {
             options.hybrid_experts.prefill_buffers = buffers;
         } else if (arg == "--expert-cache-adaptive") {
             options.hybrid_experts.adaptive_cache = true;
+        } else if (arg == "--expert-profile") {
+            options.hybrid_experts.routing_profile = value("--expert-profile");
+        } else if (arg == "--record-profile") {
+            options.hybrid_experts.record_profile = value("--record-profile");
         } else if (arg == "--ngram-table") {
             options.ngram_table.path = value("--ngram-table");
         } else if (arg == "--no-ngram-table") {

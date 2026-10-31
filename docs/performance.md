@@ -821,14 +821,37 @@ Levers measured on this card, same protocol, clean sittings:
 | `--max-context 8192` against 200,000 (service) | 8192 frees 8.5 GiB for the expert cache (24.1 vs 15.6 GiB at concurrency 2, 30.0% vs 19.5% coverage); decode scales with the cache — 24.9 / 27.9 / 30.5 tok/s in one sitting at 200,000 / 32,768 / 8,192 context (concurrency 1), so the clean 44 tok/s at 8,192 becomes ~36 at 200,000 and ~40 at 32,768 |
 | disk experts (page cache) | decode equal to host, prefill −60% |
 
-The 60-80 tok/s target is out of reach for IQ3_S on this card without the quality trade: the
-round's staging is ~60-80% of the per-layer time, the bus is 13 GB/s, the CPU's i-quant products
-are far slower than the bus (a hybrid share substitutes a slower resource for the staging
-rather than hiding it), and the cache cannot grow further without taking VRAM from the weights
-(already at IQ3_S quality) or the context. The same host-residency configuration tops out at 29.3-41.0 tok/s on the PCIe 4.0 and
-5.0 cards in the table above, and Q2_0 reaches 69.6 here at a lower perplexity; device
-residency (which removes the staging) needs 53.7 GiB of VRAM for IQ3_S, which the 32 GB card
-cannot hold.
+The 60-80 tok/s target is out of reach for IQ3_S on this card **in the current shape of the
+round**, not by the card's own limit: the round's staging and compute are serialized, the bus is
+13 GB/s, the CPU's i-quant products are far slower than the bus (a hybrid share substitutes a
+slower resource for the staging rather than hiding it), and the cache cannot grow much further
+without taking VRAM from the context. Two measurements show the remaining structure:
+
+* An 8-token prompt with 512 decode tokens reaches **56.3 tok/s** (acceptance 71.8%) on the same
+  artifact and card, because the small prompt leaves the cache to decode routing. A 512-token
+  prompt that fills the cache with prompt-phase experts before the same decode drops it to ~44.
+* The recorded per-layer route histogram of a 512-token decode shows that the 248 experts per
+  layer that 24.1 GiB can hold cover **95.1% of all routes** if residency were chosen by frequency
+  (top-100: 75.1%, top-150: 85.9%, top-300: 98.5%; 7,663 of 25,088 experts are never routed by
+  that corpus). The adaptive policy actually reaches ~86% in steady state, so ~9 points of hit
+  rate — and with them ~40% of the staging — are recoverable without more VRAM.
+
+Seeding the cache from that histogram (`--expert-profile`, the engine's existing warm-start path)
+is already a measured win on a cold cache, same sitting: decode **31.1 → 38.9 tok/s (+25%)**, hit
+rate 38.8% → 71.5%, staging service time 2.91 → 1.67 s. The Flash-Next service seeds from
+`expert-profile-iq3s.json` (recorded on this artifact, validated by artifact id).
+
+The path to the ~70 tok/s that an overlapped round would allow is structural, and is queued as
+S0.24 in `docs/v100/PLAN.md`: overlap the staging with the layer's own compute (stage gate+up,
+run the up GEMV while down copies, or split the miss set in halves and accumulate partial sums),
+keep prompt-phase routes from evicting decode-hot experts, and choose residency by frequency
+(seeded) rather than by arrival. Device residency (53.7 GiB for IQ3_S) and Q2_0 (69.6 here at a
+lower perplexity) remain the other two ways past the 44 tok/s line.
+
+For scale: a 27B model whose weights fit the card is DRAM-bound and reaches 70+ tok/s in
+llama.cpp builds because every weight is read once per token at ~875 GB/s. IQ3_S's routed experts
+alone are 53.7 GiB, so this model on a 32 GB card reads them over PCIe instead — the numbers above
+are that structure's floor, not the card's ceiling.
 
 ### Prefill of host experts, one V100
 
