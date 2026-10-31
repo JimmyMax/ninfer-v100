@@ -416,7 +416,7 @@ ppl 2.6509 vs 2.1317）或设备驻留（IQ3_S 需 53.7 GiB，32 GB 卡放不下
 | ggml-cpu（dma=1 时） | 无变化 | dma=1 时 CPU 不算任何 miss（+1.8% 只对 CPU 份额有意义） |
 | graph off | 相等 | 32.1/32.1（同 sitting） |
 | ngram 拷贝草稿（15 token） | 结构性错误杠杆 | 混合投机稀释接受率（dense 27B：64.2 vs 78.3，S0.12）；MoE 上每多一个验证 token ≈ +10% 轮暂存 |
-| ctx 8192 vs 200000 | cache 24.1 vs 15.6 GiB | 30.0% vs 19.5% 覆盖；长上下文服务按产品需要取 200000 |
+| ctx 8192 vs 200000（并发 1） | cache 24.1 / 22.8 / 21.0 GiB（8192/32768/200000） | decode 同 sitting 30.5/27.9/24.9 → 干净 44 外推 ~44/~40/~36：decode 由 cache 覆盖定；服务 200000×并发 2 时 cache 15.6 GiB → 实测 decode 20–27 tok/s，产品需要长上下文时接受或降 max-context |
 | disk experts | decode 相等，prefill −60% | host 始终更优 |
 
 nvprof 分解（MTP d3，dma=1）：H2D 专家暂存 **49.0%**（145,603 次拷贝，均 80.4 µs）+ 等 CPU 侧
@@ -444,6 +444,23 @@ router→暂存路由专家→MoE（下一层路由依赖当前层 MoE 输出，
 显存（cache −5%）→ **flashnext 服务已启用**（长 prompt 场景）。剩余杠杆：PCIe 4.0 主机（总线×2）、
 Q2_0（1.32 MiB/expert，512 prefill 224.8 tok/s，+43%，质量档代价）、设备驻留（53.7 GiB 放不下）。
 详见 `docs/performance.md` “Prefill of host experts, one V100”。
+
+### S0.23 Flash-Next prefill kernel 调优（后续计划，2026-10-31 排入）☐
+
+现状：4096 tok prefill 最佳 sitting 955 tok/s，离本卡地板（暂存 1.95 s @13 GB/s + 计算
+~1.2–2.2 s，B=2 已重叠）差 ~15%。nvprof 分解见 docs/performance.md。待办（收益递减，
+1–2 周量级，仅在产品需要 >1k prefill 时启动）：
+
+1. **GDN recurrent prefill kernel**（占 profiled 9.1%）：2,048 tok/层跑 47 次顺序调用
+   （~43 tok/次，状态 1 MB/层放不进寄存器）。目标：整宽单次/扫描路径，状态过 DRAM；
+   验收：kernel bench 冷 L2 T=2048 接近 2.8 ms/层注释值，prefill A/B +3–5%。
+2. **MoE wide i-quant kernel**（~14%）：现 profiled ~5.8 TFLOPS（int=128 token 块）；
+   对照 sm70 mmq 路径与更大 token 块（t=2048 下 128→256）；验收：op microbenchmark
+   + prefill A/B。
+3. **wait 尾巴（3.1%）**：host 侧轮询/事件链归因；预期收益 <1%。
+4. 单 pass（≤2048）与 span 的 per-token 差距（228 vs 918 tok/s，同 sitting nvprof）待复现
+   归因（暂存 per-copy 均值 137 vs 93 µs）：若坐实为坐席漂移则关闭，否则查 pool 单 pass
+   预取链（B=2 理论上已重叠，代码已确认）。
 
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 

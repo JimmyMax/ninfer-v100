@@ -818,7 +818,7 @@ Levers measured on this card, same protocol, clean sittings:
 | CUDA graphs off | equal (32.1 vs 32.1 tok/s on a degraded sitting; both the same on a clean one) |
 | n-gram copy drafting (15 tokens, `--ngram-draft-tokens 15`) | the mixed speculation dilutes the acceptance (64.2 vs 78.3 tok/s on the dense 27B, same sitting) and would add more distinct experts to this MoE model's round staging |
 | n-gram lookup drafting (one more verify token) | +1 verify token ≈ +10% of the round's staging; the extra token's own staging outweighs the draft's gain |
-| `--max-context 8192` against 200,000 (service) | 8192 frees 8.5 GiB for the expert cache (24.1 vs 15.6 GiB, 30.0% vs 19.5% coverage) |
+| `--max-context 8192` against 200,000 (service) | 8192 frees 8.5 GiB for the expert cache (24.1 vs 15.6 GiB at concurrency 2, 30.0% vs 19.5% coverage); decode scales with the cache — 24.9 / 27.9 / 30.5 tok/s in one sitting at 200,000 / 32,768 / 8,192 context (concurrency 1), so the clean 44 tok/s at 8,192 becomes ~36 at 200,000 and ~40 at 32,768 |
 | disk experts (page cache) | decode equal to host, prefill −60% |
 
 The 60-80 tok/s target is out of reach for IQ3_S on this card without the quality trade: the
