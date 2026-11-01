@@ -532,6 +532,33 @@ kernel 侧四项均无廉价杠杆；955 tok/s 已在本卡地板 ~15% 以内。
 sitting）。70+ 需要 Q2_0（1.32 MiB 专家，69.6，perplexity 代价）或双卡 pipeline。详见
 `docs/performance.md` 的 IQ3_S 一节。
 
+### S0.26 上游 DeepSeek-V4.1-Flash / STQ 草稿器：评估后不做 ☑（2026-11-01 只评估、不改代码）
+
+上游 2026-10-27 那条 What's New（`d3b2475cf`、`8df4ba6bd`、`7152edf2a`、`f34164f07`）不是
+Flash-Next 的优化，是**新模型家族** `DeepSeek-V4.1-Flash-1017`（`DeepseekV41ForCausalLM`）：
+自带 `src/models/deepseek_v41`（executor 1751 行、kernels 1373 行、engram、vision，合计约 4.8k 行）、
+自带 `runtime/engine/deepseek_v41_core`、Qwen3.5 frontend 的 DeepSeek 方言（DSML 工具调用，311 行）、
+converter 与参考实现、测试与 fixture；再叠上 DSpark 草稿器（4 次提交，`--spec dspark`）和它对
+草稿器的 STQ 量化（新 Op `src/ops/linear/stq`，`stq_linear.cu` 262 行 + 329 行测试）。
+
+不做，三条理由（都已核实）：
+
+1. **本机跑不了**。公开制品 117.18 GiB（HF 仓库单文件，经 hf-mirror API 核实），本机物理内存
+   125 GB、可用 55 GB；该模型是 host 专家型（上游参考机 249–251 GiB）。换代码也解决不了。
+2. **与 Flash-Next 无关**。它不改 Qwen3.8-Flash-Next / Gemma 4 / Qwen3.8-27B 的任何一条路径。
+   按仓库约定，新数学架构属于产品级变更，不是性能 backport。
+3. **那个 1.4× 的机制在这里不成立**。上游的收益不是"STQ 更快"，而是他们的草稿器占满了显存、
+   把专家缓存挤没了：同一张 4090，无草稿器可驻留 1,137 个专家，Unsloth 草稿器只剩 73 个，
+   STQ 回到 618 个。我们的 MTP 块只有 2.58 GiB（制品 `mtp` 组件，512 个 Q8_0 专家），按缓存
+   3.27 MiB/槽折算 ≈ 808 槽，占 24,576 个专家的 **3.3%**，而不是 94%。
+
+唯一有类比价值的一点（也评估了，收益太小）：MTP 块占 2.58 GiB 显存，把它量化减半可腾出
+~1.3 GiB 给专家缓存；按本页实测的缓存-速率关系（15.6 / ~22 / 24.1 GiB → 24.9 / 27.9 / 30.5 tok/s，
+约 0.66 tok/s per GiB）约合 **+2–3% decode**。为此改制品 MTP 组件不值得，暂不做。
+
+顺带记录：STQ 的 kernel 本身对 Volta 无害（无 `mma.sync`，纯 FP32 + `__shfl_xor_sync` 的
+Walsh-Hadamard），若将来真需要该格式，障碍不在 kernel，而在它只服务于那一个草稿器包。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
