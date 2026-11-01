@@ -583,6 +583,28 @@ AIME/GPQA 等下游基准数字。作为对照，Flash-Next IQ3_S 在我们自�
 DeepSeek 的词表小一半（同质量下每 token perplexity 应更低），实测却没更低，且它只能用 1.75 bit
 这一个版本（Q4 约 270 GB、BF16 更大），所以“质量更好”在 1.75 bit 上不可证，也不可交付。
 
+### S0.27 多架构构建（sm_70+sm_89）与异构双卡 ☑/◐（2026-11-01）
+
+目标：一个二进制同时带 sm_70 与 sm_89 原生 SASS，在 V100+4080 双卡上做 Flash-Next 层切分，
+让 4080 不再走 Volta PTX 的 JIT（JIT 版实测 decode 69.9 tok/s，V100 单卡 37.2）。
+
+1. ☑ **构建已打通**（提交 `5062dccef`）。原先 `CMAKE_CUDA_ARCHITECTURES="70;89"` 根本链不起来：
+   (a) 所有 Volta-only 源用 `STREQUAL "70"` 精确匹配，多架构构建把它们和 CUTLASS 全排除；
+   (b) 这些单元的实现整个在 `NINFER_TIER_VOLTA && (… || __CUDA_ARCH__ == 700)` 里并依赖只在
+   该通道声明的类型，`compute_89` 的宿主通道引用其内部链接核函数。CMake **没有**源级
+   `CUDA_ARCHITECTURES`（设了会被静默忽略），故按 `ninfer_nvfp4_non_rdc` 的先例给它们建独立
+   目标 `ninfer_ops_volta` + `CUDA_ARCHITECTURES 70`。产物 1.1 GB，405 个 sm_70 + 392 个 sm_89
+   cubin，无 PTX。
+2. ◐ **异构双卡仍不可用**。fat 二进制在 V100+4080 上启动即在 `sm70_small.cu` 抛
+   `cudaErrorInvalidDeviceFunction`：本仓库的 Volta 路线选择是**编译期**的（`NINFER_TIER_VOLTA`），
+   不是按设备运行时判断，所以 4080 阶段会启动只有 sm_70 SASS 的核函数。运行时 tier API
+   （`device_tier()` / `tier_built()`，`src/ops/common/device_tier.h`）已存在，但 sm70 入口点没查它。
+   修法是把每个 stage 的 linear policy 按设备 tier 传下去（或在这些入口点加运行时判断），
+   属于模型层的实质改动，未做。
+3. 结论：Flash-Next 多卡层切分目前只适用于**同架构**卡；异构组合只能用 sm70 二进制让 4080
+   走 compute_70 的 JIT（即上面 69.9 tok/s 的配置）。而多卡的收益本就来自「多一条总线 + 每卡
+   只管一半层」，与架构无关——两张 V100 才是干净解。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
