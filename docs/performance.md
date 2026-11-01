@@ -773,6 +773,40 @@ round's miss traffic falls by the same factor; the cache holds 19,539 of the 24,
 Q2_0's perplexity on this card is 2.6509 (14-window protocol, llama.cpp 2.6502) against IQ3_S's
 2.1317; on the same smoke prompt the MTP answer is identical to the plain decode's.
 
+### IQ3_S on an RTX 4080 SUPER, against one V100
+
+Same artifact, same flags, both cards in the same sitting: the IQ3_S release, host experts, every
+miss on the GPU (`--expert-dma-share 1`), INT8 KV, an 8,192-position context, a 512-token prompt
+and 128 generated tokens of a 7,051-token code corpus, a warmup and two repetitions, double-buffered
+prefill, no profile seed. Each card runs its own build (`sm_70` and `sm_89`):
+
+| Card | Drafter | Prefill, tok/s | Decode, tok/s | Drafts accepted | Expert cache | Cache hits |
+|---|---|---:|---:|---:|---:|---:|
+| Tesla V100-PCIE-32GB | none | 175.8 | 36.1 | — | 22,983 MiB | 92.1% |
+| Tesla V100-PCIE-32GB | MTP 3 | 174.9 | 45.2 | 58.4% | 22,816 MiB | 90.0% |
+| RTX 4080 SUPER | none | 180.3 | **75.0** | — | 22,773 MiB | 92.6% |
+| RTX 4080 SUPER | MTP 3 | 182.1 | **87.2** | 62.5% | 22,605 MiB | 90.9% |
+
+The 4080 SUPER decodes **2.08× (no drafter) / 1.93× (MTP 3)** the V100's rate at the same cache
+size and hit rate, and prefills at the same speed (1.03-1.04×). The split has one cause: both cards
+sit on the host's **PCIe 3.0 x16** link (the 4080 SUPER is a Gen4 part whose link negotiates down to
+Gen3 on this X99 platform; `nvidia-smi` reports a Gen3 maximum), and the two phases lean on different
+resources.
+
+* Prefill is expert-staging-bound: every prompt moves its routed experts across that same Gen3
+  link, so the extra compute of the 4080 SUPER buys nothing. At the same cache size and hit rate,
+  the bus sets the number and it lands within 4% on both cards.
+* Decode at ~90% cache hits is not bus-bound: the miss traffic is nearly the same per token
+  (494 against 465 MB of counted expert bytes per output token), so what separates 45 from 87 tok/s
+  is the per-expert arithmetic. `sm_89` runs the GGUF i-quant GEMV and MMA routes natively (and
+  clocks at 3.1 GHz against the V100's 1.38), where `sm_70` reaches them through its Volta routes;
+  the 4080 SUPER keeps its advantage with a drafter too, because the round's compute is not the
+  part that speculation removes.
+
+The practical reading: on this host a 4080 SUPER is the better decode card for Flash-Next and no
+better at all for prefill, so a long-prompt workload gains little from it, while a chat/instruct
+workload gains about 2×.
+
 ### IQ3_S on one V100: the final configuration
 
 The IQ3_S release, experts in pinned host memory, every miss on the GPU, MTP with three
