@@ -9,7 +9,7 @@ target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
 
 # 本仓库 V100 增量：Volta 构建下 sm_70 的 NVFP4/FP8 宽 T 内核依赖 CUTLASS 头文件库
 # （顶层 CMakeLists.txt 里 FetchContent，锁定 v4.4.2）。
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+if(NINFER_ARCH_VOLTA)
   target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
 endif()
 
@@ -38,6 +38,30 @@ set_source_files_properties(
   PROPERTIES
     INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/llama_cpp_fattn"
     COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda;-diag-suppress=940>")
+# 本仓库 V100 增量：Volta-only 单元自成一个静态库，**只按 sm_70 编译**。
+# 它们的实现整个在 `#if defined(NINFER_TIER_VOLTA) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700)`
+# 里，并依赖只在该通道里声明的类型（如 Fp8VoltaQpnSchedule）。多架构构建（"70;89"）若把它们
+# 和别的架构编在同一个目标里，会多出一份 compute_89 的宿主通道，它引用该文件里只有 700 通道
+# 定义的内部链接核函数 → 链接期 undefined reference。CMake 只有 target 级的 CUDA_ARCHITECTURES
+# （没有源文件级的），所以用独立目标，和上面的 ninfer_nvfp4_non_rdc 同一思路。
+if(NINFER_ARCH_VOLTA)
+  add_library(ninfer_ops_volta STATIC)
+  set_target_properties(ninfer_ops_volta PROPERTIES CUDA_ARCHITECTURES 70)
+  ninfer_internal_includes(ninfer_ops_volta)
+  ninfer_cuda_archive(ninfer_ops_volta)
+  target_link_libraries(ninfer_ops_volta PUBLIC ninfer_core)
+  target_link_libraries(ninfer_ops_volta PRIVATE nvidia::cutlass::cutlass CUDA::cublas)
+  target_link_libraries(ninfer_ops PRIVATE ninfer_ops_volta)
+endif()
+
+# 加入 Volta-only 的源文件；非 Volta 构建里它们完全不存在，与改动前一致。
+function(ninfer_ops_add_volta_sources)
+  if(NOT NINFER_ARCH_VOLTA)
+    return()
+  endif()
+  target_sources(ninfer_ops_volta PRIVATE ${ARGN})
+endfunction()
+
 include(basic_sources.cmake)
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")

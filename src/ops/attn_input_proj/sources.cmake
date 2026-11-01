@@ -55,13 +55,9 @@ if(TARGET ninfer_nvfp4_non_rdc)
 endif()
 
 # 本仓库 V100 增量（docs/v100/PLAN.md）：Volta QPN 路径
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  target_sources(ninfer_ops PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_volta_qpn.cu")
-endif()
+ninfer_ops_add_volta_sources(
+  "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_volta_qpn.cu")
 
 # 本仓库 V100 增量：sm_70 的 FP8 宽 T（prefill）CUTLASS 路径，仅 Volta 构建编译。
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  target_sources(ninfer_ops PRIVATE
-    "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_cutlass_sm70.cu")
-endif()
+ninfer_ops_add_volta_sources(
+  "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_attn_input_cutlass_sm70.cu")

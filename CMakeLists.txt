@@ -117,7 +117,7 @@ endif()
 # 本仓库 V100 增量（docs/v100/PLAN.md）：CUTLASS 头文件库，仅 Volta 构建需要——sm_70 的
 # NVFP4/FP8 宽 T 路径先把权重解量化为 FP16，再走 CUTLASS 的 sm_70 tensor-core GEMM。
 # 与 fork 一致锁定 v4.4.2；本地构建可用 -DFETCHCONTENT_SOURCE_DIR_CUTLASS=<路径> 离线复用。
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+if(NINFER_ARCH_VOLTA)
   include(FetchContent)
   set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
   set(CUTLASS_ENABLE_TESTS OFF CACHE BOOL "Disable CUTLASS tests")
