@@ -559,6 +559,30 @@ converter 与参考实现、测试与 fixture；再叠上 DSpark 草稿器（4 �
 顺带记录：STQ 的 kernel 本身对 Volta 无害（无 `mma.sync`，纯 FP32 + `__shfl_xor_sync` 的
 Walsh-Hadamard），若将来真需要该格式，障碍不在 kernel，而在它只服务于那一个草稿器包。
 
+**"就算有 250 GB 内存"的性能估算（上游实测推算）。** 上游自己测过 V100-32GB（仅 16 GB 可用）
+和同代 Xeon + PCIe 3.0 x16 的 RTX 3090，host 专家、pinned RAM、`--max-context 16384`：
+
+| 卡 | 主机链路 | 专家缓存 | decode 短答 | decode @8K | prefill @8K |
+|---|---|---:|---:|---:|---:|
+| RTX 3090, 2× Xeon E5-2690 v4 | PCIe 3.0 x16 | 1,150 (7%) | 19.8 | 15.2 | 416 |
+| Tesla V100-32GB, Xeon Gold 6130 (只 16 GB 可用) | PCIe 3.0 x16 | 38 | 10.5 | 9.3 | 198 |
+| RTX 4090, EPYC 7K62 (只 16 GB 可用) | PCIe 4.0 x16 | 54 | 21.4 | 20.0 | 679 |
+
+上游原话："The V100 copies over PCIe 3.0 and decodes at half the RTX 4090's rate." 本机给独佔
+的 ~29–30 GB 显存时，缓存会接近 3090 那行的 1,150 个（≈7%），而算力是 Volta 级：**估算 decode
+~12–18 tok/s、prefill ~350–420 tok/s @8K**。同一张 V100 上 Flash-Next IQ3_S 现在是 decode
+43.5–44.0（MTP 3）/ 33.6（nospec）、prefill 403 @2K / 695 @4K。即：**即使内存够，DeepSeek 在这个
+卡上 decode 大约只有 Flash-Next 的 1/3，prefill 相当。** 内存侧可行：上游 host 专家峰值驻留
+115.5–115.7 GiB。
+
+质量的已知证据：该制品（IQ1_M，1.75 bpw）WikiText 1,112-token 切片 perplexity **3.067**
+（对同一存储块的 FP64 参考 3.046；NInfer 高 0.7% 来自 q8_1 激活舍入）；上游**没有任何**
+AIME/GPQA 等下游基准数字。作为对照，Flash-Next IQ3_S 在我们自己的 14×2,560 窗协议下是
+**2.1317**（Q2_0 2.6509），且 Q2_0 在 2×5090 上有 AIME 2025 **93.33**、GPQA-Diamond **84.34**。
+两组 perplexity 的 tokenizer（129,280 vs 248,320）与窗口都不同，不可直接比较；但要提醒的是
+DeepSeek 的词表小一半（同质量下每 token perplexity 应更低），实测却没更低，且它只能用 1.75 bit
+这一个版本（Q4 约 270 GB、BF16 更大），所以“质量更好”在 1.75 bit 上不可证，也不可交付。
+
 ### S1 Gemma 4 的 V100 route/device profile 调优 ☐
 
 纯配置与标定，不动 kernel。
