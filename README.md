@@ -23,14 +23,17 @@ docker run -d --gpus device=1 --ulimit memlock=-1 \
   -v /path/to/models:/workspace/models -p 8000:8000 \
   --entrypoint ninfer-serve ninfer:1.7.2 \
   /workspace/models/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3.ninfer \
-  --host 0.0.0.0 --port 8000 --api-key sk-itzy --model-id qwen \
+  --host 0.0.0.0 --port 8000 --model-id qwen \
   --max-context 200000 --prefill-chunk 2048 --kv-capacity auto --kv-dtype int8 \
   --max-concurrency 1 --spec mtp --draft-tokens 4 --lm-head-draft --ngram-draft-tokens 0
 
-curl http://localhost:8000/v1/chat/completions -H 'Authorization: Bearer sk-itzy' \
+curl http://localhost:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen","messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+`--api-key` is omitted above so the server answers unauthenticated, which is what you want while
+debugging; add `--api-key sk-...` and send `-H 'Authorization: Bearer sk-...'` to require one.
 
 The server speaks the OpenAI and Anthropic APIs on `:8000/v1` (`/v1/messages` accepts
 `"thinking": {"type": "disabled"}`). `GET /health` is 503 while loading, 200 when ready. Build with
@@ -116,17 +119,26 @@ effective) instead of being read at ~875 GB/s from HBM. That is the structure's 
 card's ceiling.
 
 Tesla V100-PCIE-32GB, the IQ3_S release, host experts, every miss on the GPU, MTP with three
-drafts, INT8 KV, an 8,192-position context, a 512-token prompt and 128 generated tokens of a
-7,051-token code corpus, two repetitions; the expert cache holds 24,118 MiB (7,372 of 24,576
-experts, 30.0%):
+drafts, INT8 KV, an 8,192-position context, and a 128-token answer over a 7,051-token code corpus,
+two repetitions; the expert cache holds 24,118 MiB (7,372 of 24,576 experts, 30.0%):
 
-| Drafter | Prefill, tok/s | Decode, tok/s | Drafts accepted |
+| Drafter | Decode, tok/s | Drafts accepted |
+|---|---:|---:|
+| none | 33.6 | — |
+| MTP 3 | **43.5–44.0** | 62.5% |
+
+Prefill is staging-bound too, and it scales with the prompt, because every prompt pays a nearly
+fixed ~20–25 GB of routed-expert staging over PCIe 3.0:
+
+| Prompt, tokens | 512 | 2,048 | 4,096 |
 |---|---:|---:|---:|
-| none | 157.5 | 33.6 | — |
-| MTP 3 | 156.8–157.4 | **43.5–44.0** | 62.5% |
+| Prefill, tok/s | 158 | 403 | 695 |
+| Staging per prompt | ~20 GB | 21 GB | 25 GB |
 
-Prefill scales with the prompt (fixed ~19–25 GB of staging per prompt, so 157 tok/s at 512, ~400
-at 2,048, ~700 at 4,096). The [Q2_0 release](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3)
+A 512-token prompt therefore looks slow (158 tok/s) only because that fixed staging is spread over
+few tokens; the live service measures **324 tok/s at a 1,769-token prompt and 711 tok/s at 3,702
+tokens**, so a real prompt prefills at 300–700+ tok/s. `--expert-prefill-buffers 2` double-buffers
+the long-prompt span path (+18–27% at 4,096). The [Q2_0 release](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3)
 (38.5 GiB) halves the expert traffic — its experts are 1.32 MiB against IQ3_S's 3.27 MiB — and
 reaches **69.6 tok/s** decode with MTP 3 (70.7% accepted) at a perplexity cost (2.6509 vs 2.1317).
 The levers measured on this card (CPU share, the two-stage staging, prompt-pollution fix, profile
