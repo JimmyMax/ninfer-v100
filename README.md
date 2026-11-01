@@ -143,7 +143,7 @@ the long-prompt span path (+18–27% at 4,096). The [Q2_0 release](https://huggi
 reaches **69.6 tok/s** decode with MTP 3 (70.7% accepted) at a perplexity cost (2.6509 vs 2.1317).
 The levers measured on this card (CPU share, the two-stage staging, prompt-pollution fix, profile
 seeding) and why 70+ at IQ3_S quality needs Q2_0 or a second GPU are in
-[docs/performance.md](docs/performance.md) (the "IQ3_S on one V100" section).
+[docs/performance.md](docs/performance.md) (the "IQ3_S on one V100: the final configuration" section).
 
 ## Gemma 4
 

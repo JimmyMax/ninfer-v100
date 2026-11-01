@@ -239,9 +239,9 @@ guessing right.
 - **DFlash:** seven forms the measured block length eight; fifteen uses the maximum supported block
   length sixteen.
 
-The tables are in [performance](performance.md#mtp-draft-count-by-content); the
-[reference measurements](performance/reference-2026-09.md#draft-length) sweep one to fifteen drafts
-of both MTP and DFlash2 on four cards.
+Sweep the count on your own workload: acceptance moves with the answer and the content, so a
+deployment serving one kind of work measures its own before fixing a count. The Flash-Next counts
+for this line are in [performance](performance.md#iq3_s-on-one-v100-the-final-configuration).
 
 ## Common options
 
@@ -372,8 +372,7 @@ KV format. The artifact describes its model configuration and weight representat
 `--kv-dtype` independently selects runtime KV storage, BF16 by default. All nine formats — `bf16`,
 `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`, `k8v4`, `nvfp4` — are accepted on every
 build target: the Blackwell-only `mma.sync...kind::f8f6f4` restriction applies to FP8/NVFP4
-*weights and activations*, not to KV storage. Measured size, decode speed and perplexity of seven of
-them on an RTX 3090 are in [performance](performance.md#kv-formats-on-qwen38-27b) and the
+*weights and activations*, not to KV storage. The format sizes and what each trades are in the
 [configuration calculator](config-calculator.html).
 
 `rk8v4` is the best all-round choice: rotated INT8 keys with a packed signed int4 value plane,

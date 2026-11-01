@@ -1,576 +1,64 @@
 # Performance
 
-Every measured result in one place, card by card: what fits, decode and prompt rates by model, KV
-format, context depth and drafter, several requests at once, Qwen3.8-Flash-Next's expert
-placements, and quality across cards. Which GPUs run NInfer at all is on [Supported GPUs](gpus.md).
-The [measurement pages](#measurement-pages) keep each campaign's setup, analysis and extra tables.
+Measured results for the **single-GPU Tesla V100-PCIE-32GB (`sm_70`)** line and, where it was the
+point of the measurement, an **RTX 4080 SUPER (`sm_89`)** on the same host. Every number here was
+measured in this repository, on these two cards, with the artifacts in the table below; results
+from other cards, other forks or other artifact families are not carried into this document.
 
+| Card | Memory | Build | Host link | Measured here |
+|---|---:|---|---|---|
+| Tesla V100-PCIE-32GB | 32 GB | `70` | PCIe 3.0 x16 | everything below |
+| RTX 4080 SUPER | 32 GB | `89` | PCIe 3.0 x16 (Gen4 part, Gen3 platform) | the cross-card section |
 
-| Page | What it measures | Hardware |
-|---|---|---|
-| [Reference measurements, September 2026](performance/reference-2026-09.md) | Ternary Bonsai 2 27B and Qwen3.8-27B at full context: decode and prompt time by depth, drafters, largest context per card, needles, several requests at once, what the device profiles change, and the October re-check | RTX 3090, 4090, 5090, PRO 6000 |
-| [Tesla V100, October 2026](performance/tesla-v100-2026-10.md) | a `70` build on 16 GB: what fits, engine and server rates of Ternary Bonsai 2, the Qwen3.8-27B releases, Flash-Next and Gemma 4, perplexity against other cards, llama.cpp on the same card | Tesla V100-SXM2-16GB |
-| [Gemma 4 on a Tesla V100-32GB](performance/gemma4-v100-32gb-2026-10.md) | the dense 31B and the 26B-A4B on one 32 GB card: prefill, decode and MTP acceptance with and without speculation, what fits the card | Tesla V100-PCIE-32GB |
-| [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#measurements) | every expert placement of the GSQ-RCO releases, MTP, perplexity against llama.cpp, AIME and GPQA | RTX 3090, 4090, 5090, PRO 6000, L40S |
-| [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
-| [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
-| [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090, from measured sizes | RTX 3090 |er
+Artifacts measured: `Swift-1.5-Qwen3.8-27B` Q4_K_M (GGUF `q4_k`), `Qwen3.8-27B-GSQ-RCO-IQ3_S`
+(GGUF blocks), `Huihui-Qwen3.8-27B-abliterated` Q4_K_M, `orcarouter-Qwen3.8-27B` NVFP4 (native),
+`orcarouter-Qwen3.8-27B-Uncensored` NVFP4, `Qwen3.8-27B-Coder390-W4A4-MTP-DFlash2`,
+`Gemma4-31B-QAT` (dense GGUF), `Gemma4-26B-A4B-QAT` (GGUF Q4_0), `Qwen3.8-Flash-Next-GSQ-RCO`
+IQ3_S and Q2_0 (GGUF blocks, host experts, shared n-gram table).
 
-- **Server**: `ninfer-serve` with one request at a time and
-  [`tools/bench/refbench.py`](../tools/bench/README.md#reference-measurements-refbenchpy), greedy,
-  thinking off. *Short chat* is the mean decode rate of five 512-token answers; a depth is a cold
-  document of that many tokens followed by an answer of about 400 words; prompt time is the
-  server's time to the first token.
+## How the numbers were taken
+
+- **Server**: `ninfer-serve`, one request at a time, greedy, thinking off. *Short chat* is the mean
+  decode rate of five 512-token answers; a depth is a cold document of that many tokens followed by
+  an answer of about 400 words; prompt time is the server's time to the first token.
 - **Engine**: `ninfer_bench`, the Engine without HTTP. `pp512` is a 512-token prompt, `tg128` 128
-  decoded tokens.
+  decoded tokens. Bench rows name their corpus and repetitions.
 - **CLI**: one `ninfer` request; its summary gives the prompt and decode rates.
 
 Numbers from different methods, hosts or builds are not read against each other as a benchmark.
 Drafters are written as MTP or DFlash2 with their draft count; acceptance is accepted / drafted
 drafts with the tokens committed per verify round in brackets.
 
-## Cards
-
-| Card | Memory | Build | Power limit | Measured on |
-|---|---:|---|---|---|
-| RTX PRO 6000 Blackwell Workstation Edition | 96 GB | `120a` | 600 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements) |
-| RTX 5090 | 32 GB | `120a` | 575 W; 450 W for IQ3_S; 600 W boards for Flash-Next | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements) |
-| RTX 4090 | 24 GB | `89` | 450 W | [reference](performance/reference-2026-09.md), [Flash-Next](qwen3-8-flash-next.md#measurements), [GGUF](gguf.md#measurements) |
-| L40S | 48 GB | | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
-| RTX 3090 Ti, two | 24 GB each | `86` | | [Flash-Next](qwen3-8-flash-next.md#measurements) |
-| RTX 3090 | 24 GB | `86` | 300 to 420 W by campaign | every page |
-| RTX 3060 | 12 GB | `86`, the image | 170 W | [small cards](performance/small-cards-2026-10.md) |
-| RTX 3060 Ti | 8 GB | `86`, the image | 200 W | [small cards](performance/small-cards-2026-10.md) |
-| TITAN RTX | 24 GB | `75` | 280 W | [TITAN RTX](performance/titan-rtx-2026-10.md) |
-| RTX 2080 Ti | 11 GB | `75`, the image | 250 W | [small cards](performance/small-cards-2026-10.md) |
-| Tesla V100-SXM2-16GB | 16 GB | `70` | 300 W | [Tesla V100](performance/tesla-v100-2026-10.md) |
-| Tesla V100-SXM2-32GB | 32 GB | `70` | 300 W | [32 GB follow-up](performance/tesla-v100-2026-10.md#follow-up-on-the-32-gb-and-16-gb-cards-15-16-october) |
-
 ## Largest context
 
-The largest `--max-context` (= `--kv-capacity`, one request) the server starts with, bisected in
-4,096-token steps, with `--gdn-state-fp16` and `--rope-yarn` past 262,144; 1,048,576 is the
-engine's ceiling, and the RTX PRO 6000 starts every configuration there with at least 50 GiB free.
-On the 8 to 12 GB cards a step also had to answer one request. Each cell gives the window without
-a drafter / with MTP 3 / with DFlash2 5:
-
-| Model | KV | RTX PRO 6000 | RTX 5090 | RTX 4090 | RTX 3090 | Tesla V100 | RTX 3060 | RTX 2080 Ti | RTX 3060 Ti |
-|---|---|---|---|---|---|---|---|---|---|
-| Ternary Bonsai 2 27B | `rk8v4` | 1,048,576 / 1,048,576 / 1,048,576 | 978,944 / 901,120 / 901,120 | 659,456 / 602,112 / 581,632 | 663,552 / 606,208 / 585,728 | | | | |
-| Ternary Bonsai 2 27B | `rk4v4` | 1,048,576 / 1,048,576 / 1,048,576 | 1,048,576 / 1,048,576 / 1,048,576 | 958,464 / 876,544 / 831,488 | 970,752 / 884,736 / 839,680 | 499,712 / 421,888 / 344,064 | 266,240 | 200,704 / 143,360 | 24,576 / does not fit |
-| Ternary Bonsai 2 27B | `rk4v4-e8` | 1,048,576 | 1,048,576 | 958,464 | 970,752 | | | | |
-| Ternary Bonsai 2 27B | `int8` | | | | | | | 106,496 | |
-| Qwen3.8-27B | `rk8v4` | 1,048,576 / 1,048,576 / 1,048,576 | 598,016 / 544,768 / 491,520 | 278,528 / 241,664 / 167,936 | 286,720 / 249,856 / 176,128 | | | | |
-| Qwen3.8-27B | `rk4v4` | 1,048,576 / 1,048,576 / 1,048,576 | 872,448 / 794,624 / 716,800 | 405,504 / 356,352 / 245,760 | 417,792 / 364,544 / 258,048 | | | | |
-| Qwen3.8-27B | `rk4v4-e8` | 1,048,576 | 872,448 | 405,504 | 417,792 | | | | |
-| Qwen3.8-27B IQ3_S | `rk4v4` | | | | | 241,664 / 176,128 / 32,768 | 8,192 / does not fit | | |
-| Gemma 4 26B-A4B Q4_0 | `bf16` | | | | | 61,440 / 28,672 (MTP 2) | | | |
-
-Gemma 4's windows at eight sequences on an RTX 3090 are in [its section](#gemma-4-26b-a4b).
-
-Filled to that window without a drafter (one request: a document with three codes at 33, 66 and
-90%, asked back in order):
-
-| Card | Model | KV | Tokens | Codes found | Prompt time | Decode after it, tok/s |
-|---|---|---|---:|---:|---:|---:|
-| RTX PRO 6000 | Ternary Bonsai 2 27B | `rk4v4` | 1,048,576 | 2/3 | 910 s | 55.3 |
-| RTX PRO 6000 | Qwen3.8-27B | `rk4v4` | 1,048,576 | 2/3 | 999 s | 42.9 |
-| RTX 5090 | Ternary Bonsai 2 27B | `rk4v4` | 1,048,576 | 2/3 | 937 s | 56.2 |
-| RTX 5090 | Ternary Bonsai 2 27B | `rk8v4` | 978,944 | 3/3 | 772 s | 46.9 |
-| RTX 5090 | Qwen3.8-27B | `rk4v4` | 872,448 | 3/3 | 755 s | 47.6 |
-| RTX 5090 | Qwen3.8-27B | `rk8v4` | 598,016 | 3/3 | 378 s | 49.1 |
-| RTX 4090 | Ternary Bonsai 2 27B | `rk4v4` | 958,464 | 3/3 | 991 s | 30.9 |
-| RTX 4090 | Ternary Bonsai 2 27B | `rk8v4` | 659,456 | 3/3 | 484 s | 32.9 |
-| RTX 4090 | Qwen3.8-27B | `rk4v4` | 405,504 | 3/3 | 293 s | 35.4 |
-| RTX 4090 | Qwen3.8-27B | `rk8v4` | 278,528 | 3/3 | 166 s | 36.8 |
-| RTX 3090 | Ternary Bonsai 2 27B | `rk4v4` | 970,752 | 3/3 | 2,359 s | 17.7 |
-| RTX 3090 | Ternary Bonsai 2 27B | `rk8v4` | 663,552 | 3/3 | 1,137 s | 24.4 |
-| RTX 3090 | Qwen3.8-27B | `rk4v4` | 417,792 | 3/3 | 644 s | 23.8 |
-| RTX 3090 | Qwen3.8-27B | `rk8v4` | 286,720 | 3/3 | 353 s | 31.0 |
-
-At 1,048,576 tokens both cards miss the code at 90%, with `--rope-yarn` and with plain RoPE alike.
-Up to the 262,144-token window every card and KV format found all three codes
-([needles](performance/reference-2026-09.md)).
-
-## Ternary Bonsai 2 27B
-
-### Decode by depth
-
-Server, one request, window 262,144 tokens; decode tok/s after a cold document of that many tokens.
-VRAM is what the server holds when idle (the KV cache, workspaces and graphs are planned at
-startup):
-
-| Card | KV | Drafter | VRAM | short chat | 1,024 | 8,192 | 32,768 | 65,536 | 131,072 | 196,608 | 261,120 |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| RTX PRO 6000 | `rk4v4` | none | 12.6 GiB | 167.2 | 166.6 | 161.3 | 155.1 | 146.4 | 131.3 | 119.5 | 109.8 |
-| RTX PRO 6000 | `rk4v4` | DFlash2 5 | 14.0 GiB | 360.9 | 401.3 | 317.4 | 284.2 | 242.7 | 197.9 | 179.4 | 193.0 |
-| RTX PRO 6000 | `rk4v4` | MTP 3 | 13.3 GiB | 330.4 | 266.0 | 306.9 | 229.8 | 226.2 | 208.6 | 198.3 | 217.9 |
-| RTX PRO 6000 | `rk4v4-e8` | none | 12.6 GiB | 167.3 | 166.9 | 161.8 | 155.2 | 146.6 | 131.3 | 119.7 | 110.0 |
-| RTX PRO 6000 | `rk4v4-e8` | DFlash2 5 | 14.0 GiB | 367.4 | 285.1 | 307.0 | 319.9 | 222.8 | 203.7 | 180.8 | 189.7 |
-| RTX PRO 6000 | `rk8v4` | none | 14.6 GiB | 167.5 | 166.8 | 162.2 | 151.5 | 139.8 | 121.2 | 107.3 | 96.4 |
-| RTX PRO 6000 | `rk8v4` | DFlash2 5 | 16.0 GiB | 361.7 | 304.6 | 318.1 | 309.6 | 250.7 | 204.6 | 233.5 | 200.9 |
-| RTX PRO 6000 | `rk8v4` | MTP 3 | 15.4 GiB | 314.7 | 313.0 | 293.3 | 258.1 | 229.7 | 191.4 | 192.0 | 210.5 |
-| RTX 5090 | `rk4v4` | none | 12.4 GiB | 171.4 | 170.8 | 165.9 | 159.0 | 150.2 | 134.6 | 122.3 | 112.4 |
-| RTX 5090 | `rk4v4` | DFlash2 5 | 13.8 GiB | 366.2 | 408.8 | 292.7 | 325.6 | 259.2 | 203.3 | 179.4 | 168.4 |
-| RTX 5090 | `rk4v4` | MTP 3 | 13.1 GiB | 321.1 | 268.3 | 279.3 | 291.5 | 228.9 | 217.2 | 203.0 | 217.6 |
-| RTX 5090 | `rk4v4-e8` | none | 12.4 GiB | 170.4 | 169.9 | 166.4 | 158.2 | 149.4 | 134.1 | 122.1 | 112.1 |
-| RTX 5090 | `rk4v4-e8` | DFlash2 5 | 13.8 GiB | 387.9 | 315.1 | 332.1 | 301.1 | 241.6 | 219.2 | 219.9 | 197.8 |
-| RTX 5090 | `rk8v4` | none | 14.4 GiB | 171.5 | 171.0 | 165.8 | 155.4 | 143.8 | 124.7 | 110.7 | 99.4 |
-| RTX 5090 | `rk8v4` | DFlash2 5 | 15.8 GiB | 368.2 | 336.1 | 305.9 | 343.2 | 248.9 | 215.2 | 238.9 | 189.4 |
-| RTX 5090 | `rk8v4` | MTP 3 | 15.2 GiB | 329.0 | 336.5 | 299.9 | 306.0 | 244.5 | 207.1 | 198.7 | 207.4 |
-| RTX 4090 | `rk4v4` | none | 12.3 GiB | 107.9 | 107.6 | 105.1 | 99.3 | 93.3 | 83.0 | 75.1 | 63.8 |
-| RTX 4090 | `rk4v4` | DFlash2 5 | 13.8 GiB | 242.8 | 179.5 | 181.8 | 236.3 | 156.9 | 134.9 | 140.4 | 115.3 |
-| RTX 4090 | `rk4v4` | MTP 3 | 13.0 GiB | 206.9 | 158.6 | 179.9 | 180.7 | 142.6 | 134.7 | 131.6 | 116.3 |
-| RTX 4090 | `rk4v4-e8` | none | 12.3 GiB | 107.9 | 107.6 | 105.3 | 99.3 | 93.3 | 83.0 | 75.1 | 63.8 |
-| RTX 4090 | `rk4v4-e8` | DFlash2 5 | 13.8 GiB | 251.5 | 198.5 | 212.9 | 197.2 | 146.2 | 129.0 | 155.6 | 116.4 |
-| RTX 4090 | `rk8v4` | none | 14.3 GiB | 108.4 | 107.8 | 105.2 | 97.8 | 89.9 | 77.3 | 67.9 | 56.4 |
-| RTX 4090 | `rk8v4` | DFlash2 5 | 15.8 GiB | 244.8 | 243.6 | 206.7 | 180.0 | 160.9 | 125.8 | 118.7 | 122.9 |
-| RTX 4090 | `rk8v4` | MTP 3 | 15.1 GiB | 203.4 | 191.4 | 184.0 | 164.8 | 153.7 | 127.7 | 121.8 | 111.0 |
-| RTX 3090 | `rk4v4` | none | 12.2 GiB | 93.8 | 93.2 | 90.3 | 83.7 | 76.1 | 64.4 | 55.5 | 49.2 |
-| RTX 3090 | `rk4v4` | DFlash2 5 | 13.7 GiB | 200.8 | 172.3 | 180.3 | 174.7 | 116.5 | 97.5 | 73.5 | 78.6 |
-| RTX 3090 | `rk4v4` | MTP 3 | 12.9 GiB | 173.4 | 145.1 | 138.3 | 149.7 | 116.9 | 96.5 | 89.4 | 83.7 |
-| RTX 3090 | `rk4v4-e8` | none | 12.2 GiB | 93.6 | 93.2 | 90.4 | 84.0 | 76.5 | 64.9 | 56.0 | 49.8 |
-| RTX 3090 | `rk4v4-e8` | DFlash2 5 | 13.7 GiB | 202.8 | 157.2 | 173.3 | 140.0 | 119.4 | 109.2 | 113.9 | 76.3 |
-| RTX 3090 | `rk8v4` | none | 14.2 GiB | 94.1 | 93.5 | 90.8 | 84.3 | 76.8 | 65.3 | 56.3 | 50.0 |
-| RTX 3090 | `rk8v4` | DFlash2 5 | 15.7 GiB | 201.4 | 198.4 | 161.1 | 135.4 | 124.9 | 92.6 | 85.3 | 89.7 |
-| RTX 3090 | `rk8v4` | MTP 3 | 15.0 GiB | 172.2 | 143.6 | 184.8 | 150.4 | 109.4 | 93.7 | 94.7 | 89.3 |
-| Tesla V100 | `rk4v4` | none | 11.8 GiB | 73.2 | 73.0 | 71.8 | 67.2 | — | 54.6 | — | — |
-| Tesla V100 | `rk4v4` | DFlash2 5 | 13.5 GiB | 116.1 | 100.9 | 88.0 | 91.1 | — | 45.0 | — | — |
-| Tesla V100 | `rk4v4` | MTP 3 | 12.7 GiB | 123.1 | 100.1 | 118.7 | 87.4 | — | 60.0 | — | — |
-
-### Prompt time by depth
-
-Server, the same runs; seconds to the first token after a cold document of that many tokens:
-
-| Card | KV | Drafter | 1,024 | 8,192 | 32,768 | 65,536 | 131,072 | 196,608 | 261,120 |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| RTX PRO 6000 | `rk4v4` | none | 0.16 | 1.11 | 4.9 | 11.4 | 28.9 | 52.7 | 82.0 |
-| RTX PRO 6000 | `rk4v4` | DFlash2 5 | 0.17 | 1.12 | 4.9 | 11.5 | 29.2 | 53.1 | 82.5 |
-| RTX PRO 6000 | `rk4v4` | MTP 3 | 0.17 | 1.11 | 4.9 | 11.4 | 29.0 | 52.9 | 82.1 |
-| RTX PRO 6000 | `rk4v4-e8` | none | 0.16 | 1.10 | 4.9 | 11.3 | 28.7 | 52.1 | 81.1 |
-| RTX PRO 6000 | `rk4v4-e8` | DFlash2 5 | 0.17 | 1.12 | 4.9 | 11.4 | 28.9 | 52.5 | 81.6 |
-| RTX PRO 6000 | `rk8v4` | none | 0.16 | 1.07 | 4.7 | 10.8 | 27.4 | 50.1 | 78.3 |
-| RTX PRO 6000 | `rk8v4` | DFlash2 5 | 0.17 | 1.12 | 4.9 | 11.2 | 28.3 | 51.2 | 79.0 |
-| RTX PRO 6000 | `rk8v4` | MTP 3 | 0.16 | 1.11 | 4.8 | 11.1 | 28.0 | 50.8 | 78.5 |
-| RTX 5090 | `rk4v4` | none | 0.17 | 1.17 | 5.2 | 12.0 | 30.2 | 54.9 | 85.2 |
-| RTX 5090 | `rk4v4` | DFlash2 5 | 0.18 | 1.20 | 5.3 | 12.1 | 30.6 | 55.4 | 85.9 |
-| RTX 5090 | `rk4v4` | MTP 3 | 0.18 | 1.18 | 5.2 | 12.0 | 30.4 | 55.0 | 85.5 |
-| RTX 5090 | `rk4v4-e8` | none | 0.17 | 1.17 | 5.1 | 11.9 | 30.1 | 54.3 | 84.2 |
-| RTX 5090 | `rk4v4-e8` | DFlash2 5 | 0.18 | 1.19 | 5.2 | 12.1 | 30.4 | 54.9 | 85.0 |
-| RTX 5090 | `rk8v4` | none | 0.17 | 1.14 | 5.0 | 11.5 | 29.0 | 52.7 | 81.9 |
-| RTX 5090 | `rk8v4` | DFlash2 5 | 0.18 | 1.19 | 5.2 | 11.9 | 29.8 | 53.5 | 82.7 |
-| RTX 5090 | `rk8v4` | MTP 3 | 0.18 | 1.18 | 5.1 | 11.8 | 29.6 | 53.2 | 82.2 |
-| RTX 4090 | `rk4v4` | none | 0.21 | 1.44 | 6.4 | 14.7 | 37.2 | 67.6 | 105.2 |
-| RTX 4090 | `rk4v4` | DFlash2 5 | 0.21 | 1.47 | 6.5 | 15.0 | 37.7 | 68.4 | 106.2 |
-| RTX 4090 | `rk4v4` | MTP 3 | 0.21 | 1.45 | 6.4 | 14.8 | 37.4 | 67.9 | 105.5 |
-| RTX 4090 | `rk4v4-e8` | none | 0.21 | 1.44 | 6.3 | 14.6 | 36.8 | 66.7 | 103.5 |
-| RTX 4090 | `rk4v4-e8` | DFlash2 5 | 0.22 | 1.47 | 6.5 | 14.8 | 37.3 | 67.6 | 104.6 |
-| RTX 4090 | `rk8v4` | none | 0.20 | 1.42 | 6.3 | 14.4 | 36.2 | 65.8 | 102.1 |
-| RTX 4090 | `rk8v4` | DFlash2 5 | 0.22 | 1.47 | 6.4 | 14.7 | 36.9 | 66.8 | 103.3 |
-| RTX 4090 | `rk8v4` | MTP 3 | 0.21 | 1.44 | 6.3 | 14.5 | 36.6 | 66.3 | 102.6 |
-| RTX 3090 | `rk4v4` | none | 0.42 | 2.99 | 13.3 | 30.7 | 77.9 | 142.0 | 221.1 |
-| RTX 3090 | `rk4v4` | DFlash2 5 | 0.43 | 3.06 | 13.5 | 31.2 | 79.2 | 143.8 | 223.7 |
-| RTX 3090 | `rk4v4` | MTP 3 | 0.42 | 3.00 | 13.3 | 30.8 | 78.3 | 142.7 | 222.0 |
-| RTX 3090 | `rk4v4-e8` | none | 0.42 | 2.98 | 13.2 | 30.4 | 77.1 | 140.2 | 218.2 |
-| RTX 3090 | `rk4v4-e8` | DFlash2 5 | 0.43 | 3.06 | 13.5 | 31.0 | 78.3 | 141.8 | 220.5 |
-| RTX 3090 | `rk8v4` | none | 0.42 | 2.97 | 13.1 | 30.2 | 76.2 | 138.3 | 214.5 |
-| RTX 3090 | `rk8v4` | DFlash2 5 | 0.43 | 3.05 | 13.4 | 30.8 | 77.4 | 139.8 | 216.9 |
-| RTX 3090 | `rk8v4` | MTP 3 | 0.42 | 2.99 | 13.2 | 30.3 | 76.5 | 138.8 | 215.4 |
-| Tesla V100 | `rk4v4` | none | 1.09 | 8.2 | 38.6 | — | 261.2 | — | — |
-| Tesla V100 | `rk4v4` | DFlash2 5 | 1.13 | 8.4 | 40.2 | — | 265.9 | — | — |
-| Tesla V100 | `rk4v4` | MTP 3 | 1.10 | 8.3 | 39.3 | — | 262.8 | — | — |
-
-### Draft acceptance
-
-| Card | KV | Drafter | short chat | 1,024 | 8,192 | 32,768 | 65,536 | 131,072 | 196,608 | 261,120 |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| RTX PRO 6000 | `rk4v4` | DFlash2 5 | 0.39 (2.91) | 0.46 (3.26) | 0.33 (2.62) | 0.31 (2.54) | 0.26 (2.31) | 0.23 (2.14) | 0.24 (2.17) | 0.32 (2.57) |
-| RTX PRO 6000 | `rk4v4` | MTP 3 | 0.54 (2.61) | 0.38 (2.13) | 0.52 (2.60) | 0.33 (1.99) | 0.36 (2.06) | 0.38 (2.14) | 0.41 (2.25) | 0.56 (2.67) |
-| RTX PRO 6000 | `rk4v4-e8` | DFlash2 5 | 0.40 (2.96) | 0.26 (2.31) | 0.31 (2.53) | 0.37 (2.84) | 0.23 (2.12) | 0.24 (2.19) | 0.24 (2.18) | 0.30 (2.51) |
-| RTX PRO 6000 | `rk8v4` | DFlash2 5 | 0.39 (2.91) | 0.30 (2.47) | 0.33 (2.65) | 0.35 (2.75) | 0.28 (2.38) | 0.24 (2.19) | 0.36 (2.81) | 0.33 (2.63) |
-| RTX PRO 6000 | `rk8v4` | MTP 3 | 0.50 (2.48) | 0.50 (2.48) | 0.48 (2.46) | 0.42 (2.24) | 0.39 (2.15) | 0.35 (2.05) | 0.44 (2.30) | 0.60 (2.78) |
-| RTX 5090 | `rk4v4` | DFlash2 5 | 0.39 (2.92) | 0.46 (3.28) | 0.28 (2.40) | 0.38 (2.89) | 0.29 (2.46) | 0.24 (2.20) | 0.24 (2.19) | 0.26 (2.28) |
-| RTX 5090 | `rk4v4` | MTP 3 | 0.50 (2.49) | 0.37 (2.12) | 0.43 (2.29) | 0.50 (2.48) | 0.36 (2.06) | 0.40 (2.19) | 0.43 (2.27) | 0.56 (2.67) |
-| RTX 5090 | `rk4v4-e8` | DFlash2 5 | 0.43 (3.10) | 0.31 (2.53) | 0.35 (2.73) | 0.34 (2.67) | 0.26 (2.29) | 0.28 (2.38) | 0.34 (2.67) | 0.34 (2.67) |
-| RTX 5090 | `rk8v4` | DFlash2 5 | 0.39 (2.93) | 0.34 (2.69) | 0.31 (2.54) | 0.41 (3.02) | 0.27 (2.35) | 0.26 (2.27) | 0.36 (2.81) | 0.29 (2.46) |
-| RTX 5090 | `rk8v4` | MTP 3 | 0.52 (2.55) | 0.55 (2.63) | 0.47 (2.40) | 0.55 (2.65) | 0.43 (2.29) | 0.40 (2.21) | 0.45 (2.36) | 0.57 (2.71) |
-| RTX 4090 | `rk4v4` | DFlash2 5 | 0.39 (2.91) | 0.24 (2.17) | 0.25 (2.26) | 0.43 (3.11) | 0.25 (2.23) | 0.25 (2.22) | 0.32 (2.60) | 0.30 (2.51) |
-| RTX 4090 | `rk4v4` | MTP 3 | 0.53 (2.57) | 0.34 (2.01) | 0.44 (2.31) | 0.49 (2.49) | 0.36 (2.09) | 0.41 (2.21) | 0.47 (2.40) | 0.53 (2.59) |
-| RTX 4090 | `rk4v4-e8` | DFlash2 5 | 0.41 (3.01) | 0.28 (2.40) | 0.33 (2.63) | 0.32 (2.58) | 0.21 (2.07) | 0.23 (2.12) | 0.37 (2.85) | 0.30 (2.51) |
-| RTX 4090 | `rk8v4` | DFlash2 5 | 0.39 (2.93) | 0.39 (2.94) | 0.31 (2.56) | 0.27 (2.36) | 0.26 (2.27) | 0.21 (2.06) | 0.24 (2.19) | 0.33 (2.63) |
-| RTX 4090 | `rk8v4` | MTP 3 | 0.51 (2.51) | 0.46 (2.38) | 0.45 (2.34) | 0.42 (2.24) | 0.43 (2.28) | 0.39 (2.18) | 0.44 (2.32) | 0.55 (2.64) |
-| RTX 3090 | `rk4v4` | DFlash2 5 | 0.39 (2.91) | 0.31 (2.52) | 0.36 (2.78) | 0.40 (3.03) | 0.25 (2.26) | 0.27 (2.34) | 0.23 (2.13) | 0.33 (2.63) |
-| RTX 3090 | `rk4v4` | MTP 3 | 0.52 (2.54) | 0.39 (2.17) | 0.38 (2.15) | 0.51 (2.53) | 0.41 (2.22) | 0.41 (2.23) | 0.50 (2.47) | 0.56 (2.65) |
-| RTX 3090 | `rk4v4-e8` | DFlash2 5 | 0.39 (2.94) | 0.26 (2.30) | 0.34 (2.67) | 0.27 (2.34) | 0.25 (2.22) | 0.29 (2.44) | 0.41 (3.07) | 0.27 (2.33) |
-| RTX 3090 | `rk8v4` | DFlash2 5 | 0.39 (2.92) | 0.39 (2.91) | 0.30 (2.46) | 0.26 (2.27) | 0.27 (2.35) | 0.22 (2.12) | 0.27 (2.33) | 0.36 (2.80) |
-| RTX 3090 | `rk8v4` | MTP 3 | 0.51 (2.51) | 0.37 (2.12) | 0.62 (2.90) | 0.50 (2.49) | 0.34 (2.04) | 0.37 (2.10) | 0.50 (2.51) | 0.55 (2.65) |
-| Tesla V100 | `rk4v4` | DFlash2 5 | 0.39 (2.91) | — | 0.28 (2.36) | — | — | 0.24 (2.17) | — | — |
-| Tesla V100 | `rk4v4` | MTP 3 | 0.49 (2.45) | — | 0.52 (2.53) | — | — | 0.39 (2.17) | — | — |
-
-### Best draft count
-
-Server, `rk8v4`, one request; `--draft-tokens` from 1 to 15 at short chat and after 32,768 and
-131,072 tokens. The best count with its decode tok/s and acceptance, one run each (acceptance
-moves with the answer, so neighbouring counts within a few percent are ties;
-[full sweeps](performance/reference-2026-09.md#draft-length)):
-
-| Card | No drafter: short chat / 32,768 / 131,072 | Drafter | Short chat | 32,768 | 131,072 |
-|---|---|---|---|---|---|
-| RTX 5090 | 171.6 / 155.2 / 124.5 | MTP | 5: 321.5 (0.38) | 3: 295.6 (0.52) | 3: 207.3 (0.40) |
-| RTX 5090 | 171.6 / 155.2 / 124.5 | DFlash2 | 7: 396.7 (0.33) | 4: 338.9 (0.48) | 6: 216.8 (0.23) |
-| RTX 4090 | 108.3 / 97.9 / 77.3 | MTP | 3: 201.2 (0.50) | 3: 175.2 (0.47) | 3: 130.9 (0.41) |
-| RTX 4090 | 108.3 / 97.9 / 77.3 | DFlash2 | 7: 256.4 (0.31) | 4: 220.4 (0.47) | 6: 144.9 (0.24) |
-| RTX 3090 | 92.5 / 82.5 / 63.4 | MTP | 3: 171.4 (0.52) | 3: 128.6 (0.40) | 1: 96.9 (0.73) |
-| RTX 3090 | 92.5 / 82.5 / 63.4 | DFlash2 | 7: 202.0 (0.31) | 5: 176.2 (0.41) | 3: 97.2 (0.36) |
-
-### Engine and CLI rates
-
-Prompt and decode in tok/s:
-
-| Card | Method, KV | Prompt 512 | Prompt 2,048 | Long prompt | Decode | Decode after the long prompt |
-|---|---|---:|---:|---:|---:|---:|
-| RTX 3090 | engine, `rk8v4` | 3,026 | 3,108 | 2,292 (65,536) | 93.9 | 93.7 |
-| TITAN RTX | engine, `rk8v4` | 1,304 | 1,375 | 951 (65,536) | 63.4 | 61.8 |
-| Tesla V100 | engine, `bf16` | 984 | 1,072 | 929 (16,384) | 73.6 | 66.7 |
-| RTX 3060 Ti | CLI, `int8` | | | 1,160 (2,273) | 50.1 | |
-| RTX 2080 Ti | CLI, `int8` | | | 1,080 (2,273) | 58.5 | |
-| RTX 3060 | CLI, `int8` | | | 937 (2,273) | 40.5 | |
-
-Engine rows decode 128 tokens from the start, CLI rows 256. With a drafter, decode tok/s
-(acceptance):
-
-| Card | Method | MTP 3 | DFlash2 5 |
-|---|---|---:|---:|
-| RTX 3090 | engine, 512-token prompt, 128 tokens | 174.1 (0.49, 2.46) | 149.1 (0.23, 2.15) |
-| TITAN RTX | engine, 512-token prompt, 128 tokens | 106.8 (0.47, 2.40) | 92.1 (0.24, 2.19) |
-| RTX 2080 Ti | CLI, 2,273-token prompt, 256 tokens | 95.9 (2.33) | |
-| RTX 3060 | CLI, 2,273-token prompt, 256 tokens | 69.2 (2.31) | |
-
-### KV formats
-
-Engine, a 16,384-token prompt, then 64 decoded tokens, one run each; prompt / decode tok/s:
-
-| KV | Bytes per token | Tesla V100 | TITAN RTX | RTX 3090 |
-|---|---:|---:|---:|---:|
-| `bf16` | 65,536 | 920 / 66.8 | 1,065 / 62.8 | 2,687 / 92.0 |
-| `int8` | 33,792 | 947 / 69.3 | 1,199 / 62.6 | |
-| `fp8` | 33,024 | 914 / 67.8 | 601 / 59.7 | |
-| `rk8v4` | 26,112 | 934 / 69.0 | 1,251 / 62.1 | 2,875 / 93.9 |
-| `k8v4` | 25,728 | 907 / 66.6 | 634 / 59.6 | |
-| `nvfp4` | 18,432 | 903 / 66.1 | 628 / 62.0 | |
-| `rk4v4` | 17,920 | 937 / 68.5 | 1,234 / 62.0 | |
-| `rk4v4-e8` | 17,920 | 935 / 68.7 | 1,231 / 61.6 | |
-| `rk2v4-e8` | 13,824 | 926 / 67.1 | 1,217 / 61.6 | |
-
-After a 65,536-token prompt the TITAN RTX prompts at 951 (`rk8v4`), 826 (`int8`) and 607 (`bf16`)
-tok/s and decodes at 61.8, 62.8 and 62.4. On Turing the FP8, NVFP4 and K8V4 prompt kernels run at
-about half the rate of the INT8 family ([TITAN RTX](performance/titan-rtx-2026-10.md#kv-formats)).
-On the V100 `--prefill-chunk 4096` raises `rk4v4` prompts from 965 to 1,033 tok/s at 4,096 tokens
-and from 860 to 914 at 16,384, for 628 MiB of workspace instead of 229
-([prompt chunks](performance/tesla-v100-2026-10.md#prompt-chunks)).
-
-### Several requests at once
-
-Server, total generated tok/s when N requests arrive together: the short-chat prompts in turn, 512
-tokens each, `rk8v4`, `--max-concurrency 8 --max-context 16384 --kv-capacity 131072`. An empty
-cell at 8: eight lanes of 16,384 tokens do not fit beside that drafter, and the row ran with four.
-
-| Card | Drafter | 1 | 2 | 4 | 8 |
-|---|---|---:|---:|---:|---:|
-| RTX PRO 6000 | none | 165.5 | 321.4 | 599.1 | 1,043.5 |
-| RTX PRO 6000 | MTP 3 | 274.4 | 516.0 | 805.0 | 1,155.3 |
-| RTX PRO 6000 | DFlash2 5 | 270.6 | 523.9 | 735.5 | 890.4 |
-| RTX 5090 | none | 169.8 | 327.4 | 608.6 | 1,053.3 |
-| RTX 5090 | MTP 3 | 263.3 | 511.3 | 771.1 | 1,063.0 |
-| RTX 5090 | DFlash2 5 | 278.1 | 511.7 | 631.9 | 799.1 |
-| RTX 4090 | none | 107.4 | 206.9 | 383.5 | 670.6 |
-| RTX 4090 | MTP 3 | 182.1 | 318.3 | 533.8 | 824.1 |
-| RTX 4090 | DFlash2 5 | 197.1 | 354.2 | 504.9 | 673.5 |
-| RTX 3090 | none | 93.1 | 176.9 | 324.0 | 546.4 |
-| RTX 3090 | MTP 3 | 141.7 | 267.3 | 413.7 | 550.8 |
-| RTX 3090 | DFlash2 5 | 154.7 | 256.0 | 334.1 | 386.2 |
-| Tesla V100 | none | 71.6 | 129.1 | 214.4 | 283.5 |
-| Tesla V100 | MTP 3 | 101.5 | 157.2 | 182.6 | 204.9 |
-| Tesla V100 | DFlash2 5 | 89.4 | 104.7 | 116.4 | |
-
-The same with 256-token answers, `--max-context 8192 --kv-capacity 65536`, one run each:
-
-| Card | Drafter | 1 | 2 | 4 | 8 |
-|---|---|---:|---:|---:|---:|
-| TITAN RTX | none | 54.8 | 119.3 | 211.9 | 327.1 |
-| TITAN RTX | MTP 3 | 94.9 | 161.1 | 247.5 | 308.0 |
-| RTX 3090 | none | 73.2 | 172.2 | 308.2 | 498.0 |
-| RTX 3090 | MTP 3 | 133.3 | 255.6 | 404.6 | 521.3 |
-
-### Quality
-
-`ninfer-perplexity --quick` on `ninfer-ppl-1m-v1`:
-
-| Card | `rk8v4` | `bf16` | `rk2v4-e8` |
-|---|---:|---:|---:|
-| RTX 3090 | 5.631 | | |
-| Tesla V100 | 5.6305 | | |
-| TITAN RTX | 5.6314 | 5.6272 | 5.8189 |
-
-Against `rk8v4`'s 5.631 the reference measurement gives 5.650 for `rk4v4-e8` and 5.820 for
-`rk2v4-e8`.
-
-## Qwen3.8-27B
-
-The official [`groupwise-int` artifact](https://huggingface.co/neroued/Qwen3.8-27B-NInfer).
-
-### Decode by depth
-
-Server, one request. On the 24 GB cards each KV format runs at the largest window DFlash2 fits
-beside it, for every drafter; `rk4v4-e8` without a drafter runs the full window. A dash: past the
-window.
-
-| Card | KV | Drafter | Window | VRAM | short chat | 1,024 | 8,192 | 32,768 | 65,536 | 131,072 | 196,608 | 261,120 |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| RTX PRO 6000 | `rk4v4` | none | 262,144 | 21.8 GiB | 89.6 | 89.5 | 88.0 | 85.9 | 83.2 | 78.0 | 73.7 | 69.9 |
-| RTX PRO 6000 | `rk4v4` | DFlash2 5 | 262,144 | 24.0 GiB | 219.9 | 189.4 | 179.6 | 183.7 | 154.0 | 142.4 | 166.4 | 116.1 |
-| RTX PRO 6000 | `rk4v4` | MTP 3 | 262,144 | 22.5 GiB | 186.4 | 164.5 | 169.6 | 149.0 | 161.0 | 143.4 | 142.9 | 128.7 |
-| RTX PRO 6000 | `rk4v4-e8` | none | 262,144 | 21.8 GiB | 89.7 | 89.5 | 88.0 | 85.9 | 83.2 | 78.1 | 73.8 | 70.0 |
-| RTX PRO 6000 | `rk4v4-e8` | DFlash2 5 | 262,144 | 24.0 GiB | 222.7 | 184.6 | 171.7 | 214.9 | 148.5 | 142.2 | 150.3 | 121.6 |
-| RTX PRO 6000 | `rk8v4` | none | 262,144 | 23.8 GiB | 89.6 | 89.4 | 88.0 | 84.9 | 81.1 | 74.5 | 69.1 | 64.4 |
-| RTX PRO 6000 | `rk8v4` | DFlash2 5 | 262,144 | 26.0 GiB | 219.1 | 195.9 | 186.0 | 217.2 | 156.9 | 160.2 | 164.5 | 120.9 |
-| RTX PRO 6000 | `rk8v4` | MTP 3 | 262,144 | 24.6 GiB | 187.5 | 154.3 | 172.4 | 176.4 | 164.2 | 135.8 | 129.6 | 120.4 |
-| RTX 5090 | `rk4v4` | none | 262,144 | 21.6 GiB | 91.9 | 91.7 | 90.2 | 88.1 | 85.3 | 80.0 | 75.4 | 71.6 |
-| RTX 5090 | `rk4v4` | DFlash2 5 | 262,144 | 23.8 GiB | 214.9 | 193.9 | 197.2 | 204.7 | 151.8 | 129.7 | 136.0 | 116.1 |
-| RTX 5090 | `rk4v4` | MTP 3 | 262,144 | 22.3 GiB | 182.7 | 153.4 | 158.9 | 171.8 | 165.7 | 140.8 | 132.6 | 129.0 |
-| RTX 5090 | `rk4v4-e8` | none | 262,144 | 21.6 GiB | 91.5 | 91.3 | 90.2 | 87.8 | 84.9 | 79.7 | 75.2 | 71.3 |
-| RTX 5090 | `rk4v4-e8` | DFlash2 5 | 262,144 | 23.8 GiB | 220.3 | 165.0 | 176.0 | 202.2 | 147.0 | 147.9 | 128.7 | 128.8 |
-| RTX 5090 | `rk8v4` | none | 262,144 | 23.6 GiB | 92.0 | 91.7 | 90.2 | 87.1 | 83.3 | 76.5 | 71.0 | 66.2 |
-| RTX 5090 | `rk8v4` | DFlash2 5 | 262,144 | 25.8 GiB | 221.0 | 186.7 | 204.6 | 205.9 | 157.8 | 152.7 | 134.0 | 129.8 |
-| RTX 5090 | `rk8v4` | MTP 3 | 262,144 | 24.4 GiB | 184.7 | 153.7 | 169.8 | 180.1 | 140.5 | 130.3 | 130.5 | 114.0 |
-| RTX 4090 | `rk4v4` | none | 245,760 | 21.3 GiB | 54.7 | 54.6 | 53.9 | 52.4 | 50.7 | 47.5 | 44.8 | — |
-| RTX 4090 | `rk4v4` | DFlash2 5 | 245,760 | 23.5 GiB | 137.8 | 108.4 | 115.3 | 142.7 | 93.8 | 86.4 | 80.4 | — |
-| RTX 4090 | `rk4v4` | MTP 3 | 245,760 | 21.9 GiB | 108.9 | 93.5 | 102.0 | 105.3 | 92.8 | 85.0 | 83.3 | — |
-| RTX 4090 | `rk4v4-e8` | none | 262,144 | 21.5 GiB | 54.7 | 54.6 | 54.0 | 52.4 | 50.7 | 47.5 | 44.8 | 40.6 |
-| RTX 4090 | `rk8v4` | none | 167,936 | 21.2 GiB | 54.8 | 54.7 | 54.0 | 52.0 | 49.7 | 45.6 | — | — |
-| RTX 4090 | `rk8v4` | DFlash2 5 | 167,936 | 23.5 GiB | 138.1 | 127.1 | 129.8 | 140.3 | 102.2 | 90.9 | — | — |
-| RTX 4090 | `rk8v4` | MTP 3 | 167,936 | 21.9 GiB | 109.0 | 102.6 | 101.7 | 108.5 | 94.9 | 77.3 | — | — |
-| RTX 3090 | `rk4v4` | none | 258,048 | 21.3 GiB | 48.0 | 47.9 | 47.1 | 45.0 | 42.3 | 38.0 | 34.4 | — |
-| RTX 3090 | `rk4v4` | DFlash2 5 | 258,048 | 23.6 GiB | 115.9 | 88.5 | 86.1 | 93.2 | 70.6 | 60.5 | 54.1 | — |
-| RTX 3090 | `rk4v4` | MTP 3 | 258,048 | 22.0 GiB | 95.9 | 79.0 | 88.1 | 89.4 | 77.5 | 66.3 | 61.5 | — |
-| RTX 3090 | `rk4v4-e8` | none | 262,144 | 21.4 GiB | 48.0 | 47.9 | 47.1 | 45.2 | 42.5 | 38.3 | 34.7 | 32.0 |
-| RTX 3090 | `rk8v4` | none | 176,128 | 21.3 GiB | 48.2 | 48.0 | 47.2 | 45.1 | 42.6 | 38.4 | — | — |
-| RTX 3090 | `rk8v4` | DFlash2 5 | 176,128 | 23.5 GiB | 117.1 | 101.4 | 101.3 | 110.8 | 78.7 | 72.6 | — | — |
-| RTX 3090 | `rk8v4` | MTP 3 | 176,128 | 22.0 GiB | 97.2 | 90.6 | 90.5 | 83.6 | 83.9 | 60.9 | — | — |
-
-### Prompt time by depth
-
-| Card | KV | Drafter | 1,024 | 8,192 | 32,768 | 65,536 | 131,072 | 196,608 | 261,120 |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| RTX PRO 6000 | `rk4v4` | none | 0.30 | 1.87 | 7.9 | 17.2 | 40.5 | 70.0 | 104.9 |
-| RTX PRO 6000 | `rk4v4` | DFlash2 5 | 0.31 | 1.88 | 7.9 | 17.3 | 40.9 | 70.5 | 105.6 |
-| RTX PRO 6000 | `rk4v4` | MTP 3 | 0.31 | 1.87 | 7.8 | 17.2 | 40.6 | 70.1 | 105.0 |
-| RTX PRO 6000 | `rk4v4-e8` | none | 0.30 | 1.87 | 7.8 | 17.1 | 40.3 | 69.4 | 104.0 |
-| RTX PRO 6000 | `rk4v4-e8` | DFlash2 5 | 0.31 | 1.88 | 7.9 | 17.2 | 40.6 | 69.9 | 104.5 |
-| RTX PRO 6000 | `rk8v4` | none | 0.30 | 1.86 | 7.7 | 16.9 | 39.4 | 67.7 | 100.8 |
-| RTX PRO 6000 | `rk8v4` | DFlash2 5 | 0.31 | 1.87 | 7.8 | 17.0 | 39.7 | 68.3 | 101.7 |
-| RTX PRO 6000 | `rk8v4` | MTP 3 | 0.30 | 1.86 | 7.8 | 16.9 | 39.6 | 68.1 | 101.5 |
-| RTX 5090 | `rk4v4` | none | 0.34 | 2.04 | 8.5 | 18.4 | 43.0 | 73.8 | 110.4 |
-| RTX 5090 | `rk4v4` | DFlash2 5 | 0.34 | 2.06 | 8.6 | 18.6 | 43.4 | 74.4 | 111.6 |
-| RTX 5090 | `rk4v4` | MTP 3 | 0.34 | 2.07 | 8.6 | 18.7 | 43.6 | 74.8 | 111.7 |
-| RTX 5090 | `rk4v4-e8` | none | 0.34 | 2.05 | 8.5 | 18.5 | 43.0 | 73.7 | 109.8 |
-| RTX 5090 | `rk4v4-e8` | DFlash2 5 | 0.34 | 2.07 | 8.6 | 18.7 | 43.4 | 74.1 | 110.4 |
-| RTX 5090 | `rk8v4` | none | 0.33 | 2.03 | 8.4 | 18.2 | 42.1 | 71.9 | 107.0 |
-| RTX 5090 | `rk8v4` | DFlash2 5 | 0.34 | 2.05 | 8.5 | 18.3 | 42.4 | 72.4 | 107.7 |
-| RTX 5090 | `rk8v4` | MTP 3 | 0.33 | 2.03 | 8.4 | 18.2 | 42.2 | 72.0 | 107.1 |
-| RTX 4090 | `rk4v4` | none | 0.56 | 3.24 | 13.1 | 27.8 | 63.0 | 106.0 | — |
-| RTX 4090 | `rk4v4` | DFlash2 5 | 0.57 | 3.27 | 13.2 | 28.1 | 63.5 | 106.7 | — |
-| RTX 4090 | `rk4v4` | MTP 3 | 0.57 | 3.25 | 13.1 | 27.9 | 63.2 | 106.2 | — |
-| RTX 4090 | `rk4v4-e8` | none | 0.56 | 3.23 | 13.1 | 27.7 | 62.6 | 105.0 | 154.1 |
-| RTX 4090 | `rk8v4` | none | 0.56 | 3.23 | 13.0 | 27.6 | 62.2 | — | — |
-| RTX 4090 | `rk8v4` | DFlash2 5 | 0.57 | 3.26 | 13.2 | 27.8 | 62.7 | — | — |
-| RTX 4090 | `rk8v4` | MTP 3 | 0.57 | 3.24 | 13.1 | 27.6 | 62.3 | — | — |
-| RTX 3090 | `rk4v4` | none | 1.15 | 5.63 | 23.2 | 50.2 | 118.3 | 203.4 | — |
-| RTX 3090 | `rk4v4` | DFlash2 5 | 1.17 | 5.73 | 23.6 | 51.0 | 119.4 | 205.2 | — |
-| RTX 3090 | `rk4v4` | MTP 3 | 1.17 | 5.68 | 23.3 | 50.3 | 118.6 | 203.9 | — |
-| RTX 3090 | `rk4v4-e8` | none | 1.15 | 5.62 | 23.1 | 50.0 | 117.3 | 201.4 | 300.9 |
-| RTX 3090 | `rk8v4` | none | 1.14 | 5.61 | 23.1 | 49.9 | 116.4 | — | — |
-| RTX 3090 | `rk8v4` | DFlash2 5 | 1.17 | 5.73 | 23.4 | 50.6 | 117.7 | — | — |
-| RTX 3090 | `rk8v4` | MTP 3 | 1.16 | 5.65 | 23.1 | 49.9 | 117.0 | — | — |
-
-### Draft acceptance
-
-| Card | KV | Drafter | short chat | 1,024 | 8,192 | 32,768 | 65,536 | 131,072 | 196,608 | 261,120 |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| RTX PRO 6000 | `rk4v4` | DFlash2 5 | 0.44 (3.18) | 0.36 (2.75) | 0.33 (2.66) | 0.37 (2.85) | 0.30 (2.47) | 0.30 (2.48) | 0.42 (3.11) | 0.26 (2.31) |
-| RTX PRO 6000 | `rk4v4` | MTP 3 | 0.60 (2.78) | 0.49 (2.46) | 0.54 (2.62) | 0.45 (2.34) | 0.54 (2.62) | 0.50 (2.49) | 0.54 (2.61) | 0.50 (2.48) |
-| RTX PRO 6000 | `rk4v4-e8` | DFlash2 5 | 0.45 (3.21) | 0.34 (2.70) | 0.31 (2.54) | 0.47 (3.33) | 0.28 (2.38) | 0.29 (2.47) | 0.36 (2.78) | 0.28 (2.40) |
-| RTX PRO 6000 | `rk8v4` | DFlash2 5 | 0.44 (3.16) | 0.37 (2.84) | 0.35 (2.77) | 0.47 (3.37) | 0.30 (2.51) | 0.35 (2.75) | 0.41 (3.04) | 0.28 (2.38) |
-| RTX PRO 6000 | `rk8v4` | MTP 3 | 0.60 (2.80) | 0.44 (2.31) | 0.54 (2.62) | 0.60 (2.85) | 0.57 (2.74) | 0.48 (2.45) | 0.49 (2.46) | 0.48 (2.44) |
-| RTX 5090 | `rk4v4` | DFlash2 5 | 0.42 (3.10) | 0.37 (2.81) | 0.38 (2.91) | 0.43 (3.17) | 0.29 (2.44) | 0.25 (2.26) | 0.31 (2.55) | 0.27 (2.34) |
-| RTX 5090 | `rk4v4` | MTP 3 | 0.58 (2.71) | 0.44 (2.31) | 0.48 (2.43) | 0.57 (2.69) | 0.57 (2.68) | 0.48 (2.44) | 0.48 (2.44) | 0.51 (2.51) |
-| RTX 5090 | `rk4v4-e8` | DFlash2 5 | 0.44 (3.19) | 0.28 (2.40) | 0.32 (2.61) | 0.43 (3.15) | 0.28 (2.37) | 0.32 (2.58) | 0.29 (2.42) | 0.32 (2.58) |
-| RTX 5090 | `rk8v4` | DFlash2 5 | 0.44 (3.19) | 0.34 (2.71) | 0.41 (3.05) | 0.43 (3.15) | 0.31 (2.53) | 0.33 (2.63) | 0.30 (2.46) | 0.31 (2.56) |
-| RTX 5090 | `rk8v4` | MTP 3 | 0.59 (2.75) | 0.44 (2.32) | 0.53 (2.57) | 0.61 (2.81) | 0.44 (2.30) | 0.44 (2.30) | 0.49 (2.46) | 0.44 (2.32) |
-| RTX 4090 | `rk4v4` | DFlash2 5 | 0.44 (3.15) | 0.30 (2.51) | 0.34 (2.71) | 0.49 (3.47) | 0.27 (2.36) | 0.28 (2.37) | 0.28 (2.37) | — |
-| RTX 4090 | `rk4v4` | MTP 3 | 0.57 (2.69) | 0.45 (2.36) | 0.53 (2.62) | 0.59 (2.79) | 0.50 (2.48) | 0.48 (2.45) | 0.52 (2.56) | — |
-| RTX 4090 | `rk8v4` | DFlash2 5 | 0.44 (3.16) | 0.39 (2.95) | 0.41 (3.05) | 0.48 (3.40) | 0.32 (2.56) | 0.30 (2.48) | — | — |
-| RTX 4090 | `rk8v4` | MTP 3 | 0.57 (2.68) | 0.52 (2.57) | 0.52 (2.55) | 0.61 (2.80) | 0.53 (2.56) | 0.42 (2.29) | — | — |
-| RTX 3090 | `rk4v4` | DFlash2 5 | 0.45 (3.24) | 0.30 (2.51) | 0.30 (2.51) | 0.38 (2.86) | 0.27 (2.35) | 0.26 (2.31) | 0.27 (2.35) | — |
-| RTX 3090 | `rk4v4` | MTP 3 | 0.58 (2.73) | 0.42 (2.26) | 0.53 (2.60) | 0.59 (2.75) | 0.53 (2.57) | 0.50 (2.50) | 0.54 (2.61) | — |
-| RTX 3090 | `rk8v4` | DFlash2 5 | 0.46 (3.27) | 0.38 (2.86) | 0.39 (2.92) | 0.48 (3.39) | 0.32 (2.57) | 0.34 (2.68) | — | — |
-| RTX 3090 | `rk8v4` | MTP 3 | 0.59 (2.76) | 0.53 (2.59) | 0.55 (2.65) | 0.52 (2.55) | 0.58 (2.74) | 0.42 (2.25) | — | — |
-
-### Best draft count
-
-The same sweep as for Bonsai 2; 262,144-token window on the RTX 5090, 139,264 on the 24 GB cards:
-
-| Card | No drafter: short chat / 32,768 / 131,072 | Drafter | Short chat | 32,768 | 131,072 |
-|---|---|---|---|---|---|
-| RTX 5090 | 91.6 / 86.7 / 76.3 | MTP | 3: 184.2 (0.59) | 5: 183.3 (0.50) | 4: 134.2 (0.40) |
-| RTX 5090 | 91.6 / 86.7 / 76.3 | DFlash2 | 7: 236.2 (0.36) | 6: 226.0 (0.43) | 4: 164.0 (0.44) |
-| RTX 4090 | 54.8 / 52.0 / 45.6 | MTP | 4: 113.5 (0.52) | 3: 114.7 (0.66) | 3: 80.3 (0.45) |
-| RTX 4090 | 54.8 / 52.0 / 45.6 | DFlash2 | 7: 148.8 (0.35) | 7: 151.9 (0.39) | 7: 102.3 (0.27) |
-| RTX 3090 | 47.9 / 44.8 / 38.1 | MTP | 3: 95.9 (0.58) | 3: 93.2 (0.63) | 3: 68.5 (0.51) |
-| RTX 3090 | 47.9 / 44.8 / 38.1 | DFlash2 | 7: 117.5 (0.37) | 6: 109.3 (0.41) | 4: 79.0 (0.45) |
-
-### Engine and CLI rates
-
-Engine, `rk8v4`, the mean of three runs after one warm-up; tok/s:
-
-| Card | Prompt 512 | Prompt 2,048 | Decode 128 | MTP 3, 512-token prompt |
-|---|---:|---:|---:|---:|
-| RTX 3090 | 1,807 | 1,771 | 48.8 | 78.6 (0.32, 1.95) |
-| TITAN RTX | 775 | 793 | 29.8 | 35.3 (0.34, 2.02) |
-
-On the Tesla V100 the weights fit only with `--embedding-q4 --lm-head-q4` (14.7 GiB) or
-`--lm-head-q6` (15.0 GiB); the CLI then decodes 30.4 tok/s.
-
-### KV formats on Qwen3.8-27B
-
-One RTX 3090. Perplexity is `ninfer-perplexity --quick` on `ninfer-ppl-1m-v1` (context 4,096, stride 2,048,
-261,167 scored tokens). Decode is 128 steps after a prompt of that depth without a drafter, the
-mean of two runs, on a card capped at 315 W of its 350 W default:
-
-| KV format | Bytes per token | Perplexity | Change against `bf16` | Decode at 4,096 | at 16,384 | at 32,768 |
-|---|---:|---:|---:|---:|---:|---:|
-| `bf16` | 65,536 | 4.342517 | — | 36.58 | 34.34 | 31.93 |
-| `int8` | 33,792 | 4.342425 | −0.002% | 35.31 | 34.34 | 33.63 |
-| `fp8` | 33,024 | 4.344724 | +0.051% | 35.05 | 33.09 | 30.34 |
-| `rk8v4` | 26,112 | 4.346413 | +0.090% | 35.65 | 34.73 | 33.17 |
-| `k8v4` | 25,728 | 4.347258 | +0.109% | 34.22 | 31.83 | 28.90 |
-| `nvfp4` | 18,432 | 4.352201 | +0.223% | 35.37 | 32.78 | 29.86 |
-| `rk4v4` | 17,920 | +0.214% against `int8` | | within 1% of `rk8v4` | | |
-
-The `rk4v4` row was measured in a later session (`int8` 4.343155 there) and is stated against that
-session's `int8`. A simulation of `rk2v4-e8`'s keys on Qwen3.8-27B cost +3.08%.
-[Context and memory](cli.md#context-and-memory) turns these into recommendations.
-
-### Drafters by concurrency
-
-One RTX 3090, INT8 KV, thinking off, greedy; aggregate decode tok/s through the server, decode
-time from the request log:
-
-| Requests at once | MTP 3 | DFlash2 7 | Tokens per round, MTP / DFlash2 |
-|---:|---:|---:|---|
-| 1 | 135.0 | 187.1 | 3.51 / 5.57 |
-| 2 | 238.2 | 313.5 | 3.51 / 5.82 |
-| 4 | 387.4 | 406.2 | 3.54 / 5.63 |
-| 8 | 522.8 | does not fit | 3.53 / — |
-
-Speculation pays because a multi-column round costs about one sweep of the weights; batching
-amortizes that sweep already, so the lead shrinks as requests are added while acceptance holds.
-DFlash2's draft weights and its refusal of `--lm-head-q6` stop it at eight lanes and cost it about
-65K tokens of context against MTP on a 24 GB card. Over a reasoning, a code and a summarization
-prompt seven drafts were best on average, but the reasoning prompt kept improving to twelve while
-summarization fell off there.
-
-### MTP draft count by content
-
-One RTX 3090, `rk4v4` KV with `--lm-head-q6 --embedding-q4 --gdn-state-fp16`, greedy, 512
-generated tokens, one stream; decode tok/s with tokens per round in brackets:
-
-| `--draft-tokens` | edit code (copies the prompt) | write new code | explain a concept | short story |
-|---:|---:|---:|---:|---:|
-| none | 47.3 | 47.5 | 47.5 | 47.6 |
-| 3 | 141.9 (3.9) | 118.2 (3.3) | 102.1 (2.8) | 77.1 (2.1) |
-| 5 | 177.7 (5.7) | 124.8 (4.0) | 95.6 (3.1) | 75.1 (2.4) |
-| 7 | 226.0 (7.4) | 130.6 (4.3) | 103.9 (3.4) | 67.7 (2.2) |
-| 9 | 226.4 (8.8) | 129.9 (5.0) | 91.3 (3.5) | 56.3 (2.2) |
-| 15 | 262.6 (12.5) | 114.7 (5.4) | 75.1 (3.5) | 47.6 (2.2) |
-
-Each round verifies K+1 columns and runs K draft steps whether or not the drafts survive, so a
-larger K pays only where the head keeps guessing right ([choosing a draft
-count](cli.md#choosing-a-draft-count)).
-
-### Several requests at once
-
-The same server runs as for Bonsai 2, total generated tok/s:
-
-| Card | Drafter | 1 | 2 | 4 | 8 |
-|---|---|---:|---:|---:|---:|
-| RTX PRO 6000 | none | 88.8 | 172.6 | 327.9 | 569.8 |
-| RTX PRO 6000 | MTP 3 | 154.4 | 300.9 | 515.8 | 739.3 |
-| RTX PRO 6000 | DFlash2 5 | 176.1 | 319.4 | 473.7 | 534.6 |
-| RTX 5090 | none | 91.0 | 172.0 | 324.7 | 569.1 |
-| RTX 5090 | MTP 3 | 160.6 | 299.0 | 490.0 | 690.0 |
-| RTX 5090 | DFlash2 5 | 171.6 | 311.1 | 430.9 | 469.4 |
-| RTX 4090 | none | 54.3 | 105.6 | 198.4 | 356.7 |
-| RTX 4090 | MTP 3 | 92.8 | 174.9 | 300.3 | 442.2 |
-| RTX 4090 | DFlash2 5 | 107.7 | 185.1 | 295.2 | |
-| RTX 3090 | none | 48.1 | 91.9 | 172.2 | 290.2 |
-| RTX 3090 | MTP 3 | 88.2 | 154.8 | 238.4 | 328.9 |
-| RTX 3090 | DFlash2 5 | 89.1 | 155.4 | 206.0 | |
-
-### RTX PRO 6000 against RTX 5090, October 2026
-
-The PRO 6000's server rows measured again next to an RTX 5090 (600 W boards), build `796f98500`,
-CUDA 13.1; decode tok/s, prompt time in seconds, acceptance in brackets:
-
-| Model, KV, drafter, request | RTX PRO 6000, September | RTX PRO 6000, October | RTX 5090, October |
-|---|---:|---:|---:|
-| Bonsai 2, `rk8v4`, none, short chat | 167.5 | 167.7 | 170.4 |
-| Bonsai 2, `rk8v4`, DFlash2 7, short chat | 381 | 378.8 | 372.1 |
-| Bonsai 2, `rk8v4`, MTP 3, short chat | 314.7 | 313.9 | 321.2 |
-| Bonsai 2, `rk8v4`, none, prompt of 261,120 tokens | 78.3 s | 75.0 s | 76.7 s |
-| Bonsai 2, `rk8v4`, none, decode after it | 96.4 | 96.7 | 99.0 |
-| Bonsai 2, `rk4v4`, MTP 3, decode after it | 217.9 (0.56) | 220.9 (0.56) | 194.8 (0.46) |
-| Bonsai 2, `rk8v4`, MTP 3, decode after it | 210.5 (0.60) | 186.4 (0.49) | 207.6 (0.57) |
-| Bonsai 2, `rk8v4`, MTP 3, eight requests at once | 1,155.3 | 1,159.6 | 1,081.5 |
-| Qwen3.8, `rk8v4`, none, short chat | 89.6 | 90.0 | 92.1 |
-| Qwen3.8, `rk8v4`, DFlash2 7, short chat | 237 | 238.5 | 233.5 |
-| Qwen3.8, `rk8v4`, MTP 3, eight requests at once | 739.3 | 749.5 | 709.9 |
-
-One request decodes no faster on the PRO 6000 than on the RTX 5090: that decode is bound by memory
-bandwidth, 1.79 TB/s of GDDR7 on both. Its 188 SMs against 170 show where compute decides: it
-prefills the 261K prompt 2% faster and runs eight requests at once 6 to 7% faster.
-
-## Qwen3.8-27B GSQ-RCO IQ3_S
-
-The [3.5-bit GGUF release](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3),
-10.9 GiB of weights.
-
-### Server
-
-`rk8v4`, one request; IQ3_S / the official artifact on the same card in the same sitting (RTX 3090
-at 420 W and RTX 4090 with a 176,128-token window, RTX 5090 at 450 W with 262,144); the Tesla V100
-runs IQ3_S alone with a 65,536-token window (16,384 for DFlash2):
-
-| Measure | RTX 5090 | RTX 4090 | RTX 3090 | Tesla V100 |
-|---|---:|---:|---:|---:|
-| short chat, no drafter, tok/s | 107.5 / 88.1 | 70.6 / 55.0 | 59.9 / 40.3 | 45.5 |
-| short chat, MTP 3, tok/s | 221.4 / 178.1 | 146.4 / 109.3 | 108.7 / 82.7 | 77.0 (0.58, 2.72) |
-| short chat, DFlash2 5, tok/s | 226.5 / 222.5 | 169.4 / 141.3 | 115.6 / 109.2 | 65.3 (0.46, 3.28) |
-| decode after 32,768 tokens, no drafter, tok/s | 100.3 / 83.2 | 66.0 / 52.2 | 50.4 / 38.4 | 42.5 |
-| prompt time, 32,768 tokens, s | 8.6 / 9.3 | 9.3 / 12.8 | 20.5 / 22.2 | 38.9 |
-
-On the V100, decode after 1,024 and 8,192 tokens is 45.4 and 44.9 tok/s without a drafter, 65.0
-and 64.3 with MTP 3 (64.2 after 32,768) and 53.4 and 53.1 with DFlash2 5; prompt time is 1.18 s at
-1,024 tokens and 8.3 s at 8,192.
-
-### Against the NVFP4 OrcaRouter artifact, one V100-PCIE-32GB
+The largest `--max-context` each artifact was started and served at on this line's 32 GB cards,
+INT8 KV unless a row says otherwise. The expert residency is the one the artifact needs on a 32 GB
+card: weights that fit stay on the device, Flash-Next's routed experts go to pinned host memory.
+
+| Artifact | Card | Residency | Window, tokens | Notes |
+|---|---|---|---:|---|
+| `orcarouter-Qwen3.8-27B` NVFP4 (19.1 GiB) | V100 | device | 254,208 | DFlash2 adapter + MTP head |
+| `Qwen3.8-27B-GSQ-RCO-IQ3_S` (11.6 GiB on device) | V100 | device | 400,000 | GGUF blocks |
+| `Gemma4-31B-QAT` (dense, 17.6 GiB) | V100 | device | 32,768 | 10.5 GiB still free |
+| `Gemma4-26B-A4B-QAT` (16.9 GiB, 8 of 128 experts) | V100 | device | 28,672 | 14.1 GiB still free |
+| `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` | V100 | pinned host memory | 130,000 | with the vision tower; expert cache 18,623 MiB |
+| `Qwen3.8-27B-Coder390-W4A4-MTP-DFlash2` | 4080 SUPER | device | 200,000 | the serving configuration |
+
+Flash-Next's window trades directly against its decode rate, because the same VRAM is the expert
+cache: the same release at an 8,192-position context on the bench holds a 24,118 MiB cache, while
+the 130,000-token vision service holds 18,623 MiB, and decode follows the cache (24.9 / 27.9 / 30.5
+tok/s in one sitting at 200,000 / 32,768 / 8,192 context).
+
+## Qwen3.8-27B GSQ-RCO IQ3_S, one V100-PCIE-32GB
+
+### Against the NVFP4 OrcaRouter artifact
 
 `ninfer_bench`, INT8 group-64 KV, `--max-context 200000`, prefill chunk 2048, greedy, 3 measured
 repetitions plus one warmup; the same four prompts on both artifacts, tokenized with the
-artifact's own tokenizer and chat template. The NVFP4 artifact is the OrcaRouter
-fine-tune (18.9 GiB of weights); IQ3_S is 11.6 GiB on the device. The bases differ, so this is an
-end-to-end artifact comparison. MTP 4 decodes 1,024 tokens; the no-drafter row decodes
-256. Prefill is the measured prompt rate of the MTP run:
+artifact's own tokenizer and chat template. The NVFP4 artifact is the OrcaRouter fine-tune
+(18.9 GiB of weights); IQ3_S is 11.6 GiB on the device. The bases differ, so this is an
+end-to-end artifact comparison. MTP 4 decodes 1,024 tokens; the no-drafter row decodes 256.
+Prefill is the measured prompt rate of the MTP run:
 
 | prompt | tokens | MTP 4, IQ3_S | MTP 4, NVFP4 | no drafter, IQ3_S | no drafter, NVFP4 | prefill, IQ3_S / NVFP4 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -589,127 +77,15 @@ IQ3_S stores five Q6_K objects, all in its MTP layer; the fused `[gate; up]` par
 MLP keeps its stored layout (the dense prepack's fused-parent exclusion) while the other Q6_K
 projections take the dense layout.
 
-### Engine and CLI rates
-
-Prompt and decode in tok/s:
-
-| Card | Method, KV | Prompt 512 | Prompt 2,048 | Long prompt | Decode | Decode after the long prompt |
-|---|---|---:|---:|---:|---:|---:|
-| RTX 3090 | engine, `rk8v4` | 1,826 | 1,877 | | 59.2 | |
-| TITAN RTX | engine, `rk8v4` | 757 | 772 | 701 (16,384); 598 (65,536) | 34.8 | 33.1; 33.4 |
-| Tesla V100 | engine, `bf16` | 944 | 1,044 | 914 (16,384) | 45.3 | 42.6 |
-| Tesla V100 | llama.cpp, F16 KV | 768 | 792 | | 36.6 | 31.2 |
-| RTX 3060 | CLI, `int8` | | | 567 (2,273) | 25.8 | |
-
-With MTP 3 the engine decodes 79.1 tok/s on the RTX 3090 and 41.6 on the TITAN RTX (both 0.29,
-1.87); with DFlash2 3 the TITAN RTX decodes 32.5 (0.18, 1.52).
-
-### Quality
-
-WikiText-2 test, disjoint 2,048-token windows, BF16 KV: 7.071 ([GGUF](gguf.md#measurements)),
-7.0703 on the Tesla V100; the official artifact 7.286.
-
-## Qwen3.8-27B MXFP8
-
-The [MXFP8 tune](https://huggingface.co/WaveCut/Qwen3.8-27B-MXFP8-CRACK-NInfer-v3), 17 GiB: too
-large for 16 GB. On the TITAN RTX (engine, `rk8v4`) it prompts at 810 tok/s (512 tokens) and 832
-(2,048) and decodes at 30.9.
-
-## Qwen3.6-35B-A3B
-
-- **One RTX 3090** (capped at 315 W, the official `groupwise-int` artifact, 19.6 GiB of weights),
-  decode tok/s without a drafter at 4,096 / 16,384 / 32,768 tokens of context, the mean of two
-  runs: `rk8v4` 175.15 / 168.50 / 158.47, `int8` 171.76 / 165.02 / 154.88, `bf16` 166.16 / 156.00 /
-  142.99, `fp8` 166.01 / 148.82 / 132.00, `nvfp4` 169.04 / 151.81 / 131.75, `k8v4` 165.66 / 143.58 /
-  122.78 ([configuration calculator](config-calculator.html)).
-- **Two TITAN RTX as pipeline stages**: 146.6 tok/s, 146.2 with MTP 3 (2.70 tokens a round), CLI,
-  a 144-token prompt and 128 tokens. The artifact does not fit one TITAN RTX beside the runtime.
-- **NVFP4 on an RTX 5090**: the
-  [NVFP4 artifact](https://huggingface.co/WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3) starts in 17 s
-  and leaves 7.4 GiB of the card free.
-
 ## Qwen3.8-Flash-Next
 
-### Expert placements
+A 48-layer MoE that routes 512 experts and reads a shared n-gram table. Its routed experts do not
+fit the 32 GB card in device memory (53.7 GiB for IQ3_S), so they live in pinned host memory
+(`--expert-residency host`) and each round stages only the experts a token routes.
 
-Greedy, one request. Decode is measured over a short answer (78 tokens for Q2_0, 81 to 87 for
-IQ3_S) and over the first tokens after a 4,463-token prompt; prefill is that prompt. Host memory
-is the process's peak resident set, device memory the most `nvidia-smi` showed. The host-memory
-and disk rows of one card use its free memory as the expert cache. A range is two runs.
-
-| Card | Release | Experts | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
-|---|---|---|---:|---:|---:|---:|---:|
-| RTX PRO 6000 | Q2_0 | on the GPU | 37.7 GiB | 0.8 GiB | 136.0-139.7 | 160.7-162.6 | 2,925-2,952 |
-| RTX PRO 6000 | IQ3_S | on the GPU | 53.7 GiB | 1.0 GiB | 123.8-125.9 | 146.8-146.9 | 2,540-2,541 |
-| RTX PRO 6000 | Q2_0 | pinned host memory | 38.5 GiB | 34.0 GB | 54.8-55.0 | 67.7-70.0 | 1,296-1,297 |
-| RTX PRO 6000 | IQ3_S | pinned host memory | 55.0 GiB | 50.3 GB | 29.3 | 31.2 | 803 |
-| RTX PRO 6000 | Q2_0 | disk, in the page cache | 93.6 GiB | 1.0 GiB | 75.9 | 115.8 | 2,024 |
-| RTX PRO 6000 | IQ3_S | disk, in the page cache | 93.5 GiB | 1.2 GiB | 65.6 | 106.0 | 1,661 |
-| RTX PRO 6000 | Q2_0 | disk, pages evicted every second | 93.5 GiB | 1.0 GiB | 35.1 | 87.1 | 1,000 |
-| RTX PRO 6000 | IQ3_S | disk, pages evicted every second | 93.5 GiB | 1.2 GiB | 28.7 | 78.6 | 773 |
-| 2× RTX 5090 | Q2_0 | on the GPUs | 18.8 + 19.6 GiB | 0.9 GiB | 136.1-136.3 | 157.0-157.2 | 3,807-3,811 |
-| 2× RTX 5090 | IQ3_S | on the GPUs | 26.5 + 27.8 GiB | 1.0 GiB | 121.6-121.9 | 141.8-142.0 | 3,310-3,341 |
-| RTX 5090 | Q2_0 | pinned host memory | 30.0 GiB | 34.0 GB | 74.1-74.2 | 93.9-94.2 | 1,676-1,678 |
-| RTX 5090 | IQ3_S | pinned host memory | 30.0 GiB | 50.3 GB | 40.7 | 41.0 | 1,100 |
-| RTX 5090 | Q2_0 | disk, in the page cache | 29.9 GiB | 1.0 GiB | 67.5 | 76.7 | 1,739 |
-| RTX 5090 | IQ3_S | disk, in the page cache | 29.9 GiB | 1.1 GiB | 55.3 | 44.3 | 439 |
-| RTX 5090 | Q2_0 | disk, pages evicted every second | 29.9 GiB | 1.0 GiB | 25.3 | 28.7 | 694 |
-| RTX 5090 | IQ3_S | disk, pages evicted every second | 29.9 GiB | 1.1 GiB | 18.8 | 14.9 | 171 |
-| 2× RTX 4090 | Q2_0 | on the GPUs | 18.5 + 19.4 GiB | 0.8 GiB | 92.6-100.7 | 116-120 | 3,482-3,734 |
-| RTX 4090 | Q2_0 | pinned host memory | 20.7 GiB | 34.0 GB | 52.6-52.7 | 44.3-44.6 | 1,137-1,139 |
-| RTX 4090 | Q2_0 | disk, in the page cache | 20.7 GiB | 1.0 GiB | 42.0 | 45.6 | 723 |
-| RTX 4090 | Q2_0 | disk, pages evicted every second | 20.5 GiB | 1.0 GiB | 17.7 | 12.2 | 160 |
-| 2× RTX 3090 Ti | Q2_0 | on the GPUs | 18.4 + 19.4 GB | 0.7 GB | 90.2 | 107 | 1,504 |
-| RTX 3090 | Q2_0 | pinned host memory | 22.6 GB | 34 GB | 48.9 | 42.1 | 842 |
-| RTX 3090 | Q2_0 | disk, in the page cache | 22.6 GB | 0.9 GB | 47.0 | 39.1 | 630 |
-| RTX 3090 | Q2_0 | disk, page cache dropped every second | 22.6 GB | 0.9 GB | 17.2 | 11.3 | 195 |
-| RTX 3090 | IQ3_S | pinned host memory | 22.1 GiB | 50.3 GB | 34.4 | 30.2 | 533 |
-| RTX 3090 | IQ3_S | disk, the page cache holding part of the file | 22.1 GiB | | 19.0 | 21.6 | 209 |
-| RTX 3090 | IQ3_S | disk, pages evicted every second | 22.1 GiB | | 10.7 | 5.4 | 47 |
-| RTX 3090 | Q2_0 | pinned host memory | 22.1 GiB | 34.0 GB | 50.2 | 43.7 | 847 |
-| L40S (48 GB) | Coder IQ1_M | pinned host memory | | | 35 | | 1,648 |
-| L40S (48 GB) | Coder IQ1_M | disk, in the page cache | | | 42 | | 1,938 |
-
-The Coder IQ1_M rows are the 28.4 GiB model beside the shared n-gram table on one NVIDIA L40S (48 GB).
-The two RTX 3090 Q2_0 host-memory rows come from two hosts (an earlier build with 512-token prompt
-chunks, and the IQ3_S sitting). The host link carries host and disk experts: PCIe 5.0 x16 on the
-RTX 5090 host, 4.0 x16 on the RTX PRO 6000, RTX 4090 and RTX 3090 hosts. The RTX 4090 rows ran pinned to the GPU's NUMA node; left
-unpinned, host experts decode 40 tok/s and disk experts 32 to 33.
-
-Other cards ran the Q2_0 release from the CLI with other prompts, 128 generated tokens, a cold
-expert cache, the files in the page cache (most or all of them on the 8 and 12 GB cards); prefill /
-decode tok/s with the expert-cache hits:
-
-| Card | Experts | Prompt | Prefill / decode | Hits |
-|---|---|---:|---|---:|
-| TITAN RTX, two | on the GPUs, two pipeline stages | 144 tokens | — / 76.0 | |
-| TITAN RTX | pinned host memory | 144 tokens | — / 53.5 | 43.7% |
-| TITAN RTX | disk | 144 tokens | — / 30.3 | 83.5% |
-| Tesla V100 | pinned host memory | 66 tokens | 38.8 / 35.9 | 58.6% |
-| Tesla V100 | disk | 66 tokens | 38.2 / 30.8 | 81.0% |
-| RTX 3060 | pinned host memory | 69 / 2,273 tokens | 58.9 / 39.9; 569 / 38.2 | 51.3%; 26.4% |
-| RTX 3060 | disk | 69 / 2,273 tokens | 37.9 / 23.5; 215 / 22.9 | 70.2%; 44.2% |
-| RTX 3060 Ti | pinned host memory | 69 / 2,273 tokens | 73.3 / 33.0; 723 / 30.6 | 29.3%; 13.7% |
-| RTX 3060 Ti | disk | 69 / 2,273 tokens | 52.8 / 17.6; 356 / 16.4 | 39.9%; 23.3% |
-
-The RTX 3060 and 3060 Ti hold 4.9 to 5.3 GiB and 0.9 to 1.3 GiB of expert cache; their
-host-memory rows peak at 32.7 GiB of RAM, their disk rows at 1.2 to 1.3 GiB.
-
-### MTP
-
-Two RTX 3090s (350 W), the Q2_0 release with Unsloth's `shared-Q8_0` MTP block, greedy decoding of
-a 117-token answer to a 37-token coding prompt, two runs each; every speculative output is the
-plain decode's, token for token:
-
-| Placement | Drafts | Decode, tok/s | Drafts accepted | Tokens a round |
-|---|---:|---:|---:|---:|
-| 2× RTX 3090, experts on the GPUs | none | 92.9-93.0 | | |
-| 2× RTX 3090, experts on the GPUs | 1 | 130.1-130.9 | 96.6% | 1.97 |
-| 2× RTX 3090, experts on the GPUs | 2 | 150.3-150.5 | 91.5% | 2.83 |
-| 2× RTX 3090, experts on the GPUs | 3 | 167.8-171.0 | 95.6% | 3.87 |
-| 2× RTX 3090, experts on the GPUs | 4 | 171.9-173.6 | 91.0% | 4.64 |
-
-A prose answer keeps 38.6% of three drafts and gains nothing.
+**The decode rate is set by miss traffic, not compute.** IQ3_S's routed experts are 53.7 GiB, so
+on a 32 GB card they cross PCIe 3.0 (~13 GB/s effective) instead of being read at ~875 GB/s from
+HBM. That is the structure's floor, not the card's ceiling.
 
 ### CPU arithmetic for the host experts, one V100
 
@@ -717,8 +93,7 @@ The host experts the CPU computes (the `--expert-dma-share` share of a call's mi
 run on the exact q8_1 products (the default, bit for bit with the GPU) or on ggml-cpu's AVX2
 vecdot kernels (`--expert-cpu-arithmetic ggml`), which quantize the activation to q8_K for the
 i-quant gate/up and to q8_0 for the IQ4_NL and Q8_0 down; a projection ggml-cpu does not cover
-(GSQ-RCO's Q2_0) keeps the exact products. The Q2_0 artifact's down projections and every other
-projection the exact path covers stay exact, so both modes run the same artifact.
+(GSQ-RCO's Q2_0) keeps the exact products, so both modes run the same artifact.
 
 Tesla V100-PCIE-32GB, the IQ3_S release, host experts, an 8,192-position context, INT8 KV, MTP
 with three drafts, a 512-token prompt and 128 generated tokens of a 7,051-token code corpus,
@@ -735,50 +110,180 @@ two repetitions; the expert cache holds 24,118 MiB. Decode tok/s, the drafts acc
 The host CPU is a Xeon E5-2696 v3 (18 cores, AVX2). At a 50% share the CPU computes a round's
 share of the missing experts in about 20 ms, more than the round's slack at ~30 tok/s, so the
 second stage waits on it and the hybrid loses to the all-GPU miss path (30.0-30.1 tok/s); the
-vecdot kernels are +1.8% over the exact q8_1 products for the share they compute. The default
-(exact arithmetic, all misses on the GPU) stays the fastest configuration on this host.
+vecdot kernels are +1.8% over the exact q8_1 products for the share they compute.
 
-The same sweep on a clean sitting (the same protocol, this host, the exact q8_1 arithmetic;
-the `--expert-dma-share` value shown, 1.0 = every miss on the GPU):
+The same sweep on a clean sitting (this host, the exact q8_1 arithmetic):
 
 | DMA share | 1.0 | 0.8 | 0.7 | 0.9 | 0.6 |
 |---|---:|---:|---:|---:|---:|
 | Decode, tok/s | 43.5 | 43.5 | 28.1 | 28.6 | 27.0 |
 
-A 20% CPU share costs nothing (the CPU's 0.2 share fits in the round's staging time); every
-other share tested costs about 35%, because the CPU's i-quant vecdot products run at a few GB/s
-of expert bytes (compute-bound on this Xeon, measured at ~0.6-2 GB/s effective), far slower than
-the 13 GB/s bus they replace, so the round ends up waiting on the CPU; the service thread also
-serializes the two. The all-GPU miss path (`--expert-dma-share 1`) is the fastest configuration
-on this host; the ggml-cpu vecdot kernels (above) matter only for the share the CPU takes,
-which is best kept at zero here.
+A 20% CPU share costs nothing (it fits in the round's staging time); every other share tested
+costs about 35%, because the CPU's i-quant vecdot products run at a few GB/s of expert bytes
+(compute-bound on this Xeon, ~0.6-2 GB/s effective), far slower than the 13 GB/s bus they replace,
+so the round ends up waiting on the CPU. **The all-GPU miss path (`--expert-dma-share 1`) is the
+fastest configuration on this host.**
+
+Making the CPU skip the device cache (a CPU-computed expert is no longer re-copied into a slot)
+removes its bytes from the bus — a 50% share cuts the round's host-to-device expert traffic
+104 → 66 GB — but decode still falls (same sitting, MTP 3: 27.7 all-GPU → 23.9 at a 50% share,
+service time 9.1 → 12.5 s), because the CPU is the slower resource here. The change is kept as the
+default for a faster host, with no effect on the `--expert-dma-share 1` path.
+
+### Where a decode round's expert bytes go
+
+The bench reports a run's expert bytes by category (`expert_seed_bytes`,
+`expert_rebalance_bytes`, `expert_admit_bytes`, plus the two-stage staging-bank copies), so a
+104 GB run breaks into the one-time profile seed (23.1 GB, the warm start), the pass-end budget
+(4.9 GB), the steady-state miss admissions into slots (38.0 GB) and the two-stage staging-bank
+copies (38.0 GB). The steady-state traffic is split evenly between slot admissions and
+staging-bank copies: a miss is admitted into a slot and also staged for the round that needs it
+before the admission lands, and the long tail that never fits a slot is staged every round it is
+routed. 76 GB of steady-state traffic per run is set by the miss rate and the expert size, not by
+a removable copy.
+
+### Prefill of host experts, one V100
+
+Prefill is staging-bound the same way decode is. A wide pass (≤2,048 tokens, one pass) runs each
+layer serially: the router needs the layer's input, so the experts the next layer will route to
+are only known after the current layer's MoE; the staged copy of a layer's routed experts and its
+MoE cannot overlap across layers. A long prompt (>2,048 tokens) goes through the span path, which
+stages each layer's uncached experts once per span (up to 8 chunks) instead of once per pass. The
+measured per-prompt expert staging is nearly fixed:
+
+| Prompt | Staging transferred | Prefill, tok/s | Per token |
+|---|---:|---:|---:|
+| 512 | 19.4-21.5 GB | 157.5 (clean) | ~38-42 MiB |
+| 2,048 | 21.3 GB | 402.9 | 10.4 MiB |
+| 4,096 | 25.4 GB | 695.2 | 6.2 MiB |
+
+The 512-token 157.5 tok/s is a small-prompt artifact: the per-prompt staging floor is ~19-25 GB of
+routed experts plus the decode-bound admissions, ~1.5 s of PCIe 3.0 time plus ~1.6 s of compute,
+and the measured 3.25 s sits on that floor. A cold first prompt (no warm-up overlap) measures the
+same staging (19.4 GB, 10.1% cache hits) because the pool stages the routed subset, not the whole
+bank. Disk residency costs −60% of prefill (page-cache reads instead of pinned DMA plus a second
+staging).
+
+The live service reproduces the same shape, because its reported `prefill = prompt / TTFT` includes
+that fixed staging. Measured on the 130,000-token, vision-enabled service (expert cache 18,623 MiB),
+same sitting:
+
+| Prompt, tokens | 19 | 524 | 1,280 |
+|---|---:|---:|---:|
+| Reported prefill, tok/s | 23.9 | 146.0 | 350.3 |
+
+so a short prompt is dominated by the fixed staging and says nothing about the model's prefill
+rate; a real prompt runs 300–700+ tok/s (711 tok/s at 3,702 tokens on the same service).
+
+`--expert-prefill-buffers 2` double-buffers the span path so the next layer's bank is copied while
+the current layer computes. Interleaved A/B at a 4,096-token prompt, same sitting: 363.7 / 338.7
+(one buffer) against 428.1 / 430.8 (two) — +17.7% / +27.0%. At a 512-token prompt it is neutral to
+negative, because a single pass cannot prefetch across layers at all. The second buffer holds
+1.1 GiB, taken from the expert cache; the Flash-Next service enables it for its long prompts.
+
+The nvprof decomposition of a 4,096-token span prefill (two buffers, one pass per layer):
+
+| Activity | Share of profiled GPU time |
+|---|---:|
+| host-to-device expert staging (25.4 GB, 120,649 copies) | 48.5% |
+| MoE wide calls (i-quant, all layers) | ~14% |
+| GDN recurrent attention | 9.1% |
+| cuBLAS GEMMs (embed, router, shared expert) | 7.7% |
+| full-attention layers (12, O(T²)) | 3.9% |
+| host-side waits | 3.1% |
+| hyper-connections, routing, KV, quantize | ~10% |
+
+Staging at the bus peak (~12 GB/s wall) is ~2.0 s and compute (~55 TFLOP of the 4,096 tokens) is
+~1.2-2.2 s; with the two buffers they overlap, and the measured 4.3 s is close to
+max(staging, compute) plus the wait tail. The kernel-side levers were checked and all came up
+empty: the Volta prefill already runs GDN as one full-width recurrent kernel per layer-pass (op
+bench, cold L2, T=2048: 3.54 ms against 8.40 ms for the chunked pipeline); the wide i-quant calls
+already use the widest available column tile (128, the vendored ggml config's limit); and the wait
+tail is the GPU spinning during the staging itself, so it falls with the hit rate and has no
+independent lever. A same-sitting 2,048-versus-4,096 A/B (both arms double-buffered) measured
+436.0 against 496.9 tok/s (+14%): a fixed per-prompt staging cost of ~1.15 s on top of ~1.73 ms
+token streaming.
+
+### IQ3_S on one V100: the final configuration
+
+Experts in pinned host memory, every miss on the GPU, INT8 KV, an 8,192-position context, exact
+CPU arithmetic, CUDA graphs on. A 512-token prompt and 128 generated tokens of a 7,051-token code
+corpus, two repetitions; the expert cache holds 24,118 MiB (7,372 of 24,576 experts, 30.0%):
+
+| Drafter | Prefill, tok/s | Decode, tok/s | Drafts accepted | Per draft position |
+|---|---:|---:|---:|---|
+| none | 157.5 | 33.6 | | |
+| MTP 2 | 155.4 | 43.5 | 71.9% | 84 / 67% |
+| MTP 3 (final) | 156.8-157.4 | 43.5-44.0 | 62.5% | 67 / 58 / 42% |
+| MTP 4 | 157.4 | 39.8 | 54.0% | 62 / 49 / 34 / 30% |
+
+What a decode round spends on (nvprof over the measured region, MTP 3, all misses on the GPU):
+
+| Activity | Share of GPU time |
+|---|---:|
+| host-to-device expert staging (145,603 copies, 80.4 µs each) | 49.0% |
+| waiting on the CPU side of the round | 13.5% |
+| GDN recurrent attention | 6.8% |
+| MoE second stage (down projections, Q4_NL) | 3.4% |
+| cuBLAS GEMMs (embed, router, shared expert) | 3.1% |
+| MoE first stage, vector ops, routing, PLE, KV | ~24% |
+
+Levers measured on this card, clean sittings:
+
+| Lever | Result |
+|---|---|
+| `--draft-min-p 10` | 43.8 tok/s; no draft falls below the 10% floor (the MTP head is over-confident), so the filter removes nothing |
+| `--expert-dma-share 0.8` | 43.5 tok/s (equal; a 20% CPU share fits in the staging time) |
+| `--expert-dma-share` 0.7 / 0.9 / 0.6 | 28.1 / 28.6 / 27.0 tok/s (−35%) |
+| `--expert-dma-share auto` | 24.9 tok/s; the balance pushes more share to the slow CPU |
+| ggml-cpu arithmetic at `--expert-dma-share 1` | no effect (no miss is computed on the CPU) |
+| CUDA graphs off | equal |
+| n-gram copy drafting (15 tokens) | the mixed speculation dilutes the acceptance and adds distinct experts to the round's staging |
+| n-gram lookup drafting (one more verify token) | +1 verify token ≈ +10% of the round's staging; the extra token's own staging outweighs the draft's gain |
+| `--max-context 8192` instead of 200,000 | 8192 frees 8.5 GiB for the expert cache (24.1 vs 15.6 GiB); decode scales with the cache — 24.9 / 27.9 / 30.5 tok/s at 200,000 / 32,768 / 8,192 context |
+| disk experts (page cache) | decode equal to host, prefill −60% |
+| two-stage staging (gate+up, then down) | neutral at t=1; kept, harmless |
+| prompt routes kept out of the cache's frequency tiers | nospec 27.7 → 34.0 tok/s (+23%), hit rate 66.9% → 92.7%; MTP 3 with a seeded cache 31.5 → 33.3 (+5.7%) |
+| seeding from a route histogram (`--expert-profile`) | decode 31.1 → 38.9 tok/s (+25%) on a cold cache, staging service time 2.91 → 1.67 s |
+
+The 60-80 tok/s target is out of reach for IQ3_S on this card **in the current shape of the
+round**: the round's staging and compute are serialized, the bus is ~13 GB/s, the CPU's i-quant
+products are far slower than the bus, and the cache cannot grow much further without taking VRAM
+from the context. Two measurements show the remaining structure:
+
+* An 8-token prompt with 512 decode tokens reaches **56.3 tok/s** (acceptance 71.8%), because the
+  small prompt leaves the cache to decode routing.
+* The recorded per-layer route histogram of a 512-token decode shows that the 248 experts per
+  layer that 24.1 GiB can hold cover **95.1% of all routes** if residency were chosen by frequency
+  (top-100: 75.1%, top-150: 85.9%, top-300: 98.5%). The adaptive policy reaches ~86% in steady
+  state, so ~9 points of hit rate — and with them ~40% of the staging — are recoverable without
+  more VRAM.
+
+Device residency (53.7 GiB for IQ3_S) and the Q2_0 release remain the other two ways past the
+44 tok/s line.
 
 ### Q2_0 on one V100
 
-The [Q2_0 release](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3)
-(40.7 GiB; the n-gram table is the shared one). Tesla V100-PCIE-32GB, experts in pinned host
-memory with every miss on the GPU (`--expert-dma-share 1`), an 8,192-position context, INT8 KV,
-a 512-token prompt and 128 generated tokens of a 7,051-token code corpus, two repetitions;
-the expert cache holds 25,759 MiB (nospec) / 25,638 MiB (MTP). Greedy, one request:
+The Q2_0 release (40.7 GiB; the n-gram table is the shared one), experts in pinned host memory,
+every miss on the GPU, an 8,192-position context, INT8 KV, a 512-token prompt and 128 generated
+tokens of a 7,051-token code corpus, two repetitions; the expert cache holds 25,759 MiB (nospec) /
+25,638 MiB (MTP). Greedy, one request:
 
 | Drafter | Prefill, tok/s | Decode, tok/s | Drafts accepted | Misses served by |
 |---|---:|---:|---:|---|
 | none | 224.8 | 44.0 | | GPU, 67.0% cache hits |
 | MTP 3 | 241.3 | 69.6 | 70.7% | GPU, 73.1% cache hits |
 
-Against the IQ3_S release under the same protocol on the same sitting: nospec 33.6 tok/s and
-MTP 3 44.0 tok/s (62.5% accepted). The Q2_0 experts are 1.32 MiB against IQ3_S's 3.27 MiB, so a
-round's miss traffic falls by the same factor; the cache holds 19,539 of the 24,576 experts
-(79.5%) instead of 7,372 (30.0%). Prefill rises from 157 to 225 tok/s on the same protocol.
-Q2_0's perplexity on this card is 2.6509 (14-window protocol, llama.cpp 2.6502) against IQ3_S's
-2.1317; on the same smoke prompt the MTP answer is identical to the plain decode's.
+The Q2_0 experts are 1.32 MiB against IQ3_S's 3.27 MiB, so a round's miss traffic falls by the
+same factor; the cache holds 19,539 of the 24,576 experts (79.5%) instead of 7,372 (30.0%).
+Prefill rises from 157 to 225 tok/s on the same protocol.
 
 ### IQ3_S on an RTX 4080 SUPER, against one V100
 
-Same artifact, same flags, both cards in the same sitting: the IQ3_S release, host experts, every
-miss on the GPU (`--expert-dma-share 1`), INT8 KV, an 8,192-position context, a 512-token prompt
-and 128 generated tokens of a 7,051-token code corpus, a warmup and two repetitions, double-buffered
-prefill, no profile seed. Each card runs its own build (`sm_70` and `sm_89`):
+Same artifact, same flags, both cards in the same sitting: host experts, every miss on the GPU,
+INT8 KV, an 8,192-position context, a 512-token prompt and 128 generated tokens of a 7,051-token
+code corpus, a warmup and two repetitions, double-buffered prefill, no profile seed. Each card runs
+its own build (`sm_70` and `sm_89`):
 
 | Card | Drafter | Prefill, tok/s | Decode, tok/s | Drafts accepted | Expert cache | Cache hits |
 |---|---|---:|---:|---:|---:|---:|
@@ -804,307 +309,54 @@ resources.
   part that speculation removes.
 
 The practical reading: on this host a 4080 SUPER is the better decode card for Flash-Next and no
-better at all for prefill, so a long-prompt workload gains little from it, while a chat/instruct
-workload gains about 2×.
-
-### IQ3_S on one V100: the final configuration
-
-The IQ3_S release, experts in pinned host memory, every miss on the GPU, MTP with three
-drafts, INT8 KV, an 8,192-position context, exact CPU arithmetic, CUDA graphs on. Tesla
-V100-PCIE-32GB, a 512-token prompt and 128 generated tokens of a 7,051-token code corpus, two
-repetitions; the expert cache holds 24,118 MiB (7,372 of 24,576 experts, 30.0%):
-
-| Drafter | Prefill, tok/s | Decode, tok/s | Drafts accepted | Per draft position |
-|---|---:|---:|---:|---|
-| none | 157.5 | 33.6 | | |
-| MTP 2 | 155.4 | 43.5 | 71.9% | 84 / 67% |
-| MTP 3 (final) | 156.8-157.4 | 43.5-44.0 | 62.5% | 67 / 58 / 42% |
-| MTP 4 | 157.4 | 39.8 | 54.0% | 62 / 49 / 34 / 30% |
-
-What a decode round spends on (nvprof over the measured region, MTP 3, all misses on the GPU):
-
-| Activity | Share of GPU time |
-|---|---:|
-| host-to-device expert staging (145,603 copies, 80.4 µs each) | 49.0% |
-| waiting on the CPU side of the round | 13.5% |
-| GDN recurrent attention | 6.8% |
-| MoE second stage (down projections, Q4_NL) | 3.4% |
-| cuBLAS GEMMs (embed, router, shared expert) | 3.1% |
-| MoE first stage, vector ops, routing, PLE, KV | ~24% |
-
-The numbers above predate the S0.24 changes; they are the baseline this section's
-levers are measured against. With the prompt-pollution fix and a mixed-corpus seed, the
-same 512+128 protocol on a same-sitting old-versus-new A/B (MTP 3, double-buffered)
-measured decode 28.1 → 28.9 tok/s and hit rate 77.7% → 91.8% on a degraded sitting
-(the clean-sitting levels of that configuration are pending a clean GPU window; the
-clean old-code baseline above is 43.5-44.0 without a seed).
-
-In steady state a round's four tokens route about forty expert slots per layer, and the cache
-misses a few of them (about 4.6, from the round's 1.36 ms layer budget and the 80.4 µs average
-copy); staging those 4.6 × 2.18 MiB through PCIe 3.0 (≈13 GB/s effective) is ~0.8 ms per layer,
-most of the ~1.36 ms layer budget. The decode rate is therefore set by the miss traffic, not
-by compute: the nospec arm (33.6 tok/s) pays the same staging per token but amortizes the layer's
-fixed work (dense projections, GDN, routing, KV) over one token a round instead of 2.9;
-Q2_0's 69.6 tok/s above is its 1.32 MiB experts halving that traffic (at the perplexity cost
-noted there).
-
-Levers measured on this card, same protocol, clean sittings:
-
-| Lever | Result |
-|---|---|
-| `--draft-min-p 10` | 43.8 tok/s; no draft falls below the 10% floor (the MTP head is over-confident), so the filter removes nothing |
-| `--expert-dma-share 0.8` | 43.5 tok/s (equal; a 20% CPU share fits in the staging time) |
-| `--expert-dma-share` 0.7 / 0.9 / 0.6 | 28.1 / 28.6 / 27.0 tok/s (−35%); see the CPU-arithmetic sweep above |
-| ggml-cpu arithmetic at `--expert-dma-share 1` | no effect (no miss is computed on the CPU) |
-| CUDA graphs off | equal (32.1 vs 32.1 tok/s on a degraded sitting; both the same on a clean one) |
-| n-gram copy drafting (15 tokens, `--ngram-draft-tokens 15`) | the mixed speculation dilutes the acceptance (64.2 vs 78.3 tok/s on the dense 27B, same sitting) and would add more distinct experts to this MoE model's round staging |
-| n-gram lookup drafting (one more verify token) | +1 verify token ≈ +10% of the round's staging; the extra token's own staging outweighs the draft's gain |
-| `--max-context 8192` against 200,000 (service) | 8192 frees 8.5 GiB for the expert cache (24.1 vs 15.6 GiB at concurrency 2, 30.0% vs 19.5% coverage); decode scales with the cache — 24.9 / 27.9 / 30.5 tok/s in one sitting at 200,000 / 32,768 / 8,192 context (concurrency 1), so the clean 44 tok/s at 8,192 becomes ~36 at 200,000 and ~40 at 32,768 |
-| disk experts (page cache) | decode equal to host, prefill −60% |
-| CPU experts skip the device cache (the `--expert-dma-share < 1` share no longer re-copies its computed experts into a slot) | removes the CPU share's bytes from the bus — a 50% share cuts the round's host→device expert traffic 104 → 66 GB — but on this Xeon the CPU's i-quant products are the slower resource, so decode falls (same sitting, MTP 3: 27.7 all-GPU → 23.9 at a 50% share, service time 9.1 → 12.5 s); it stays the right default for a faster host, not a win here |
-
-The bench now reports a run's expert bytes by category (`expert_seed_bytes`, `expert_rebalance_bytes`, `expert_admit_bytes`, `expert_cpu_routes`), so the 104 GB above breaks down on this sitting into the one-time profile seed (23.1 GB, the warm start), the pass-end budget (4.9 GB), the steady-state miss admissions into slots (38.0 GB), and the two-stage staging-bank copies (38.0 GB). The steady-state traffic is split evenly between slot admissions and staging-bank copies: a miss is admitted into a slot and also staged for the round that needs it before the admission lands, and the long tail that never fits a slot is staged every round it is routed. The seed is one-time and amortizes over the whole process; the 76 GB of steady-state traffic is what a decode pays per token, and it is set by the miss rate and the expert size, not by a removable copy. The CPU lever above removes the staging-bank share of the CPU's experts but, on this host, the CPU cannot compute them faster than the bus copied them, so the round ends up longer.
-
-The 60-80 tok/s target is out of reach for IQ3_S on this card **in the current shape of the
-round**, not by the card's own limit: the round's staging and compute are serialized, the bus is
-13 GB/s, the CPU's i-quant products are far slower than the bus (a hybrid share substitutes a
-slower resource for the staging rather than hiding it), and the cache cannot grow much further
-without taking VRAM from the context. Two measurements show the remaining structure:
-
-* An 8-token prompt with 512 decode tokens reaches **56.3 tok/s** (acceptance 71.8%) on the same
-  artifact and card, because the small prompt leaves the cache to decode routing. A 512-token
-  prompt that fills the cache with prompt-phase experts before the same decode drops it to ~44.
-  That drop is now explained and fixed, not an open question: every pass's routes — prompt chunks
-  included — were fed to the cache's frequency tiers, and a 2,048-token chunk decays the whole
-  working set by 0.999^2048 ≈ 13% before the prompt's own routes move it. Stopping that
-  (only decode and verification passes feed the tiers; prefill never reads the cache) measured,
-  same sitting, same 512+128 protocol: nospec **27.7 → 34.0 tok/s (+23%)**, hit rate
-  66.9% → 92.7%; MTP 3 with a seeded cache **31.5 → 33.3 tok/s (+5.7%)**, hit rate
-  82.6% → 93.7%, acceptance unchanged. (The absolute levels are a degraded GPU sitting; the
-  old/new binaries match each other within ±1.5 there, which is what the A/B is for.)
-* The recorded per-layer route histogram of a 512-token decode shows that the 248 experts per
-  layer that 24.1 GiB can hold cover **95.1% of all routes** if residency were chosen by frequency
-  (top-100: 75.1%, top-150: 85.9%, top-300: 98.5%; 7,663 of 25,088 experts are never routed by
-  that corpus). The adaptive policy actually reaches ~86% in steady state, so ~9 points of hit
-  rate — and with them ~40% of the staging — are recoverable without more VRAM.
-
-Seeding the cache from that histogram (`--expert-profile`, the engine's existing warm-start path)
-is already a measured win on a cold cache, same sitting: decode **31.1 → 38.9 tok/s (+25%)**, hit
-rate 38.8% → 71.5%, staging service time 2.91 → 1.67 s. The Flash-Next service now seeds from a
-**mixed-corpus** profile (`expert-profile-mixed.json`: code7k + zh7k, 2,048 decode tokens each,
-recorded with the fixed, decode-only counting; top-248-per-layer coverage 93.4% vs 95.6% for
-the code-only profile — merging flattens the long tail, and for unknown traffic the mix is the
-right expectation). It also runs `--expert-profile-out`, which writes the process's cumulative
-real-traffic route histogram after every completed request; when the traffic mix stabilizes,
-that file is the seed to deploy.
-
-The path to the ~70 tok/s that an overlapped round would allow is structural. S0.24 in
-`docs/v100/PLAN.md` closed it out: staging each miss in two stages (gate+up, then down) with the
-up GEMV behind the first stage is neutral at t=1 — a missing expert's up GEMV reads only
-1.25 MiB of weights (~1 µs per layer), far less than the 0.2 ms of down staging it hides; and
-splitting the miss set in halves (or pipelining staging across layers) is a dead end, because a
-layer's routing needs the previous layer's MoE output, so there is no GPU work left to overlap
-the staging with. What remains reachable on this card at IQ3_S quality is the hit rate: seeding
-(+25% cold), the prompt-pollution fix above (+23% nospec on a degraded sitting), and the
-difference between the 86% steady-state and the 95.1% optimal residency. Device residency
-(53.7 GiB for IQ3_S) and Q2_0 (69.6 here at a lower perplexity) remain the other two ways past
-the 44 tok/s line.
-
-For scale: a 27B model whose weights fit the card is DRAM-bound and reaches 70+ tok/s in
-llama.cpp builds because every weight is read once per token at ~875 GB/s. IQ3_S's routed experts
-alone are 53.7 GiB, so this model on a 32 GB card reads them over PCIe instead — the numbers above
-are that structure's floor, not the card's ceiling.
-
-### Prefill of host experts, one V100
-
-Prefill is staging-bound the same way decode is. A wide pass (≤2,048 tokens, one pass) runs each
-layer serially: the router needs the layer's input, so the experts the next layer will route to
-are only known after the current layer's MoE; the staged copy of a layer's routed experts and its
-MoE cannot overlap across layers. A long prompt (>2,048 tokens) goes through the span path, which
-stages each layer's uncached experts once per span (up to 8 chunks) instead of once per pass. The
-measured per-prompt expert staging is nearly fixed:
-
-| Prompt | Staging transferred | Prefill, tok/s | Per token |
-|---|---:|---:|---:|
-| 512 | 19.4-21.5 GB | 157.5 (clean) | ~38-42 MiB |
-| 2,048 | 21.3 GB | 402.9 | 10.4 MiB |
-| 4,096 | 25.4 GB | 695.2 | 6.2 MiB |
-
-(the 2,048/4,096 rates from one sitting; the 512 rate clean, the same protocol as the table above).
-The 512-token 157.5 tok/s is therefore a small-prompt artifact: the per-prompt staging floor is
-~19-25 GB of routed experts plus the decode-bound admissions, ~1.5 s of PCIe 3.0 time plus ~1.6 s
-of compute, and the measured 3.25 s sits on that floor. A cold first prompt (no warm-up overlap)
-measures the same staging (19.4 GB, 10.1% cache hits) because the pool stages the routed subset,
-not the whole bank. Disk residency costs −60% of prefill (page-cache reads instead of pinned DMA
-plus a second staging).
-
-`--expert-prefill-buffers 2` double-buffers the span path so the next layer's bank is copied while
-the current layer computes. Interleaved A/B at a 4,096-token prompt, same sitting: 363.7 / 338.7
-(one buffer) against 428.1 / 430.8 (two) — +17.7% / +27.0%. At a 512-token prompt it is neutral to
-negative (113.8 / 52.1 against 58.5 / 55.5 interleaved; 59.0 against 50.3 cold), because a single
-pass cannot prefetch across layers at all. The second buffer holds 1.1 GiB, taken from the expert
-cache (24,192 → 22,983 MiB, ~5% of its 30% coverage); the Flash-Next service enables it for its
-long prompts. The remaining levers for prefill on this card are the bus itself (a PCIe 4.0 host
-doubles it), the artifact's expert size (Q2_0's 1.32 MiB experts: 224.8 tok/s at 512, +43%, at the
-perplexity cost noted above), or device residency (53.7 GiB, which this card cannot hold).
-
-The nvprof decomposition of a 4,096-token span prefill (two buffers, one pass per layer) puts the
-measured 955 tok/s best-sitting rate within ~15% of this card's floor:
-
-| Activity | Share of profiled GPU time |
-|---|---:|
-| host-to-device expert staging (25.4 GB, 120,649 copies) | 48.5% |
-| MoE wide calls (i-quant, all layers) | ~14% |
-| GDN recurrent prefill (2,272 calls) | 9.1% |
-| cuBLAS (GDN projections, routers, hyper-connections) | 7.7% |
-| full-attention layers (12, O(T²)) | 3.9% |
-| host-side waits | 3.1% |
-| hyper-connections, routing, KV, quantize | ~10% |
-
-Staging at the bus peak (~12 GB/s wall) is ~2.0 s and compute (≈55 TFLOP of the 4,096 tokens) is
-~1.2-2.2 s; with the two buffers they overlap, and the measured 4.3 s best-sitting time is close
-to max(staging, compute) plus the wait tail. A cold first request of the service (no warm-up
-overlap) measures 742 tok/s at 3,702 tokens. The kernel-side levers were checked and all came up
-empty (S0.23): the Volta prefill already runs GDN as one full-width recurrent kernel per
-layer-pass (op bench, cold L2, T=2048: 3.54 ms against 8.40 ms for the chunked pipeline — the
-2.67 ms of the pre-normalized chunked path is not available because the production q/k arrive
-unnormalized); the wide i-quant calls already use the widest available column tile (128, the
-vendored ggml config's limit); and the wait tail is the GPU spinning during the staging itself,
-so it falls with the hit rate (S0.24.3) and has no independent lever. A same-sitting 2,048-
-versus-4,096 A/B (both arms double-buffered) measured 436.0 against 496.9 tok/s (+14%):
-2.29 versus 2.01 ms per token, a fixed per-prompt staging cost of ~1.15 s on top of ~1.73 ms
-token streaming — the earlier 228-versus-918 spread was sitting-to-sitting drift on this host,
-not a prefetch bug. Squeezing the last 10-20% means a PCIe 4.0 bus, smaller experts (Q2_0's
-1.32 MiB: 224.8 tok/s at 512, +43%, at the perplexity cost noted above), or the FP16-matvec
-rewrite of the GDN state update (a few days of kernel work, ~4-5% ceiling).
-
-### Serving with host experts on one RTX 3090
-
-`ninfer-serve`, INT8 KV, an 8,192-position context, one request at a time; three prompts (Python
-code, prose, Chinese) twice, 256 greedy tokens each; decode tok/s of the first / second run:
-
-| Mode | Code | Prose | Chinese |
-|---|---|---|---|
-| no drafter | 87.3 / 92.3 | 93.7 / 94.3 | 93.4 / 94.3 |
-| MTP 2 | 118.8 / 118.6 | 117.3 / 114.8 | 95.8 / 101.2 |
-| MTP 3 | 121.2 / 122.6 | 117.7 / 111.1 | 90.0 / 94.6 |
-| MTP 4 | 111.1 / 105.9 | 101.9 / 96.2 | 74.6 / 78.5 |
-| disk experts, first run | 68.1 | 71.4 | |
+better at all for prefill, so a long-prompt workload gains little from it, while a
+chat/instruct workload gains about 2×.
 
 ### Quality
 
 The first 72 KB of the WikiText sample in `perplexity-1m`, 2,560-token windows advancing by 1,024,
-BF16 KV, the fourteen windows llama.cpp evaluates identically: Q2_0 2.6579 on an RTX 3090, 2.6489
-on an L40S and 2.6509 on the Tesla V100 (llama.cpp 2.6502); IQ3_S 2.1317 (llama.cpp 2.1278). Over
-five 65,536-token windows of PG-19 on two RTX 5090s: 8.0834 against llama.cpp's 8.0802. Host and
-disk experts give the same perplexity on every card checked (2.6057 on the V100 over the first
-40 KB, 2.53655 on the TITAN RTX over the first 40,000 bytes of `wikitext/00.txt`, INT8 KV).
+BF16 KV, the fourteen windows llama.cpp evaluates identically: Q2_0 2.6509 on the Tesla V100
+(llama.cpp 2.6502); IQ3_S 2.1317 (llama.cpp 2.1278). Host and disk experts give the same perplexity
+on this card (2.6057 over the first 40 KB with INT8 KV). On the same smoke prompt the MTP answer is
+identical to the plain decode's.
 
-## Gemma 4 26B-A4B
+## Gemma 4, one V100-PCIE-32GB
 
-Google's [QAT Q4_0 release](https://huggingface.co/WaveCut/gemma-4-26B-A4B-it-QAT-Q4_0-MTP-NInfer-v3)
-with its MTP assistant, F16 KV (`bf16`) unless a row names another.
+Both artifacts are GGUF-derived and run through the ggml bridge, but their shapes differ: the
+26B-A4B routes 8 of 128 experts per token, while the 31B is **dense** — 60 layers at hidden 5376,
+no experts. One request each, a 5,513-token prompt over int8 KV, 500 output tokens
+([Gemma 4 on the V100-32GB](performance/gemma4-v100-32gb-2026-10.md)):
 
-### Engine rates
+| Artifact | Weights | Prefill, tok/s | Decode, tok/s | Without speculation |
+|---|---:|---:|---:|---:|
+| Gemma 4 31B (dense, hidden 5376) | 17.6 GiB | 715 | **54.1** (MTP 4, 54.5%) | 27.4 |
+| Gemma 4 26B-A4B (128 experts, 8 per token) | 16.9 GiB | 2.39k | **157.2** (MTP 2, 71.7%) | 120.3 |
 
-Prompt and decode in tok/s; llama.cpp on the same GGUF with flash attention:
+The dense 31B reads all 17.6 GiB per token, so unspeculated decode is bandwidth: 27.4 tok/s is
+about 517 GB/s of the ~790 GB/s this card's HBM2 moves with ECC on. Speculation is what lifts it —
+four drafts verified per weight read take the same traffic to 54.1 tok/s. The A4B's file is only 4%
+smaller, but a token touches 8 of 128 experts, so it decodes 4.4× faster and gains less from
+drafting (1.3× against 2.0×).
 
-| Card | Engine | Prompt 2,048 | Prompt 10,000 | Prompt 40,000 | Decode | after 10,000 | after 40,000 |
-|---|---|---:|---:|---:|---:|---:|---:|
-| RTX 3090 (350 W) | NInfer | 6,566 | 6,045 | 4,698 | 215.4 | 190.4 | 162.2 |
-| RTX 3090 (350 W) | llama.cpp | 4,925 | 4,697 | 3,767 | 168.6 | 151.7 | 135.7 |
+Context that fits beside them: 32,768 tokens of int8 KV leave 10.5 GiB free on the 31B; the A4B
+leaves 14.1 GiB free at 28,672 tokens.
 
-| Card | Engine | Prompt 512 | Prompt 2,048 | Prompt 16,384 | Decode 128 | after 16,384 |
-|---|---|---:|---:|---:|---:|---:|
-| RTX 3090 | NInfer | 5,068 | 6,976 | | 222.9 | |
-| TITAN RTX | NInfer | 2,532 | 3,571 | 2,660 | 158.8 | 158.5 |
-| Tesla V100 | NInfer | 2,631 | 3,005 | 2,572 | 167.7 | 145.3 |
-| Tesla V100 | llama.cpp | 1,608 | 1,514 | | 120.0 | 108.7 |
+## Why a host-expert MoE is slower to prefill than a dense model that fits
 
-The MTP assistant with 2 drafts decodes 435.2 tok/s on the RTX 3090 and 290.7 on the TITAN RTX
-(engine, 512-token prompt; 0.95, 2.91 on both).
+The question comes up because a MoE activates fewer parameters per token. On a 32 GB card the
+condition does not hold: a MoE only wins when its activated experts are cheap to *read*, and
+Flash-Next's 53.7 GiB of routed experts are in host memory.
 
-### KV formats on Gemma 4
+| Model | Where the weights are | Prompt rate |
+|---|---|---:|
+| Qwen3.8-27B (native, 19.1 GiB) | device | 1.00k tok/s at 27K tokens |
+| Gemma 4 26B-A4B (16.9 GiB, 8 of 128 experts) | device | 2.39k tok/s at 5.5K tokens |
+| Qwen3.8-Flash-Next IQ3_S (53.7 GiB routed) | pinned host memory | 403 tok/s at 2,048; 695 at 4,096 |
+| Qwen3.8-Flash-Next Q2_0 (34 GiB routed) | pinned host memory | 225 tok/s at 512; 241 with MTP 3 |
 
-Decode tok/s of 128 tokens on an RTX 3090 held at 300 W, the HauhauCS Balanced artifact, one
-request, no drafts; prompts stay within 1.5% of F16 in every format:
-
-| `--kv-dtype` | empty context | after 10,000 | after 40,000 |
-|---|---:|---:|---:|
-| `bf16` | 199.8 | 176.3 | 150.4 |
-| `int8` | 195.0 | 175.2 | 149.2 |
-| `rk8v4` | 194.6 | 175.9 | 149.7 |
-| `rk4v4` | 193.8 | 175.5 | 150.5 |
-| `rk4v4-e8` | 192.6 | 174.8 | 149.7 |
-| `rk2v4-e8` | 185.6 | 167.7 | 144.7 |
-| `fp8` | 177.9 | 154.7 | 130.5 |
-| `k8v4` | 177.0 | 152.6 | 129.1 |
-| `nvfp4` | 176.8 | 149.7 | 125.5 |
-
-The FP8 and NVFP4 formats lose 11 to 17% already on an empty context: the RTX 3090 has no E4M3 or
-E2M1 conversion instruction (sm_89 adds them), and those decodes run in software.
-
-The longest `--max-context` that `ninfer-serve --max-concurrency 8` starts with on the RTX 3090,
-HauhauCS artifact, context cache on, no vision tower:
-
-| `--kv-dtype` | 8 sequences, MTP 2 | 8 sequences, no drafts |
-|---|---:|---:|
-| `bf16` | 24,576 | 36,864 |
-| `int8` | 82,944 | 96,256 |
-| `fp8` | 84,992 | 98,304 |
-| `rk8v4` | 92,160 | 103,424 |
-| `k8v4` | 94,208 | 105,472 |
-| `nvfp4` | 163,840 | 179,200 |
-| `rk4v4`, `rk4v4-e8` | 164,864 | 180,224 |
-| `rk2v4-e8` | 173,056 | 186,368 |
-
-Perplexity by format is in [Gemma 4](gemma4.md#quality-and-speed).
-
-### Server
-
-Ten chat requests one at a time to `ninfer-serve` on the RTX 3090, 384 generated tokens each; every
-configuration generates the same tokens:
-
-| Decode tok/s | greedy | after a 13,600-token prompt | sampled (T 1, top-k 64, top-p 0.95) |
-|---|---:|---:|---:|
-| no drafter | 209.1 | 186.0 | 207.9 |
-| MTP 1 (acceptance 0.81) | 280.1 | 240.2 | |
-| MTP 2 (0.70; 0.63 sampled) | 290.7 | 241.9 | 270.6 |
-| MTP 3 (0.62; 0.55 sampled) | 293.7 | 229.2 | 268.0 |
-
-llama.cpp's server with the same GGUF and drafter decodes the greedy requests at 131.4 tok/s, 186.4
-with one draft, 201.6 with two and 195.2 with three. Parallel streams, total tok/s:
-
-| Streams | no drafter | with the assistant |
-|---:|---:|---|
-| 1 | 208.4 | 295.5 with three drafts, 291.8 with two |
-| 2 | 310.1 | 370.0 with one draft each |
-| 3 | 354.7 | 365.7 with one draft each |
-| 4 | 397.2 | 387.6 with one draft each, so four or more decode plainly |
-
-On the Tesla V100 (window 28,672 tokens), short chat decodes 164.3 tok/s without a drafter and
-226.3 with MTP 2 (0.70, 2.40); after 1,024 and 8,192 tokens 155.6 and 149.5, with MTP 2 187.7 and
-167.0. Prompt time is 0.36 s at 1,024 tokens and 2.9 s at 8,192.
-
-## Measurement pages
-
-| Page | What it measures | Hardware |
-|---|---|---|
-| [Reference measurements, September 2026](performance/reference-2026-09.md) | Ternary Bonsai 2 27B and Qwen3.8-27B at full context: decode and prompt time by depth, drafters, largest context per card, needles, several requests at once, what the device profiles change, and the October re-check | RTX 3090, 4090, 5090, PRO 6000 |
-| [Tesla V100, October 2026](performance/tesla-v100-2026-10.md) | a `70` build on 16 GB: what fits, engine and server rates of Ternary Bonsai 2, the Qwen3.8-27B releases, Flash-Next and Gemma 4, perplexity against other cards, llama.cpp on the same card | Tesla V100-SXM2-16GB |
-| [TITAN RTX, October 2026](performance/titan-rtx-2026-10.md) | a `75` build on one and two 24 GB cards: every model's prompt and decode rates against an RTX 3090, drafters, KV formats, depth, Flash-Next and the 35B-A3B over two stages, the device profile, where the time goes, perplexity | TITAN RTX, RTX 3090 |
-| [8, 11 and 12 GB cards, October 2026](performance/small-cards-2026-10.md) | the published image on small cards: which models load, CLI rates, the largest context, Flash-Next with host and disk experts | RTX 3060 Ti, RTX 2080 Ti, RTX 3060 |
-| [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#measurements) | every expert placement of the GSQ-RCO releases, MTP, perplexity against llama.cpp, AIME and GPQA | RTX 3090, 3090 Ti, 4090, 5090, PRO 6000, L40S |
-| [GGUF block formats](gguf.md#measurements) | the Qwen3.8-27B GSQ-RCO IQ3_S release against the official artifact: perplexity, reasoning benchmarks, speed | RTX 3090, 4090, 5090 |
-| [Gemma 4 26B-A4B](gemma4.md#measurements) | against llama.cpp, KV formats, the assistant's drafts, parallel streams | RTX 3090 |
-| [Quality trades](maintainer/quality-trade-experiments.md) | what each precision option costs in perplexity and buys in memory or speed | RTX 3090 |
-| [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090, from measured sizes | RTX 3090 |
-
-The tools behind them: [`tools/bench/refbench.py`](../tools/bench/README.md#reference-measurements-refbenchpy)
-for the server tables, the [serving corpus runner](../tools/bench/README.md#serving-corpus-benchmark),
-`ninfer_bench` for the Engine without HTTP and the Op benchmarks for single operations
-([benchmarks](../bench/README.md)), and `ninfer-perplexity` for quality ([perplexity](perplexity.md)).
-An Op benchmark establishes an Op result, not an end-to-end one; a whole request does.
+A model whose weights fit is read at HBM speed; Flash-Next pays ~20-25 GB of PCIe 3.0 staging per
+prompt instead. That is a memory-placement difference, not a density difference, and it is why the
+same engine on the same card reaches 2.39k tok/s on the Gemma MoE and 400-700 tok/s on Flash-Next.
 
 ## Determinism
 
