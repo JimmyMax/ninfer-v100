@@ -41,13 +41,32 @@ card: weights that fit stay on the device, Flash-Next's routed experts go to pin
 | `Qwen3.8-27B-GSQ-RCO-IQ3_S` (11.6 GiB on device) | V100 | device | 400,000 | GGUF blocks |
 | `Gemma4-31B-QAT` (dense, 17.6 GiB) | V100 | device | 32,768 | 10.5 GiB still free |
 | `Gemma4-26B-A4B-QAT` (16.9 GiB, 8 of 128 experts) | V100 | device | 28,672 | 14.1 GiB still free |
-| `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` | V100 | pinned host memory | 130,000 | with the vision tower; expert cache 18,623 MiB |
+| `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` | V100 | pinned host memory | 200,000 | rk4v4, with the vision tower; expert cache 18,753 MiB |
+| `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S` | V100 | pinned host memory | 262,144 | rk4v4; expert cache 18,285 MiB |
 | `Qwen3.8-27B-Coder390-W4A4-MTP-DFlash2` | 4080 SUPER | device | 200,000 | the serving configuration |
 
-Flash-Next's window trades directly against its decode rate, because the same VRAM is the expert
-cache: the same release at an 8,192-position context on the bench holds a 24,118 MiB cache, while
-the 130,000-token vision service holds 18,623 MiB, and decode follows the cache (24.9 / 27.9 / 30.5
-tok/s in one sitting at 200,000 / 32,768 / 8,192 context).
+Flash-Next's window trades against its decode rate through the expert cache. On this card the
+context's cost is the GDN recurrent state, which is stored in the KV format and grows linearly:
+at 200,000 tokens the state is 3,046 MiB with `int8`, 2,451 with `rk8v4` and 1,816 with `rk4v4`,
+against 2,019 at 130,000 with `int8`. Measured on the service (concurrency 1, vision, MTP 3,
+double-buffered prefill), the expert cache at 200,000 tokens is:
+
+| `--kv-dtype` | GDN state | Workspace | Expert cache | Perplexity, against `int8` |
+|---|---:|---:|---:|---:|
+| `bf16` | 5,506 MiB | 5,884 | 15,113 MiB | lossless reference |
+| `int8` | 3,046 MiB | 5,884 | 17,656 MiB | — |
+| `rk8v4` | 2,451 MiB | 5,884 | 18,129 MiB | +0.81% (4,094 tokens) |
+| `rk4v4` | 1,816 MiB | 5,884 | 18,753 MiB | **+0.040% (20,470 tokens)** |
+
+So 200,000 tokens does not have to cost cache: `rk4v4` at 200,000 holds 130 MiB more than the old
+130,000/`int8` configuration did. The format costs something: on 4,094 scored tokens of prose
+`rk4v4` read +1.28% over `int8` and `int8` read −1.16% against `bf16`, differences inside that
+sample's ±2.7% standard error; over 20,470 tokens on the same text the `rk4v4`-versus-`int8`
+difference settles at **+0.040%** (mean nll 2.704615 against 2.705015, perplexity 14.9486 against
+14.9545). `--gdn-state-fp16` halves only the host state image and does not change the device state.
+A decode request on the 200,000/`rk4v4` service reads 37.3 and 37.2 tok/s over a 256-token answer,
+against 35.0 and 37.5 on the 130,000/`int8` one (same prompt, same sitting, MTP 3), so the wider
+context does not cost decode.
 
 ## Qwen3.8-27B GSQ-RCO IQ3_S, one V100-PCIE-32GB
 
