@@ -165,15 +165,23 @@ bank. Disk residency costs −60% of prefill (page-cache reads instead of pinned
 staging).
 
 The live service reproduces the same shape, because its reported `prefill = prompt / TTFT` includes
-that fixed staging. Measured on the 130,000-token, vision-enabled service (expert cache 18,623 MiB),
-same sitting:
+that fixed staging. Five prompts on the 130,000-token, vision-enabled service (expert cache
+18,623 MiB), one sitting, `thinking` off:
 
-| Prompt, tokens | 19 | 524 | 1,280 |
-|---|---:|---:|---:|
-| Reported prefill, tok/s | 23.9 | 146.0 | 350.3 |
+| Prompt, tokens | 19 | 524 | 1,280 | 2,330 | 4,220 |
+|---|---:|---:|---:|---:|---:|
+| TTFT, s | 0.80 | 3.6 | 3.8 | 4.0 | 5.3 |
+| Reported prefill, tok/s | 23.9 | 146.0 | 350.3 | 606.4 | 824.8 |
 
-so a short prompt is dominated by the fixed staging and says nothing about the model's prefill
-rate; a real prompt runs 300–700+ tok/s (711 tok/s at 3,702 tokens on the same service).
+The five points fit a fixed cost plus a marginal rate:
+
+    TTFT ≈ 3.3 s + 0.47 ms per prompt token      (marginal ≈ 2,100 tok/s)
+
+The 3.3 s is the per-prompt expert staging; the 0.47 ms is the token streaming. So the number the
+log prints is `N / (3.3 s + 0.47 ms·N)`, which collapses for a short prompt and approaches ~2,100
+tok/s as the prompt grows: 6 tok/s at 19 tokens on that line, 148 at 524, 799 at 4,220, ~1,470 at
+16,000. A short prompt's reported rate is therefore not a measurement of the model's prefill
+throughput. (The 19-token row also carries the first request's warm-up, so it sits below the line.)
 
 `--expert-prefill-buffers 2` double-buffers the span path so the next layer's bank is copied while
 the current layer computes. Interleaved A/B at a 4,096-token prompt, same sitting: 363.7 / 338.7
