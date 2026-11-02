@@ -55,37 +55,48 @@ Two families load, in place, with no offline conversion:
   That is the honest price of a 2–4 bit block format: a mixed-precision artifact fragments prefill
   into many small dequantize-and-GEMM kernels and lands ~12% below the native profile.
 
-| Artifact | Weights | Format | Notes |
+| Artifact | File, GiB | Format | Notes |
 |---|---:|---|---|
-| `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3.ninfer` | 19.1 GiB | native `nvfp4` | production default; DFlash2 adapter + MTP head |
-| `Swift-1.5-Qwen3.8-27B-OrcaRouter-NVFP4-DFlash2-V2.ninfer` | 22.1 GiB | native `nvfp4`, **v2, read in place** | same family, older container |
-| `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` | 12.9 GiB | GGUF blocks, 3.5 bits | 18 block formats, IQ3_S holding 3.39 GiB |
-| `Huihui-Qwen3.8-27B-Coder390-...-Q4_K_M.ninfer` | 17 GiB | GGUF `q4_k` | abliterated dense |
-| `Gemma4-31B-...-MTP-ninfer-v3.ninfer` | 17.6 GiB | GGUF (dense) | 60 layers, hidden 5376, no experts |
-| `Gemma4-26B-A4B-...-MTP-ninfer-v3.ninfer` | 16.9 GiB | GGUF Q4_0 | 128 experts, 8 routed per token |
-| `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` | 54.5 GiB | GGUF blocks, 3.5 bits | MoE, host/disk experts, n-gram table |
-| `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer` | 38.5 GiB | GGUF blocks, 2.4 bits | MoE; reads the shared n-gram table |
+| `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3.ninfer` | 21.2 | native `nvfp4` | production default; 19.1 GiB on device; DFlash2 adapter + MTP head |
+| `Qwen3.8-27B-Coder390-EfficientThink-W4A4-MTP-DFlash2.ninfer` | 22.1 | native `nvfp4`/`fp8`/groupwise | Coder390 family; DFlash2 + MTP head |
+| `orcarouter-Qwen3.8-27B-Uncensored-nvfp4-NInfer.ninfer` | 20.0 | native `nvfp4` | orca's uncensored variant |
+| `Swift-1.5-Qwen3.8-27B-Q4_K_M-ninfer-v3.ninfer` | 17.0 | GGUF `q4_k` | the same 27B base as orca, converted from the GGUF |
+| `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` | 14.0 | GGUF blocks, 3.5 bits | 18 block formats, IQ3_S holding 3.39 GiB |
+| `Huihui-Qwen3.8-27B-Coder390-EfficientThink-abliterated.Q4_K_M.ninfer` | 16.5 | GGUF `q4_k` | abliterated dense |
+| `Gemma4-31B-...-MTP-ninfer-v3.ninfer` | 18.7 | GGUF (dense) | 60 layers, hidden 5376, no experts |
+| `Gemma4-26B-A4B-...-MTP-ninfer-v3.ninfer` | 17.0 | GGUF Q4_0 | 128 experts, 8 routed per token |
+| `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` | 54.0 | GGUF blocks, 3.5 bits | MoE, host/disk experts, n-gram table |
+| `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer` | 37.9 | GGUF blocks, 2.4 bits | MoE; reads the shared n-gram table |
 
-The container version does not affect speed — the same weights measure 998 tok/s as a v2 file and
-997 tok/s as the upgraded v3, and both are read in place. What changes the numbers is the weight
-recipe (native vs GGUF), not the container. The three Flash-Next releases read one shared n-gram
-table the model names by digest, passed with `--ngram-table` (IQ4_NL rows, 26.92 GiB).
+The container version does not affect speed — a v2 file is read in place and measured within 1% of
+the upgraded v3 (998 vs 997 tok/s of prefill on the native profile). What changes the numbers is
+the weight recipe (native vs GGUF), not the container. The three Flash-Next releases read one shared
+n-gram table the model names by digest, passed with `--ngram-table` (IQ4_NL rows, 26.92 GiB).
 
 ## Measured performance
 
-One request, a 27,000-token prompt, int8 KV, MTP with four drafts, greedy, on the V100-32GB. Decode
-is per output token.
+`ninfer_bench`, the 1.7.2 sm_70 binary, int8 KV, prefill chunk 2048, greedy, three measured
+repetitions after one warmup, on the V100-32GB. Two prompts: a short 1,024-token one and a long
+27,000-token one (repeated 2,048-token corpus). Decode is 128 generated tokens from a one-token
+seed, so it is prompt-length-independent here; TTFT is the short prompt's.
 
-| Artifact | Weights | Context | TTFT | Prefill | Decode |
-|---|---:|---:|---:|---:|---:|
-| orcarouter `nvfp4` v3 (native) | 19.1 GiB | 254,208 | 27.2 s | 1.00k tok/s | **71.1 tok/s** (MTP 50.0% accepted) |
-| orcarouter `nvfp4` v2 (read in place) | 22.1 GiB | 200,000 | 27.4 s | 996 tok/s | 67.6 tok/s (MTP 45.9%) |
-| Qwen3.8-27B GSQ-RCO IQ3_S (GGUF) | 12.9 GiB | 400,000 | 30.8 s | 885 tok/s | 66–74 tok/s |
+| Artifact | File, GiB | Prompt | TTFT | Prefill | Decode, MTP 4 drafts | Decode, no drafter |
+|---|---|---:|---:|---:|---:|---:|
+| orcarouter `nvfp4` v3 | 21.2 | 1,024 | 0.95 s | 1,079 tok/s | **61.6 tok/s** (34.4% accepted) | 34.4 tok/s |
+| orcarouter `nvfp4` v3 | 21.2 | 27,000 | 27.6 s | 980 tok/s | 61.6 tok/s (34.4%) | |
+| Swift-1.5 Q4_K_M | 17.0 | 1,024 | 1.13 s | 907 tok/s | 51.9 tok/s (28.7%) | 38.1 tok/s |
+| Swift-1.5 Q4_K_M | 17.0 | 27,000 | 30.3 s | 891 tok/s | 52.0 tok/s (28.7%) | |
+| GSQ-RCO IQ3_S | 14.0 | 1,024 | 1.13 s | 906 tok/s | 51.5 tok/s (27.7%) | 43.0 tok/s |
+| GSQ-RCO IQ3_S | 14.0 | 27,000 | 30.3 s | 890 tok/s | 51.5 tok/s (27.7%) | |
 
-Short-context decode (1,024-token prompt) is **82.3 tok/s** on the native profile. MTP acceptance
-drifts a few points across engine revisions — the frozen draft head reads a hidden state that
-changes with the engine — and is prompt- and output-length-dependent (the same run at 192 output
-tokens averages 37%). Both Gemma 4 artifacts load and run (below).
+The native profile prefills ~16% faster than the GGUF block formats (the mixed-precision
+fragmentation above), and decodes faster **with** the drafter because the draft's acceptance
+favors it (34.4% versus 27.7–28.7%). Without a drafter the order inverts: the 14.0-GiB IQ3_S
+artifact reads 43.0 tok/s against the native's 34.4 (+25%), Q4_K_M 38.1. The drafter's acceptance
+is generation-dependent — a different 128-token generation gives a different rate — and drifts a
+few points across engine revisions (the frozen draft head reads a hidden state that changes with
+the engine), so these decode figures are the honest rate of this sitting, not a best case.
+Both Gemma 4 artifacts load and run (below).
 
 ## Technical highlights
 
@@ -136,10 +147,16 @@ fixed ~20–25 GB of routed-expert staging over PCIe 3.0:
 | Staging per prompt | ~20 GB | 21 GB | 25 GB |
 
 A 512-token prompt therefore looks slow (158 tok/s) only because that fixed staging is spread over
-few tokens; the live service measures **324 tok/s at a 1,769-token prompt and 711 tok/s at 3,702
-tokens**, so a real prompt prefills at 300–700+ tok/s. `--expert-prefill-buffers 2` double-buffers
-the long-prompt span path (+18–27% at 4,096). The [Q2_0 release](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3)
-(38.5 GiB) halves the expert traffic — its experts are 1.32 MiB against IQ3_S's 3.27 MiB — and
+few tokens. The live 200,000-token service fits **TTFT ≈ 3.3 s + 0.47 ms per prompt token**
+(marginal ≈ 2,100 tok/s), measured at 19 / 524 / 1,280 / 2,330 / 4,220 / 8,820 / 30,820-token
+prompts: 23.9 / 146.0 / 350.3 / 606.4 / 824.8 / 905.8 / 951.1 tok/s. `--expert-prefill-buffers 2`
+double-buffers the long-prompt span path (+18–27% at 4,096). The same A/B that set the 200,000-token
+service's KV to `rk4v4` also set its decode, unseeded: **36.1 tok/s without a drafter, 45.2 with
+MTP 3** (62.5% accepted), a little above the 8,192-context bench numbers (33.6 / 43.5–44.0) because
+that bench gives the expert cache 24,118 MiB against the service's 18,753. The production service
+additionally seeds the cache from a route histogram (`--expert-profile`), a further +25% on a cold
+start ([docs/performance.md](docs/performance.md), "IQ3_S on one V100: the final configuration"). The [Q2_0 release](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3)
+(37.9 GiB) halves the expert traffic — its experts are 1.32 MiB against IQ3_S's 3.27 MiB — and
 reaches **69.6 tok/s** decode with MTP 3 (70.7% accepted) at a perplexity cost (2.6509 vs 2.1317).
 The levers measured on this card (CPU share, the two-stage staging, prompt-pollution fix, profile
 seeding) and why 70+ at IQ3_S quality needs Q2_0 or a second GPU are in
