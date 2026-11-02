@@ -98,6 +98,20 @@ the native profile — and drifts a few points across engine revisions (the froz
 a hidden state that changes with the engine), so these figures are the honest rate of this sitting
 at a 512-token generation, not a best case. Both Gemma 4 artifacts load and run (below).
 
+Where the drafter gap comes from: a verify round costs the same on all three (12.9 / 13.9 / 13.6 ms,
+only 44–52% above its no-drafter t=1 step), so the whole difference is the acceptance chain,
+per draft position: NVFP4 78.2 → 52.9 → 39.4 → 30.6%, Q4_K_M 71.7 → 47.6 → 30.9 → 17.3%, IQ3_S
+66.8 → 38.8 → 21.5 → 12.1%. The MTP draft module is frozen — trained to predict the
+**unquantized** model's next tokens — and it is quantized to the artifact's own format, so its
+noise compounds over the draft's four autoregressive steps; the 4.5-bpw native profile keeps both
+the base model and the draft module closest to the reference, and its chain decays least. At equal
+chains all three would decode ~73–78 tok/s. And that chain is a property of the *generation*, not
+the artifact: the two artifacts branch at their first divergent token, so each scores its own
+trajectory here. On four real prompts (code and Chinese, 6–31k tokens, [docs/performance.md]
+(docs/performance.md)) the acceptance rates agree within 1.5 points and the native profile's
+genuine edge over IQ3_S is 4–7% of decode (13.4–14.2 ms versus 14.2–15.0 ms per round) and
+10–12% of prefill — not the 25% this corpus sitting shows.
+
 ## Technical highlights
 
 The gap to a modern card is closed in operator routing and weight prepacking, measured per change:
