@@ -203,6 +203,15 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     static_assert((128 % Schedule::kRowsPerCta) == 0);
 
     __shared__ Nvfp4GemvSharedStorage<Geometry, Schedule> shared;
+    // e2m1 decode LUT in shared memory: 16 entries (4-bit code -> float value). Replaces the
+    // hardware intrinsic (a 4-6 instruction ALU sequence on Ada) with a single shared load.
+    __shared__ float e2m1_lut[16];
+    if (threadIdx.x < 16) {
+        const float values[16] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
+                                  -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
+        e2m1_lut[threadIdx.x]   = values[threadIdx.x];
+    }
+    __syncthreads();
     constexpr int kCtasPerM128 = 128 / Schedule::kRowsPerCta;
     const int m_tile           = static_cast<int>(blockIdx.x) / kCtasPerM128;
     const int cta_in_tile      = static_cast<int>(blockIdx.x) - m_tile * kCtasPerM128;
@@ -222,8 +231,48 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, inverse_weight_divisor,
-                                           parent_rows, flat_row0, lane, accumulators);
+    constexpr int kValuesPerPhase = 32 * Schedule::kValuesPerLane;
+    constexpr int kPhases         = Geometry::kInputRows / kValuesPerPhase;
+    constexpr int kGroupsPerLane  = Schedule::kValuesPerLane / 16;
+    const auto* activation_pairs  = reinterpret_cast<const std::uint32_t*>(x);
+#pragma unroll
+    for (int phase = 0; phase < kPhases; ++phase) {
+        float coefficients[Schedule::kRowsPerWarp][kGroupsPerLane];
+        Nvfp4CodePack<Schedule::kValuesPerLane> row_codes[Schedule::kRowsPerWarp];
+#pragma unroll
+        for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+            load_nvfp4_coefficients<Geometry, Schedule>(
+                scales, shared, parent_rows[local_row], flat_row0 + local_row, phase, lane,
+                inverse_weight_divisor, coefficients[local_row]);
+            const std::int64_t code_offset =
+                static_cast<std::int64_t>(parent_rows[local_row]) * Geometry::kCodeBytesPerRow +
+                phase * (kValuesPerPhase / 2) + lane * (Schedule::kValuesPerLane / 2);
+            row_codes[local_row] = load_nvfp4_codes<Schedule::kCodeCache, Schedule::kValuesPerLane>(
+                codes + code_offset);
+        }
+#pragma unroll
+        for (int pair = 0; pair < Schedule::kPairsPerLane; ++pair) {
+            const int activation_index =
+                phase * (kValuesPerPhase / 2) + lane * Schedule::kPairsPerLane + pair;
+            const float2 activation = bf16x2_bits_to_float2(activation_pairs[activation_index]);
+            const int group         = ((lane * Schedule::kValuesPerLane & 15) + pair * 2) / 16;
+#pragma unroll
+            for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
+                const std::uint32_t word  = row_codes[local_row].words[pair / 4];
+                const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
+                const float code_x        = e2m1_lut[packed & 0x0f];
+                const float code_y        = e2m1_lut[packed >> 4];
+                const float coefficient   = coefficients[local_row][group];
+                constexpr int kChainMask  = Schedule::kAccumulatorChains - 1;
+                accumulators[local_row][(2 * pair) & kChainMask] =
+                    fmaf(code_x * coefficient, activation.x,
+                         accumulators[local_row][(2 * pair) & kChainMask]);
+                accumulators[local_row][(2 * pair + 1) & kChainMask] = fmaf(
+                    code_y * coefficient, activation.y,
+                    accumulators[local_row][(2 * pair + 1) & kChainMask]);
+            }
+        }
+    }
 
 #pragma unroll
     for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {

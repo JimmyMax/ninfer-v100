@@ -37,6 +37,14 @@ __global__ __launch_bounds__(
     static_assert((128 % Schedule::kWarpsPerCta) == 0);
 
     __shared__ Nvfp4SimtSharedStorage<Geometry, ActiveTokens, Schedule> shared;
+    // e2m1 decode LUT in shared memory: 16 entries (4-bit code -> float value).
+    __shared__ float e2m1_lut[16];
+    if (threadIdx.x < 16) {
+        const float values[16] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
+                                  -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
+        e2m1_lut[threadIdx.x]   = values[threadIdx.x];
+    }
+    __syncthreads();
     constexpr int kCtasPerM128                    = 128 / Schedule::kWarpsPerCta;
     const int block                               = static_cast<int>(blockIdx.x);
     const int m_tile                              = block / kCtasPerM128;
@@ -53,7 +61,7 @@ __global__ __launch_bounds__(
         {};
     compute_nvfp4_simt_rows<Geometry, ActiveTokens, Schedule>(
         x, codes, scales, shared, inverse_weight_divisor, parent_rows,
-        warp * Schedule::kRowsPerWarp, 0, 0, lane, accumulators);
+        warp * Schedule::kRowsPerWarp, 0, 0, lane, e2m1_lut, accumulators);
 
 #pragma unroll
     for (int token = 0; token < ActiveTokens; ++token) {

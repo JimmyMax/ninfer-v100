@@ -56,7 +56,7 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
     const std::uint8_t* __restrict__ scales,
     Nvfp4SimtSharedStorage<Geometry, ActiveTokens, Schedule>& shared, float inverse_weight_divisor,
     const int (&parent_rows)[Schedule::kRowsPerWarp], int flat_row0, int token0, int warp_in_row,
-    int lane,
+    int lane, const float* __restrict__ e2m1_lut,
     float (
         &accumulators)[Schedule::kRowsPerWarp][Schedule::kTokenTile][Schedule::kAccumulatorChains],
     int live_tokens = ActiveTokens) {
@@ -132,7 +132,7 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                     const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                    const float2 code         = decode_nvfp4_e2m1x2(packed);
+                    const float2 code         = {e2m1_lut[packed & 0x0f], e2m1_lut[packed >> 4]};
                     const float coefficient   = coefficients[local_row][group];
                     row_weight[local_row] = make_float2(code.x * coefficient, code.y * coefficient);
                 }
@@ -165,7 +165,7 @@ __device__ __forceinline__ void compute_nvfp4_simt_rows(
                 for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                     const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                     const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                    const float2 code         = decode_nvfp4_e2m1x2(packed);
+                    const float2 code         = {e2m1_lut[packed & 0x0f], e2m1_lut[packed >> 4]};
                     const float coefficient   = coefficients[local_row][group];
                     row_weight[local_row] = make_float2(code.x * coefficient, code.y * coefficient);
                 }
@@ -242,6 +242,15 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int token0 = kTokenTiles == 1 ? 0 : token_tile * Schedule::kTokenTile;
 
     __shared__ Nvfp4SimtSharedStorage<Geometry, ActiveTokens, Schedule> shared;
+    // e2m1 decode LUT in shared memory: 16 entries (4-bit code -> float value). Replaces the
+    // hardware intrinsic (a 4-6 instruction ALU sequence on Ada) with a single shared load.
+    __shared__ float e2m1_lut[16];
+    if (threadIdx.x < 16) {
+        const float values[16] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
+                                  -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
+        e2m1_lut[threadIdx.x]   = values[threadIdx.x];
+    }
+    __syncthreads();
     constexpr int kCtasPerM128 = 128 / Schedule::kRowsPerCta;
     const int m_tile           = row_block / kCtasPerM128;
     const int cta_in_tile      = row_block - m_tile * kCtasPerM128;
@@ -266,7 +275,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         {};
     compute_nvfp4_simt_rows<Geometry, ActiveTokens, Schedule>(
         x, codes, scales, shared, inverse_weight_divisor, parent_rows, flat_row0, token0,
-        warp_in_row, lane, accumulators, live_tokens);
+        warp_in_row, lane, e2m1_lut, accumulators, live_tokens);
 
     if constexpr (Finalization == Nvfp4SimtFinalization::RowVector) {
         static_assert(Schedule::kTokenTile == ActiveTokens,
