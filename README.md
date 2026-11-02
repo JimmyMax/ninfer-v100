@@ -77,26 +77,26 @@ n-gram table the model names by digest, passed with `--ngram-table` (IQ4_NL rows
 
 `ninfer_bench`, the 1.7.2 sm_70 binary, int8 KV, prefill chunk 2048, greedy, three measured
 repetitions after one warmup, on the V100-32GB. Two prompts: a short 1,024-token one and a long
-27,000-token one (repeated 2,048-token corpus). Decode is 128 generated tokens from a one-token
-seed, so it is prompt-length-independent here; TTFT is the short prompt's.
+27,000-token one (repeated 2,048-token corpus). Prefill is the whole prompt; decode is 512
+generated tokens from a one-token seed, so it is prompt-length-independent here.
 
 | Artifact | File, GiB | Prompt | TTFT | Prefill | Decode, MTP 4 drafts | Decode, no drafter |
 |---|---|---:|---:|---:|---:|---:|
-| orcarouter `nvfp4` v3 | 21.2 | 1,024 | 0.95 s | 1,079 tok/s | **61.6 tok/s** (34.4% accepted) | 34.4 tok/s |
-| orcarouter `nvfp4` v3 | 21.2 | 27,000 | 27.6 s | 980 tok/s | 61.6 tok/s (34.4%) | |
-| Swift-1.5 Q4_K_M | 17.0 | 1,024 | 1.13 s | 907 tok/s | 51.9 tok/s (28.7%) | 38.1 tok/s |
-| Swift-1.5 Q4_K_M | 17.0 | 27,000 | 30.3 s | 891 tok/s | 52.0 tok/s (28.7%) | |
-| GSQ-RCO IQ3_S | 14.0 | 1,024 | 1.13 s | 906 tok/s | 51.5 tok/s (27.7%) | 43.0 tok/s |
-| GSQ-RCO IQ3_S | 14.0 | 27,000 | 30.3 s | 890 tok/s | 51.5 tok/s (27.7%) | |
+| orcarouter `nvfp4` v3 | 21.2 | 1,024 | 0.95 s | 1,079 tok/s | **78.1 tok/s** (50.3% accepted) | 34.4 tok/s |
+| orcarouter `nvfp4` v3 | 21.2 | 27,000 | 27.6 s | 980 tok/s | 78.1 tok/s (50.3%) | |
+| Swift-1.5 Q4_K_M | 17.0 | 1,024 | 1.13 s | 907 tok/s | 64.8 tok/s (41.9%) | 38.1 tok/s |
+| Swift-1.5 Q4_K_M | 17.0 | 27,000 | 30.3 s | 891 tok/s | 64.8 tok/s (41.9%) | |
+| GSQ-RCO IQ3_S | 14.0 | 1,024 | 1.13 s | 906 tok/s | 58.7 tok/s (34.9%) | 43.0 tok/s |
+| GSQ-RCO IQ3_S | 14.0 | 27,000 | 30.3 s | 890 tok/s | 58.7 tok/s (34.9%) | |
 
 The native profile prefills ~16% faster than the GGUF block formats (the mixed-precision
 fragmentation above), and decodes faster **with** the drafter because the draft's acceptance
-favors it (34.4% versus 27.7–28.7%). Without a drafter the order inverts: the 14.0-GiB IQ3_S
+favors it (50.3% versus 34.9–41.9%). Without a drafter the order inverts: the 14.0-GiB IQ3_S
 artifact reads 43.0 tok/s against the native's 34.4 (+25%), Q4_K_M 38.1. The drafter's acceptance
-is generation-dependent — a different 128-token generation gives a different rate — and drifts a
-few points across engine revisions (the frozen draft head reads a hidden state that changes with
-the engine), so these decode figures are the honest rate of this sitting, not a best case.
-Both Gemma 4 artifacts load and run (below).
+is generation-dependent — the same engine at a 128-token generation takes 34.4% and 61.6 tok/s on
+the native profile — and drifts a few points across engine revisions (the frozen draft head reads
+a hidden state that changes with the engine), so these figures are the honest rate of this sitting
+at a 512-token generation, not a best case. Both Gemma 4 artifacts load and run (below).
 
 ## Technical highlights
 
