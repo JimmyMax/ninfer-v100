@@ -294,6 +294,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--lm-head-q4`, `--lm-head-q6` | store the output head as Q4 or Q6 while loading | off |
 | `--embedding-q4`, `--embedding-q6` | store the token embedding as Q4 or Q6 while loading | off |
 | `--mtp-experts-q4` | Qwen3.6-35B-A3B: store the MTP layer's routed experts in the text layers' formats | off |
+| `--nvfp4-native` | keep stored NVFP4 weights on their native route; by default an Ampere (sm_86/sm_89) build transcodes them to row-split Q4 at load, which is faster there because Ada has no FP4 Tensor Cores. No effect on Volta (sm_70), which keeps the native NVFP4 route | transcode on Ampere |
 | `--gdn-state-fp16` | keep the GDN recurrent state in FP16 | FP32 |
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
 | `--no-prefill-a8` | return full prefill tiles to their A16 routes, which is how the integer routes are measured on a whole request | integer routes |

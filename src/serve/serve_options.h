@@ -87,6 +87,7 @@ struct ServeOptions {
     bool embedding_q4       = false;
     bool embedding_q6       = false;
     bool mtp_experts_q4     = false;
+    bool nvfp4_native       = false;
     bool gdn_state_fp16     = false;
     bool rope_yarn          = false;
     float rope_yarn_factor  = 1.0F;

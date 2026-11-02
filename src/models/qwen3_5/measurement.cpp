@@ -78,7 +78,10 @@ std::string prefill_signature(const Model& model) {
             // describe the parent as the artifact stores it.
             const auto& geometry =
                 part.parent->stored_format && *part.parent->stored_format != part.parent->geometry.format
-                    ? weight_geometry(*part.parent->stored_format, part.parent->geometry.layout,
+                    ? weight_geometry(*part.parent->stored_format,
+                                      part.parent->stored_layout
+                                          ? *part.parent->stored_layout
+                                          : part.parent->geometry.layout,
                                       part.parent->geometry.shape)
                     : part.parent->geometry;
             item["parts"].push_back({it->second, part.begin, part.end, geometry.format,

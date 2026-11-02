@@ -235,4 +235,43 @@ void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
     }
 }
 
+// Tiers without FP4 tensor cores (Ampere: sm_86/sm_89) run the native NVFP4 route compute-bound,
+// while the row-split q4 GEMV and MoE routes are memory-bound at the same 4-bit weight precision.
+// Transcode every device-resident NVFP4 parameter to row-split Q4 on those ranks so the decode and
+// verify routes take the faster path. The stored artifact is unchanged; --nvfp4-native keeps the
+// native route. sm_70 keeps its native QPN route (it has no Ampere tier here), and a parameter
+// mixing NVFP4 with another format keeps its stored layout.
+void apply_ampere_nvfp4_trades(Bindings& bindings, std::span<const ops::DeviceTier> rank_tiers,
+                               const LoadOptions& options) {
+    if constexpr (!ops::kBuildAmpere) {
+        (void)bindings;
+        (void)rank_tiers;
+        (void)options;
+        return;
+    }
+    if (options.nvfp4_native) { return; }
+    const auto ampere_rank = [&](std::size_t rank) {
+        if (rank >= rank_tiers.size()) {
+            throw std::logic_error("NVFP4 trades: no device tier for pipeline rank " +
+                                   std::to_string(rank));
+        }
+        return rank_tiers[rank] == ops::DeviceTier::Ampere;
+    };
+    for (std::size_t i = 0; i < bindings.weights.size(); ++i) {
+        const auto& parameter = bindings.weights[i];
+        if (parameter.reference.residency != artifact::Residency::Device) { continue; }
+        if (!ampere_rank(parameter.rank)) { continue; }
+        bool all_nvfp4 = !parameter.reference.binding.parts.empty();
+        for (const auto& part : parameter.reference.binding.parts) {
+            if (bindings.binder.reader().geometry(part.object).format != QType::NVFP4) {
+                all_nvfp4 = false;
+                break;
+            }
+        }
+        if (all_nvfp4) {
+            (void)bindings.transcode(WeightId{i}, QType::Q4_G64_FP16, "NVFP4 to Q4 transcode");
+        }
+    }
+}
+
 } // namespace ninfer::models::qwen3_5::loading

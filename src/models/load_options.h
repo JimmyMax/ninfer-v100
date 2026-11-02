@@ -21,6 +21,10 @@ struct LoadOptions {
     bool embedding_q4   = false;
     bool embedding_q6   = false;
     bool mtp_experts_q4 = false;
+    // Keep stored NVFP4 weights on their native route. Clearing it (the default) lets a tier
+    // without FP4 tensor cores (Ampere) transcode them to row-split Q4 at load, where the native
+    // NVFP4 route is compute-bound and the row-split q4 GEMV and MoE routes are memory-bound.
+    bool nvfp4_native = false;
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Execution selection carried with the instance: admit the integer small-T gate_up route at
     // verify widths (see execution::DenseParameters::verify_gate_up_policy).
@@ -119,6 +123,7 @@ struct LoadOptions {
             .embedding_q4   = options.embedding_q4,
             .embedding_q6   = options.embedding_q6,
             .mtp_experts_q4 = options.mtp_experts_q4,
+            .nvfp4_native   = options.nvfp4_native,
             .expert_residency = options.expert_residency,
             .mlp_a8_decode  = options.mlp_a8_decode,
             .prefill_a8     = options.prefill_a8,

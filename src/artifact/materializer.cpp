@@ -182,8 +182,13 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         const auto source = reader.read_object(placement->object);
         totals.read_bytes = checked_add(totals.read_bytes, source.size(), "transcode read bytes");
         std::vector<std::byte> encoded(static_cast<std::size_t>(placement->bytes));
-        transcode_row_split(*placement->transcode,
-                            reader.directory().tensor(placement->object).shape, source, encoded);
+        const auto& geometry = reader.geometry(placement->object);
+        if (geometry.format == QType::NVFP4) {
+            transcode_nvfp4_to_q4(geometry, source, encoded);
+        } else {
+            transcode_row_split(*placement->transcode,
+                                reader.directory().tensor(placement->object).shape, source, encoded);
+        }
         const ScopedRank bound(device, placement->rank);
         check_cuda(cudaMemcpy(bases[placement->rank] + placement->offset, encoded.data(),
                               encoded.size(), cudaMemcpyHostToDevice),
@@ -572,7 +577,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                                  ? object.host->weight_scale_divisor
                                  : read_divisor(reader, placement.object, geometry, {}, out.stats_);
         object.device = WeightParent{geometry, static_cast<const std::byte*>(storage.data),
-                                     divisor, stored_geometry.format};
+                                     divisor, stored_geometry.format, stored_geometry.layout};
     }
     const UploadTotals upload = upload_device_objects(reader, plan.device_objects,
                                                       out.arena_bases(), device, observer, phase,

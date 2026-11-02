@@ -202,11 +202,112 @@ void transcode_rows(const TargetCodec& codec, const WeightGeometry& source_geome
     }
 }
 
+// NVFP4 e2m1 (FP4) code table: 1 sign, 2 exponent (bias 1), 1 mantissa.
+constexpr float kE2M1[16] = {
+    0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
+    -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F,
+};
+
+// NVFP4 e4m3 (FP8) block scale: 1 sign, 4 exponent (bias 7), 3 mantissa.
+float decode_e4m3(std::uint8_t x) {
+    const std::uint32_t sign = (x >> 7) & 1U;
+    const std::uint32_t exp  = (x >> 3) & 0xfU;
+    const std::uint32_t mant = x & 7U;
+    const float value =
+        (exp == 0) ? static_cast<float>(mant) * 0.001953125F
+                   : std::ldexp(1.0F + static_cast<float>(mant) * 0.125F, static_cast<int>(exp) - 7);
+    return sign ? -value : value;
+}
+
+// One e4m3 block scale byte in the K16M128x4 tiled layout: a 512-byte tile holds 128 rows by four
+// groups, interleaved so four rows 32 apart share a 16-byte line. `scale_tiles_per_row` is the
+// matrix's column count over 64. Mirrors nvfp4_scale_offset in the NVFP4 GEMV.
+std::int64_t nvfp4_scale_byte(int row, int group, int scale_tiles_per_row) {
+    const int m_tile       = row / 128;
+    const int row_inner    = row - m_tile * 128;
+    const int scale_tile   = group / 4;
+    const int scale_lane   = group & 3;
+    const int row_mod32    = row_inner & 31;
+    const int row_quartile = row_inner >> 5;
+    return static_cast<std::int64_t>(m_tile * scale_tiles_per_row + scale_tile) * 512 +
+           row_mod32 * 16 + row_quartile * 4 + scale_lane;
+}
+
+float load_f32(const std::byte* bytes) {
+    float value = 0.0F;
+    std::memcpy(&value, bytes, sizeof(value));
+    return value;
+}
+
+void transcode_nvfp4_rows(const WeightGeometry& source_geometry,
+                          const WeightGeometry& target_geometry,
+                          std::span<const std::byte> source, std::span<std::byte> destination,
+                          float inverse_divisor, std::uint64_t row_begin, std::uint64_t row_end) {
+    const std::uint64_t k               = source_geometry.shape[1];
+    const std::uint64_t target_groups   = target_geometry.padded_columns / target_geometry.group_size;
+    const int scale_tiles_per_row       = static_cast<int>(k / 64);
+    const std::byte* const source_codes = source.data();
+    const std::byte* const source_scales = source.data() + source_geometry.scale_offset;
+    std::byte* const target_codes        = destination.data();
+    std::byte* const target_scales       = destination.data() + target_geometry.scale_offset;
+    const std::uint64_t target_code_row_bytes  = target_geometry.code_bytes_per_row;
+    const std::uint64_t target_scale_row_bytes = target_geometry.scale_bytes_per_row;
+
+    std::array<float, kTargetGroup> weights{};
+    for (std::uint64_t row = row_begin; row < row_end; ++row) {
+        const std::uint64_t source_row = row * (k / 2);
+        std::byte* const target_row_codes  = target_codes + row * target_code_row_bytes;
+        std::byte* const target_row_scales = target_scales + row * target_scale_row_bytes;
+        for (std::uint64_t group = 0; group < target_groups; ++group) {
+            float absmax = 0.0F;
+            for (int block = 0; block < 4; ++block) {
+                const int nvfp4_group = static_cast<int>(group) * 4 + block;
+                const std::uint8_t scale_byte = static_cast<std::uint8_t>(source_scales[nvfp4_scale_byte(
+                    static_cast<int>(row), nvfp4_group, scale_tiles_per_row)]);
+                const float scale = decode_e4m3(scale_byte) * inverse_divisor;
+                const std::byte* const codes =
+                    source_codes + source_row + static_cast<std::uint64_t>(block) * 8;
+                for (int lane = 0; lane < 16; ++lane) {
+                    const std::uint8_t byte = static_cast<std::uint8_t>(codes[lane >> 1]);
+                    const std::uint8_t code = (lane & 1) == 0 ? (byte & 0x0fU) : (byte >> 4);
+                    const float value = kE2M1[code] * scale;
+                    weights[block * 16 + lane] = value;
+                    absmax = std::max(absmax, std::fabs(value));
+                }
+            }
+            // Single-scale requantization: the NVFP4 values are already 4-bit, so the natural
+            // scale (absmax / 7) is within a fraction of a percent of the clipping-search optimum
+            // at a tenth of the cost. This is a load-time trade; the exact group scale is not an
+            // observable boundary.
+            const float scale = absmax > 0.0F ? absmax / 7.0F : 0.0F;
+            const std::uint16_t best_half = float_to_half(scale);
+            const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+            std::byte* const target_group = target_row_codes + group * 32;
+            for (int index = 0; index < kTargetGroup; ++index) {
+                const int code           = code_for(weights[index], inverse, -8, 7);
+                const std::uint32_t bits = static_cast<std::uint32_t>(code) & 0x0fU;
+                target_group[index >> 1] |= static_cast<std::byte>(
+                    (index & 1) != 0 ? static_cast<std::byte>(bits << 4U)
+                                     : static_cast<std::byte>(bits));
+            }
+            store_u16(target_row_scales + group * 2, best_half);
+        }
+    }
+}
+
 } // namespace
 
 bool row_split_transcode_supported(QType source, QType target) noexcept {
     return source == QType::Q8_G32_FP16 &&
            (target == QType::Q4_G64_FP16 || target == QType::Q6_G64_FP16);
+}
+
+bool transcode_supported(QType source, QuantLayout layout, QType target) noexcept {
+    if (row_split_transcode_supported(source, target) && layout == QuantLayout::RowSplit) {
+        return true;
+    }
+    return source == QType::NVFP4 && is_block_scale_nvfp4(layout) &&
+           target == QType::Q4_G64_FP16;
 }
 
 void transcode_row_split(QType target, std::span<const std::uint64_t> shape,
@@ -247,6 +348,58 @@ void transcode_row_split(QType target, std::span<const std::uint64_t> shape,
     try {
         transcode_rows(codec, source_geometry, target_geometry, source, destination, 0,
                        rows / workers);
+    } catch (...) {
+        failures[0] = std::current_exception();
+    }
+    for (std::thread& thread : pool) { thread.join(); }
+    for (const std::exception_ptr& failure : failures) {
+        if (failure) { std::rethrow_exception(failure); }
+    }
+}
+
+void transcode_nvfp4_to_q4(const WeightGeometry& source_geometry,
+                           std::span<const std::byte> source, std::span<std::byte> destination) {
+    const WeightGeometry target_geometry =
+        weight_geometry(QType::Q4_G64_FP16, QuantLayout::RowSplit, source_geometry.shape);
+    if (source_geometry.format != QType::NVFP4 || !is_block_scale_nvfp4(source_geometry.layout)) {
+        throw ArtifactError("NVFP4 to Q4 transcode requires a block-scale NVFP4 source");
+    }
+    if (source.size() != source_geometry.bytes || destination.size() != target_geometry.bytes) {
+        throw ArtifactError("NVFP4 to Q4 transcode payload sizes do not match the tensor shape");
+    }
+    const float divisor = load_f32(source.data() + source_geometry.divisor_offset);
+    if (!(divisor > 0.0F) || !std::isfinite(divisor)) {
+        throw ArtifactError("NVFP4 to Q4 transcode requires a positive finite divisor");
+    }
+    const float inverse_divisor = 1.0F / divisor;
+    std::fill(destination.begin(), destination.end(), std::byte{0});
+
+    const std::uint64_t rows = source_geometry.shape[0];
+    const std::uint64_t workers =
+        std::clamp<std::uint64_t>(std::thread::hardware_concurrency(), 1,
+                                  std::max<std::uint64_t>(rows, 1));
+    if (workers == 1) {
+        transcode_nvfp4_rows(source_geometry, target_geometry, source, destination, inverse_divisor,
+                             0, rows);
+        return;
+    }
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<std::size_t>(workers - 1));
+    std::vector<std::exception_ptr> failures(static_cast<std::size_t>(workers));
+    for (std::uint64_t worker = 1; worker < workers; ++worker) {
+        pool.emplace_back([&, worker] {
+            try {
+                transcode_nvfp4_rows(source_geometry, target_geometry, source, destination,
+                                     inverse_divisor, rows * worker / workers,
+                                     rows * (worker + 1) / workers);
+            } catch (...) {
+                failures[static_cast<std::size_t>(worker)] = std::current_exception();
+            }
+        });
+    }
+    try {
+        transcode_nvfp4_rows(source_geometry, target_geometry, source, destination, inverse_divisor,
+                             0, rows / workers);
     } catch (...) {
         failures[0] = std::current_exception();
     }

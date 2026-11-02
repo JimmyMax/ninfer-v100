@@ -354,6 +354,7 @@ std::string usage_text(std::string_view program) {
         << "  --lm-head-q4 | --lm-head-q6   store the output head as Q4 or Q6 while loading\n"
         << "  --embedding-q4                store the token embedding as Q4 while loading\n"
         << "  --gdn-state-fp16              keep the GDN recurrent state in FP16\n"
+        << "  --nvfp4-native                keep stored NVFP4 on its native route (Ampere transcodes to Q4 by default)\n"
         << "  --prefill-cublas            hand wide prefill GEMMs to cuBLAS (quality trade; wants a "
            "larger --prefill-chunk)\n"
         << "  --no-prefill-cublas-projections  keep attention/GDN input projections off that route\n"
@@ -507,6 +508,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.embedding_q4 = true;
         } else if (arg == "--gdn-state-fp16") {
             options.gdn_state_fp16 = true;
+        } else if (arg == "--nvfp4-native") {
+            options.nvfp4_native = true;
         } else if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
         } else if (arg == "--prefill-cublas") {

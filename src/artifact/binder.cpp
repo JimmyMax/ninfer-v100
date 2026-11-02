@@ -112,8 +112,7 @@ void Binder::transcode_device(ObjectHandle object, QType target) {
     if (demand.host) {
         throw ArtifactError(tensor.id + ": a transcoded object cannot also keep Host bytes");
     }
-    if (geometry.layout != QuantLayout::RowSplit ||
-        !row_split_transcode_supported(geometry.format, target)) {
+    if (!transcode_supported(geometry.format, geometry.layout, target)) {
         throw ArtifactError(tensor.id + ": object format cannot be transcoded as requested");
     }
     if (demand.transcode && *demand.transcode != target) {

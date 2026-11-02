@@ -137,6 +137,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     if (rank_tiers.empty()) { rank_tiers.assign(options.ranks, ops::current_device_tier()); }
     loading::apply_rank_policies(bindings, rank_tiers);
     loading::apply_device_layouts(bindings, out->weights, rank_tiers);
+    loading::apply_ampere_nvfp4_trades(bindings, rank_tiers, options);
     if (options.overlay_vision()) {
         loading::apply_vision_overlay_placement(bindings, out->weights, mtp_parameters,
                                                 draft_parameters);

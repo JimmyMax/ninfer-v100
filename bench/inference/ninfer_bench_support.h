@@ -76,6 +76,7 @@ struct BenchOptions {
     bool lm_head_q6            = false;
     bool embedding_q4          = false;
     bool gdn_state_fp16        = false;
+    bool nvfp4_native          = false;
     NgramTableOptions ngram_table;
     HybridExpertOptions hybrid_experts;
     bool profile_measured = false;

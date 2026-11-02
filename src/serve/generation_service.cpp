@@ -284,6 +284,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.embedding_q4             = options.embedding_q4;
     engine_options.embedding_q6             = options.embedding_q6;
     engine_options.mtp_experts_q4           = options.mtp_experts_q4;
+    engine_options.nvfp4_native             = options.nvfp4_native;
     engine_options.gdn_state_fp16           = options.gdn_state_fp16;
     engine_options.rope_yarn                = options.rope_yarn;
     engine_options.rope_yarn_factor         = options.rope_yarn_factor;

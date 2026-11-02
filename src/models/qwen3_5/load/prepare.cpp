@@ -243,11 +243,9 @@ bool Bindings::transcode(WeightId id, QType target, std::string_view option) {
     for (const auto& part : parameter.reference.binding.parts) {
         const auto& geometry = binder.reader().geometry(part.object);
         if (geometry.format == target) { continue; }
-        if (geometry.layout != QuantLayout::RowSplit ||
-            !artifact::row_split_transcode_supported(geometry.format, target)) {
-            throw std::invalid_argument(std::string(option) + " requires " +
-                                        parameter.reference.name +
-                                        " to be stored as row-split Q8_G32");
+        if (!artifact::transcode_supported(geometry.format, geometry.layout, target)) {
+            throw std::invalid_argument(std::string(option) + " cannot transcode " +
+                                        parameter.reference.name + " as requested");
         }
         binder.transcode_device(part.object, target);
         requested = true;

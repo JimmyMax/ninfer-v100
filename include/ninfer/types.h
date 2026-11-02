@@ -682,6 +682,11 @@ struct EngineOptions {
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.
     bool mtp_experts_q4                    = false;
+    // Keep stored NVFP4 weights on their native route. Clearing it (the default) lets a tier
+    // without FP4 tensor cores (Ampere: sm_86/sm_89) transcode NVFP4 to row-split Q4 at load, where
+    // the native NVFP4 route is compute-bound and the row-split q4 GEMV and MoE routes are
+    // memory-bound at the same 4-bit weight precision. Inert on tiers that keep the native route.
+    bool nvfp4_native                      = false;
     // Integer-activation MLP gate_up at decode and verify widths. Measured 4-6% off that Op from
     // sixteen columns up; see docs/maintainer/quality-trade-experiments.md.
     bool mlp_a8_decode                     = false;

@@ -155,6 +155,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                loading\n"
            "  --mtp-experts-q4              Qwen3.6-35B-A3B: store the MTP layer's routed\n"
            "                                experts in the text layers' formats\n"
+           "  --nvfp4-native                keep stored NVFP4 on its native route (Ampere\n"
+           "                                transcodes it to row-split Q4 at load by default)\n"
            "  --gdn-state-fp16              keep the GDN recurrent state in FP16 (halves\n"
            "                                each host state image)\n"
            "  --rope-yarn                   past the model's native window, apply Qwen's\n"
@@ -1309,6 +1311,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--mtp-experts-q4") {
             options.mtp_experts_q4 = true;
+            continue;
+        }
+        if (arg == "--nvfp4-native") {
+            options.nvfp4_native = true;
             continue;
         }
         if (arg == "--gdn-state-fp16") {

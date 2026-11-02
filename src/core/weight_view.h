@@ -72,6 +72,9 @@ struct WeightParent {
     // transcoded to a narrower grouped format at load; identities that describe the artifact's
     // representation (such as the prefill measurement signature) read this one.
     std::optional<QType> stored_format;
+    // Layout stored in the artifact, paired with stored_format. A transcode changes the layout as
+    // well (for example NVFP4's block-scale plane to row-split), so the stored geometry needs both.
+    std::optional<QuantLayout> stored_layout;
 };
 
 struct WeightRegion {

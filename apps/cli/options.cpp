@@ -422,6 +422,8 @@ Options parse_options(int argc, char** argv) {
             options.embedding_q6 = true;
         } else if (arg == "--mtp-experts-q4") {
             options.mtp_experts_q4 = true;
+        } else if (arg == "--nvfp4-native") {
+            options.nvfp4_native = true;
         } else if (arg == "--gdn-state-fp16") {
             options.gdn_state_fp16 = true;
         } else if (arg == "--rope-yarn") {

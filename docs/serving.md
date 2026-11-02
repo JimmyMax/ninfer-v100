@@ -1983,6 +1983,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--lm-head-q4`, `--lm-head-q6` | store the output head as Q4 or Q6 while loading (Q4 costs +0.69% perplexity, Q6 +0.01%) | off |
 | `--embedding-q4`, `--embedding-q6` | store the token embedding as Q4 or Q6 while loading | off |
 | `--mtp-experts-q4` | Qwen3.6-35B-A3B: store the MTP layer's routed experts in the text layers' formats | off |
+| `--nvfp4-native` | keep stored NVFP4 weights on their native route; by default an Ampere (sm_86/sm_89) build transcodes them to row-split Q4 at load, which is faster there because Ada has no FP4 Tensor Cores. No effect on Volta (sm_70) | transcode on Ampere |
 | `--gdn-state-fp16` | keep the GDN recurrent state in FP16, which halves each Host StateImage ([quality trades](maintainer/quality-trade-experiments.md)) | FP32 |
 | `--default-max-tokens N` | output limit when omitted by a request; see [default output limit](#default-output-limit) | largest budget that keeps every lane admissible |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |

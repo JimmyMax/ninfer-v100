@@ -73,6 +73,7 @@ struct Options {
     bool embedding_q4                   = false;
     bool embedding_q6                   = false;
     bool mtp_experts_q4                 = false;
+    bool nvfp4_native                   = false;
     bool gdn_state_fp16                 = false;
     bool rope_yarn                      = false;
     float rope_yarn_factor              = 1.0F;
@@ -195,6 +196,8 @@ Options parse_options(int argc, char** argv) {
             out.embedding_q6 = true;
         } else if (option == "--mtp-experts-q4") {
             out.mtp_experts_q4 = true;
+        } else if (option == "--nvfp4-native") {
+            out.nvfp4_native = true;
         } else if (option == "--gdn-state-fp16") {
             out.gdn_state_fp16 = true;
         } else if (option == "--devices") {
@@ -376,6 +379,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.embedding_q4     = options.embedding_q4;
     engine_options.embedding_q6     = options.embedding_q6;
     engine_options.mtp_experts_q4   = options.mtp_experts_q4;
+    engine_options.nvfp4_native     = options.nvfp4_native;
     engine_options.gdn_state_fp16   = options.gdn_state_fp16;
     engine_options.rope_yarn        = options.rope_yarn;
     engine_options.rope_yarn_factor = options.rope_yarn_factor;

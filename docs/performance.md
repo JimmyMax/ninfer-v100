@@ -408,6 +408,33 @@ A model whose weights fit is read at HBM speed; Flash-Next pays ~20-25 GB of PCI
 prompt instead. That is a memory-placement difference, not a density difference, and it is why the
 same engine on the same card reaches 2.39k tok/s on the Gemma MoE and 400-700 tok/s on Flash-Next.
 
+## NVFP4 on an RTX 4080 SUPER: the load-time Q4 transcode
+
+Ada (`sm_86`/`sm_89`) has no FP4 Tensor Cores, so a stored NVFP4 weight runs on the SIMT/MMA
+route, which is compute-bound in a decode round. An Ampere build therefore transcodes each
+device-resident NVFP4 weight to row-split `Q4_G64_FP16` at load, so the linear layers take the
+memory-bound row-split Q4 GEMV. `--nvfp4-native` keeps the native route. Volta (`sm_70`) is
+unaffected: its NVFP4 QPN route is the fast path there, so the transcode is a compile-time no-op.
+
+The transcode is a single-scale requantization (the NVFP4 values are already 4-bit, so `absmax / 7`
+is within a fraction of a percent of the clipping-search optimum at a tenth of the load cost).
+It costs load time — 9 s to 119 s for the 8–9 GiB of NVFP4 in these artifacts — and one
+consequence: a DFlash2 drafter that **shares** the main model's MLP through a binding range now
+sees the transcoded weights, so its acceptance collapses toward zero. The net is therefore
+artifact-dependent, measured on the 4080 SUPER with a 512-token generation, DFlash2 K5, three
+repetitions:
+
+| Artifact | NVFP4 | Native, tok/s | Native acc | Transcode, tok/s | Transcode acc | Faster |
+|---|---:|---:|---:|---:|---:|---|
+| `Qwen3.8-27B-Coder390-W4A4-MTP-DFlash2` | 8.4 GiB | 25.00 | 0.150 | **28.32** | 0.004 | transcode +13% |
+| `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3` | 9.0 GiB | **41.80** | 0.386 | 30.52 | 0.000 | native +37% |
+
+The transcode wins only where the native NVFP4 round is slow enough that losing the drafter does
+not cost more than the faster Q4 GEMV saves (W4A4). Where the native round is already fast and the
+drafter accepts well (the OrcaRouter NVFP4 fine-tune), keeping the native route is better. The
+default is the transcode because the 4080 serving configuration is W4A4; use `--nvfp4-native`
+for an artifact whose native profile is the stronger one.
+
 ## Determinism
 
 Every configuration reproduces its own output exactly. Configurations do not reproduce each other:

@@ -113,6 +113,11 @@ void apply_rank_policies(Bindings& bindings, std::span<const ops::DeviceTier> ra
 // run Volta's code (`rank_tiers`, one per rank; storage_trades.cpp).
 void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
                           std::span<const ops::DeviceTier> rank_tiers);
+// Tiers without FP4 tensor cores (Ampere) transcode device-resident NVFP4 parameters to row-split
+// Q4 at load so the decode and verify routes take the memory-bound q4 path; --nvfp4-native keeps
+// the native route (storage_trades.cpp).
+void apply_ampere_nvfp4_trades(Bindings& bindings, std::span<const ops::DeviceTier> rank_tiers,
+                               const LoadOptions& options);
 // --vision-residency overlay: rank the device weights an exclusive Vision window may borrow.
 // `mtp_parameters` and `draft_parameters` are the half-open WeightId index ranges registered by
 // bind_mtp and bind_draft.
