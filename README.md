@@ -89,6 +89,14 @@ generated tokens from a one-token seed, so it is prompt-length-independent here.
 | GSQ-RCO IQ3_S | 14.0 | 1,024 | 1.13 s | 906 tok/s | 58.7 tok/s (34.9%) | 43.0 tok/s |
 | GSQ-RCO IQ3_S | 14.0 | 27,000 | 30.3 s | 890 tok/s | 58.7 tok/s (34.9%) | |
 
+**Fastest decode the card sustains: 108.4 tok/s** (NVFP4, MTP 4, a 7,051-token code-prompt
+continuation — the highest-acceptance workload, measured with `ninfer_bench -pg 7051,512`). On
+that best-condition workload all three 27B artifacts decode at 104.5–108.4 tok/s (a 3.4–3.7%
+spread, acceptance 85–88%), decided by per-round format speed — NVFP4's QPN route reads 4-bit
+blocks directly, the mixed GGUF blocks pay a dequantize pass — so the table's 25% drafter gap is a
+one-token-seed trajectory, not the artifacts' genuine edge. Full record in
+[docs/performance.md](docs/performance.md).
+
 The native profile prefills ~16% faster than the GGUF block formats (the mixed-precision
 fragmentation above), and decodes faster **with** the drafter because the draft's acceptance
 favors it (50.3% versus 34.9–41.9%). Without a drafter the order inverts: the 14.0-GiB IQ3_S
@@ -105,14 +113,9 @@ per draft position: NVFP4 78.2 → 52.9 → 39.4 → 30.6%, Q4_K_M 71.7 → 47.6
 **unquantized** model's next tokens — and it is quantized to the artifact's own format, so its
 noise compounds over the draft's four autoregressive steps; the 4.5-bpw native profile keeps both
 the base model and the draft module closest to the reference, and its chain decays least. At equal
-chains all three would decode ~73–78 tok/s. And that chain is a property of the *generation*, not
-the artifact: the two artifacts branch at their first divergent token, so each scores its own
-trajectory here. On the same continuation workload measured across all three 27B artifacts on 1.7.2
-([docs/performance.md](docs/performance.md)), the native profile's genuine edge is **3.4–3.7% of
-decode** (108.4 vs 104.5–104.8 tok/s, acceptance within 3 points) and **~11% of prefill** (1,089 vs
-980 tok/s) — not the 25% this corpus sitting shows. The 108.4 tok/s is the fastest decode the card
-sustains; the per-round format speed (NVFP4's QPN route reads 4-bit blocks directly, the mixed GGUF
-blocks pay a dequantize pass) is what decides it at equal acceptance.
+chains all three would decode ~73–78 tok/s. That chain is a property of the *generation*, not the
+artifact: the two artifacts branch at their first divergent token, so each scores its own trajectory
+here — which is why the best-condition continuation recorded above narrows the gap to a few percent.
 
 ## Technical highlights
 
