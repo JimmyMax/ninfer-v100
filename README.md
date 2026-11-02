@@ -89,13 +89,19 @@ generated tokens from a one-token seed, so it is prompt-length-independent here.
 | GSQ-RCO IQ3_S | 14.0 | 1,024 | 1.13 s | 906 tok/s | 58.7 tok/s (34.9%) | 43.0 tok/s |
 | GSQ-RCO IQ3_S | 14.0 | 27,000 | 30.3 s | 890 tok/s | 58.7 tok/s (34.9%) | |
 
-**Fastest decode the card sustains: 108.4 tok/s** (NVFP4, MTP 4, a 7,051-token code-prompt
-continuation — the highest-acceptance workload, measured with `ninfer_bench -pg 7051,512`). On
-that best-condition workload all three 27B artifacts decode at 104.5–108.4 tok/s (a 3.4–3.7%
-spread, acceptance 85–88%), decided by per-round format speed — NVFP4's QPN route reads 4-bit
-blocks directly, the mixed GGUF blocks pay a dequantize pass — so the table's 25% drafter gap is a
-one-token-seed trajectory, not the artifacts' genuine edge. Full record in
-[docs/performance.md](docs/performance.md).
+**Fastest decode the card sustains** — a 7,051-token code-prompt continuation, the
+highest-acceptance workload (`ninfer_bench -pg 7051,512`), same settings otherwise:
+
+| Artifact | MTP 4 decode | No drafter | Speedup | Acceptance | Prefill 7,051 |
+|---|---:|---:|---:|---:|---:|
+| orcarouter `nvfp4` v3 | **108.4 tok/s** | 33.2 tok/s | 3.26× | 84.9% | **1,089 tok/s** |
+| Swift-1.5 Q4_K_M | 104.8 tok/s | 36.8 tok/s | 2.85× | 87.9% | 980 tok/s |
+| GSQ-RCO IQ3_S | 104.5 tok/s | 41.2 tok/s | 2.54× | 86.7% | 980 tok/s |
+
+At 85–88% acceptance the three artifacts are within 3.4–3.7%; the spread is decided by per-round
+format speed (NVFP4's QPN route reads 4-bit blocks directly, the mixed GGUF blocks pay a
+dequantize pass). So the table above's 25% drafter gap is a one-token-seed trajectory, not the
+artifacts' genuine edge. Full record in [docs/performance.md](docs/performance.md).
 
 The native profile prefills ~16% faster than the GGUF block formats (the mixed-precision
 fragmentation above), and decodes faster **with** the drafter because the draft's acceptance
