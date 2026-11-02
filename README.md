@@ -107,10 +107,12 @@ noise compounds over the draft's four autoregressive steps; the 4.5-bpw native p
 the base model and the draft module closest to the reference, and its chain decays least. At equal
 chains all three would decode ~73–78 tok/s. And that chain is a property of the *generation*, not
 the artifact: the two artifacts branch at their first divergent token, so each scores its own
-trajectory here. On four real prompts (code and Chinese, 6–31k tokens, [docs/performance.md]
-(docs/performance.md)) the acceptance rates agree within 1.5 points and the native profile's
-genuine edge over IQ3_S is 4–7% of decode (13.4–14.2 ms versus 14.2–15.0 ms per round) and
-10–12% of prefill — not the 25% this corpus sitting shows.
+trajectory here. On the same continuation workload measured across all three 27B artifacts on 1.7.2
+([docs/performance.md](docs/performance.md)), the native profile's genuine edge is **3.4–3.7% of
+decode** (108.4 vs 104.5–104.8 tok/s, acceptance within 3 points) and **~11% of prefill** (1,089 vs
+980 tok/s) — not the 25% this corpus sitting shows. The 108.4 tok/s is the fastest decode the card
+sustains; the per-round format speed (NVFP4's QPN route reads 4-bit blocks directly, the mixed GGUF
+blocks pay a dequantize pass) is what decides it at equal acceptance.
 
 ## Technical highlights
 

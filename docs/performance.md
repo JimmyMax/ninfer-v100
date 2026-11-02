@@ -96,6 +96,29 @@ IQ3_S stores five Q6_K objects, all in its MTP layer; the fused `[gate; up]` par
 MLP keeps its stored layout (the dense prepack's fused-parent exclusion) while the other Q6_K
 projections take the dense layout.
 
+### Fastest decode record, all three artifacts (1.7.2)
+
+The same continuation workload on all three 27B artifacts: `ninfer_bench -pg 7051,512`, a true
+long-prompt decode (a 7,051-token code prompt, then a timed 512-token continuation), MTP 4,
+INT8 KV, chunk 2048, greedy, three repetitions. This is the highest-acceptance workload the
+model produces (the continuation is near-deterministic), so it is the fastest decode the card
+can sustain. The standard `-p`/`-n` flags are *not* this: they run a prefill plus a one-token-seed
+free generation, whose acceptance is a trajectory artifact, not the prompt's.
+
+| artifact | MTP 4 decode | no drafter | speedup | acceptance | prefill 7,051 |
+|---|---:|---:|---:|---:|---:|
+| NVFP4 OrcaRouter | **108.4** | 33.2 | 3.26× | 84.9% | **1,089** |
+| Q4_K_M | 104.8 | 36.8 | 2.85× | 87.9% | 980 |
+| IQ3_S GSQ-RCO | 104.5 | 41.2 | 2.54× | 86.7% | 980 |
+
+Fastest single number: **108.4 tok/s** (NVFP4). Under these best conditions the native profile's
+decode edge over both GGUF artifacts is only **3.4–3.7%** — not the ~25% that the one-token-seed
+free-generation table in the README shows. On a near-deterministic continuation all three artifacts
+accept 85–88% of drafts (a 2–3-point spread), so the per-round format speed decides: NVFP4's
+QPN route reads 4-bit blocks directly (13.4–14.2 ms per round) while the mixed GGUF blocks pay a
+dequantize pass (14.2–15.0 ms), and that outweighs NVFP4's slightly lower acceptance. Prefill stays
++11% for NVFP4, and without a drafter the order inverts (IQ3_S 41.2, +24% over NVFP4's 33.2).
+
 ## Qwen3.8-Flash-Next
 
 A 48-layer MoE that routes 512 experts and reads a shared n-gram table. Its routed experts do not
