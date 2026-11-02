@@ -408,32 +408,46 @@ A model whose weights fit is read at HBM speed; Flash-Next pays ~20-25 GB of PCI
 prompt instead. That is a memory-placement difference, not a density difference, and it is why the
 same engine on the same card reaches 2.39k tok/s on the Gemma MoE and 400-700 tok/s on Flash-Next.
 
-## NVFP4 on an RTX 4080 SUPER: the load-time Q4 transcode
+## NVFP4 on an RTX 4080 SUPER: the e2m1 LUT decode and the load-time Q4 transcode
 
 Ada (`sm_86`/`sm_89`) has no FP4 Tensor Cores, so a stored NVFP4 weight runs on the SIMT/MMA
-route, which is compute-bound in a decode round. An Ampere build therefore transcodes each
-device-resident NVFP4 weight to row-split `Q4_G64_FP16` at load, so the linear layers take the
-memory-bound row-split Q4 GEMV. `--nvfp4-native` keeps the native route. Volta (`sm_70`) is
-unaffected: its NVFP4 QPN route is the fast path there, so the transcode is a compile-time no-op.
+route. The original route was instruction-bound: the e2m1 hardware intrinsic (`__nv_fp4x2_e2m1`)
+expands to a 4–6 instruction ALU sequence per 4-bit code, and the kernels sat at 83% SM active
+with only ~1 TFLOP/s of useful throughput.
 
-The transcode is a single-scale requantization (the NVFP4 values are already 4-bit, so `absmax / 7`
-is within a fraction of a percent of the clipping-search optimum at a tenth of the load cost).
-It costs load time — 9 s to 119 s for the 8–9 GiB of NVFP4 in these artifacts — and one
-consequence: a DFlash2 drafter that **shares** the main model's MLP through a binding range now
-sees the transcoded weights, so its acceptance collapses toward zero. The net is therefore
-artifact-dependent, measured on the 4080 SUPER with a 512-token generation, DFlash2 K5, three
-repetitions:
+A 16-entry shared-memory LUT now replaces the intrinsic in all four NVFP4 decode kernels (GEMV,
+SIMT, Swiglu decode, Swiglu small-t). The LUT values are bit-exact with the e2m1 spec, so the
+numerics and perplexity are unchanged. The kernels are now memory-bound (SM 56%, DRAM 68–70%),
+and the decode round runs 1.6–1.75× faster:
+
+| Swift1.5 NVFP4 27B, 4080 SUPER, 512-token | Before LUT | After LUT |
+|---|---:|---:|
+| nospec decode | 19.97 tok/s | **34.86 tok/s** (1.75×) |
+| DFlash2 K5 decode | 41.89 tok/s | **66.92 tok/s** (1.60×), acc 0.386 |
+| swiglu T=1 microbench | 327.7 µs | **148.5 µs** (2.2×) |
+
+An Ampere build can additionally transcode each device-resident NVFP4 weight to row-split
+`Q4_G64_FP16` at load, so the linear layers take the memory-bound row-split Q4 GEMV.
+`--nvfp4-native` keeps the native route. The transcode is a single-scale requantization
+(`absmax / 7`, within a fraction of a percent of the clipping-search optimum at a tenth of the
+load cost). It costs load time (9 s to 119 s for the 8–9 GiB of NVFP4) and one consequence: a
+DFlash2 drafter that **shares** the main model's MLP through a binding range now sees the
+transcoded weights, so its acceptance collapses toward zero. The net is artifact-dependent,
+measured on the 4080 SUPER with a 512-token generation, DFlash2 K5, three repetitions, **with
+the LUT decode**:
 
 | Artifact | NVFP4 | Native, tok/s | Native acc | Transcode, tok/s | Transcode acc | Faster |
 |---|---:|---:|---:|---:|---:|---|
 | `Qwen3.8-27B-Coder390-W4A4-MTP-DFlash2` | 8.4 GiB | 25.00 | 0.150 | **28.32** | 0.004 | transcode +13% |
-| `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3` | 9.0 GiB | **41.80** | 0.386 | 30.52 | 0.000 | native +37% |
+| `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3` | 9.0 GiB | **66.92** | 0.386 | 30.52 | 0.000 | native +119% |
 
-The transcode wins only where the native NVFP4 round is slow enough that losing the drafter does
-not cost more than the faster Q4 GEMV saves (W4A4). Where the native round is already fast and the
-drafter accepts well (the OrcaRouter NVFP4 fine-tune), keeping the native route is better. The
-default is the transcode because the 4080 serving configuration is W4A4; use `--nvfp4-native`
-for an artifact whose native profile is the stronger one.
+The LUT decode makes the native route much faster, so the native route now wins decisively for
+the Swift1.5 artifact (+119%, up from +37% before the LUT). The transcode still wins for W4A4
+(where the drafter acceptance is low either way). The default is the transcode because the 4080
+serving configuration is W4A4; use `--nvfp4-native` for an artifact whose native profile is the
+stronger one (now the clear choice for Swift1.5). Volta (`sm_70`) is unaffected: its NVFP4 QPN
+route is the fast path there, so the transcode is a compile-time no-op (the LUT also applies to
+the sm_70 build, where it is a harmless shared-memory load).
 
 ## Determinism
 
