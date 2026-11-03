@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <exception>
@@ -2672,13 +2673,26 @@ private:
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
         nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
                                        static_cast<std::uint64_t>(membership.size));
+        const bool round_timing = std::getenv("NINFER_ROUND_TIMING") != nullptr;
+        const auto t0 = round_timing ? Clock::now() : Clock::time_point{};
         ProgramCallScope program_call(*this);
         auto pending = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
+        const auto t1 = round_timing ? Clock::now() : Clock::time_point{};
         program_call.finish(pending.execution_timing());
         cumulative_stats_.decode_seconds_total +=
             static_cast<double>(pending.execution_timing().elapsed_ns()) * 1e-9;
+        const auto t2 = round_timing ? Clock::now() : Clock::time_point{};
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
+        if (round_timing) {
+            const auto t3 = Clock::now();
+            std::fprintf(stderr,
+                         "[round] dev=%.2fms call=%.2fms finish=%.2fms commit=%.2fms\n",
+                         static_cast<double>(pending.execution_timing().elapsed_ns()) * 1e-6,
+                         std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                         std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                         std::chrono::duration<double, std::milli>(t3 - t2).count());
+        }
         publish_runtime_stats();
     }
 
