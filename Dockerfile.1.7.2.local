@@ -1,0 +1,21 @@
+# Dockerfile.1.7.2.local — 单镜像双架构：sm_70 (Tesla V100) + sm_89 (RTX 4080 SUPER)
+#
+# 与 1.7.1 相同的布局；二进制换成 2026-10-30 构建树的构建（含 ngram 表未训练行 guard，
+# 修复 Flash-Next --ngram-table 的乱码输出）。本地镜像，未发布。
+#
+#   mkdir -p docker-runtime/1.7.2
+#   cp /mnt/data/ninfer-build-gemma4/apps/ninfer-serve docker-runtime/1.7.2/ninfer-serve.sm70
+#   cp /mnt/data/ninfer-build-sm89/apps/ninfer-serve   docker-runtime/1.7.2/ninfer-serve.sm89
+#   cp docker-runtime/1.7.1/ninfer-serve              docker-runtime/1.7.2/ninfer-serve
+#   docker build -f Dockerfile.1.7.2.local -t ninfer:1.7.2 .
+
+FROM ninfer:1.7.0-sm89
+
+COPY docker-runtime/1.7.2/ninfer-serve.sm70 /opt/ninfer/ninfer-serve.sm70
+COPY docker-runtime/1.7.2/ninfer-serve.sm89 /opt/ninfer/ninfer-serve.sm89
+COPY docker-runtime/1.7.2/ninfer-serve /usr/local/bin/ninfer-serve
+RUN chmod +x /opt/ninfer/ninfer-serve.sm70 /opt/ninfer/ninfer-serve.sm89 /usr/local/bin/ninfer-serve
+
+WORKDIR /workspace
+EXPOSE 8000
+CMD ["ninfer-serve", "--help"]
