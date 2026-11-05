@@ -54,9 +54,20 @@ tile 配置沿用 ggml 上游常数（非本卡标定）。GDN 9.4% 次之。
 
 ## 优化方向（按预期收益排序）
 
-### 1. GGUF prefill 大-T 路由：反量化平面 + 张量核心 GEMM（预期 +50~80% prefill）
+### 0. 代码事实核查（2026-11-05，排除的错误假设）
+- ~~“mul_mat_q 在 Turing 上纯 SIMT”~~ **不成立**：`common.cuh` 在
+  `__CUDA_ARCH__ >= GGML_CUDA_CC_TURING(750)` 定义 `TURING_MMA_AVAILABLE`，
+  `mmq.cuh: use_mma_data_layout()` 对它返回 true，kernel 走 mma.sync 数据布局。
+- ~~“Ampere 配置表配 SIMT 回退”~~ **不成立**：launch config 按 cc 查
+  `ggml_cuda_mmq_get_config`（`>= VOLTA` 用 ampere 表），该表的 tile/threads
+  与 Turing mma 布局兼容。
+- 结论：MMQ 在 2080 Ti 上已按设计运行张量核心路径。与 V100 的 prefill 差距
+  （655 vs 906 tok/s）与硬件规模吻合（68 SM @1.65GHz vs 80 SM @1.4GHz +
+  kernel 常数非本卡标定），非功能缺陷。
+
+### 1. GGUF prefill 大-T 路由：反量化平面 + 张量核心 GEMM（预期 +30~60% prefill）
 - 现状：README 记载 native profile 走 "CUTLASS wide-T over a dequantized staging plane"，
-  GGUF 固定走 MMQ。mul_mat_q 在 Turing 上纯 SIMT。
+  GGUF 固定走 MMQ（激活量化 Q8_1 + mma dp4a）。
 - 方案：prefill T≥512 时，把 IQ/Q 格式权重整块反量化为 FP16 plane，
   走已有的 bf16 mma GEMM（sm75_mma.cuh）或 cuBLAS（magma_sgemmEx 已出现在 profile）。
   反量化带宽开销（3.5bit→fp16 ≈ 4.6×）在 M=2048 的计算密度下可忽略。
@@ -64,9 +75,12 @@ tile 配置沿用 ggml 上游常数（非本卡标定）。GDN 9.4% 次之。
   参考 `src/ops/linear/bf16/` 的 wide-T 调度与 `store_plane_kernel`。
 - 风险：数值契约（MMQ 的 Q8_1 激活量化 vs 平面 A16），需对照 native profile 的实现。
 
-### 2. mul_mat_q tile 配置 Turing 重标定（预期 +10~20% prefill）
-- ggml-quants 的 MMQ tile/block 常数对 sm_75 未调；可用 ncu 测 occupancy
-  后调整 `third_party/ggml-quants/src` 里各 iq*_mmq 的线程/共享内存布局。
+### 2. mul_mat_q tile 配置 Turing 重标定（预期 +5~15% prefill）
+- 虽然 mma 路径已启用，`mmq-config-ampere.cuh` 的 tile 表对 sm_75 未单独标定
+  （68 SM / 64KiB smem 与 Ampere 不同）。用 ncu 对热点实例
+  （IQ2_S/IQ1_S/IQ1_M，各 ~5-9ms/次）测 occupancy 与 stall 后，
+  在 `third_party/ggml-quants/src/ggml-cuda/mmq-config-ampere.cuh`
+  增加 cc==750 分支或新增 mmq-config-turing.cuh。
 - 便宜，适合第一步落地。
 
 ### 3. GDN chunk_recurrence_kernel<32> 调优（预期 +3~5% 总 prefill）
