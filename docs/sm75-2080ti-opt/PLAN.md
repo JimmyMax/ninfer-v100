@@ -93,6 +93,16 @@ tile 配置沿用 ggml 上游常数（非本卡标定）。GDN 9.4% 次之。
 ## 工作记录
 
 - 2026-11-05 分支建立；基线与 profile 固化（本文档）。
+- 2026-11-05 实验 4（正结果，运行时开关）：decode 再加 `--gdn-state-fp16`。
+  - 单独开对裸 decode 无影响（29.7 不变），但叠加 spec 时 2048-prompt 负载
+    71.7 -> **96.5 tok/s（+35%）**（两次复现 71.3-71.7 vs 96.5，GDN 状态读写
+    在投机轮次的关键路径上）。质量文档背书：perplexity 无变化、漂移 ≤0.34%。
+    StateImage 减半（147 -> 74.5 MiB），host cache 容量翻倍。
+  - decode 侧结论（ncu + nsys）：decode 99% GPU busy，瓶颈是 ggml vec kernel 的
+    **L1/TEX 带宽（91.6%）**而非 DRAM（49.9%）——IQ 格式反量化的访存模式是硬墙，
+    DRAM 余量约 2×但短期无法转化。进一步提速需重写 vec kernel（大工程）
+    或走投机采样（已调）。
+
 - 2026-11-05 实验 3（正结果，运行时开关）：decode 叠加 n-gram 草稿。
   - `--spec mtp --draft-tokens 4 --lm-head-draft --ngram-draft-tokens 8`
     （验证式复制草稿，数值无损）：2048 prompt decode 59.9 -> **71.8 tok/s（+20%）**；
