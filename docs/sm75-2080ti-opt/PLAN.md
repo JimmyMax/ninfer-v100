@@ -93,6 +93,23 @@ tile 配置沿用 ggml 上游常数（非本卡标定）。GDN 9.4% 次之。
 ## 工作记录
 
 - 2026-11-05 分支建立；基线与 profile 固化（本文档）。
+- 2026-11-05 实验 2（正结果，已启用）：GGUF 宽产品走 dequant→FP16→cuBLAS 路由。
+  - 实现：`gguf_linear.cpp` 的 `turing_cublas_route()`——Turing 卡上 t≥65 的 GGUF 产品
+    复用 sm_70 的 `sm70_project`（按 slab 反量化权重到 FP16 + cublasGemmEx 到 FP32 plane
+    + epilogue），窄宽度仍走 vec kernel。workspace 计算同步放开。
+  - profile 变化：mul_mat_q 系列（~78%）→ `turing_s1688gemm_fp16_*`（~73%）+
+    slice_dequantize ~4.4% + store_plane 3.4% + convert_activation 1.2%。
+  - 结果（bench, int8 KV, chunk 2048）：
+    - 2K prompt：658.5 → **707.8 tok/s（+7.5%）**
+    - 27K prompt：579.4 → **590.2 tok/s（+2.0%）**
+    - decode 不变（29.8），MTP 组合 2048：688 prefill（spec 接受率 67.1%，
+      采样路径不同导致与基线 75.9% 不可直接比）
+  - 数值验证：3 组贪心生成（物理/代码/数学，150-200 tokens）新旧路由输出逐字一致。
+  - 分析：cuBLAS FP16+FP32-accum GEMM 实测 ~37 TFLOP/s ≈ Turing 该精度的峰值
+    （~53 TFLOPS）的 70%；MMQ 原本已接近。进一步提升需 FP16-accum（数值风险）
+    或减小 dequant/epilogue 开销。
+  - 代码：`gguf_linear.cpp`（gate），sm70 命名空间下的 kernel 均为通用 CUDA/cuBLAS。
+
 - 2026-11-05 实验 1（负结果）：MMQ 缩小 tile 提升 occupancy。
   - 动机：ncu 显示 mul_mat_q 255 regs/thread、~58KiB smem/block、occupancy 25%。
   - 实现：`mmq-config-turing.cuh`，热门口径 I=64 + nthreads=128 + J≤64

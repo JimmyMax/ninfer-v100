@@ -1,6 +1,7 @@
 #include "ops/linear/gguf/gguf_linear.h"
 
 #include "core/layout.h"
+#include "ops/common/device_tier.h"
 #include "ops/linear/sm70/sm70_gemm.h"
 
 #include <algorithm>
@@ -25,6 +26,15 @@ std::int64_t row_bytes(const Weight& w) {
 }
 
 bool matrix_kernel(const Weight& w) { return gguf::has_matrix_kernel(gguf_type(w.qtype)); }
+
+// Whether a wide GGUF product on a Turing card takes the dequantize-to-FP16 + cuBLAS route
+// sm_70 uses. Turing's MMQ tiles hit the 64 KiB shared-memory wall at one block per SM
+// (255 regs/thread, 25% occupancy, L1/TEX-bound; measured on an RTX 2080 Ti, see
+// docs/sm75-2080ti-opt/PLAN.md), while cuBLAS FP16 GEMM uses the tensor cores without
+// that tile constraint. Narrow widths stay on the vector kernels, as on Volta.
+bool turing_cublas_route(std::int32_t tokens) {
+    return current_device_turing() && tokens >= detail::sm70::cublas_min_tokens();
+}
 
 gguf::Epilogue bridge_epilogue(GgufEpilogue epilogue) {
     switch (epilogue) {
@@ -239,7 +249,7 @@ std::size_t gguf_project_workspace_bytes(std::span<const GgufShape> shapes,
     // Every product may carry its own input gather, so each may quantize its own activation.
     const std::size_t activations = shapes.size();
     std::size_t widest            = 0;
-    if (detail::sm70::takes(max_tokens)) {
+    if (detail::sm70::takes(max_tokens) || turing_cublas_route(max_tokens)) {
         widest = sm70_project_bytes(activations, static_cast<std::int32_t>(rows), k, max_tokens);
     }
     if (min_tokens <= gguf::kMaxVectorColumns) {
@@ -278,7 +288,7 @@ void gguf_project(const Tensor& x, std::span<const GgufProduct> products,
     const auto* xb       = static_cast<const __nv_bfloat16*>(x.data);
     auto scope           = workspace.scope();
 
-    if (detail::sm70::takes(t)) {
+    if (detail::sm70::takes(t) || turing_cublas_route(t)) {
         sm70_project(x, products, workspace, stream);
         return;
     }
