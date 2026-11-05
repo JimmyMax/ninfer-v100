@@ -93,6 +93,15 @@ tile 配置沿用 ggml 上游常数（非本卡标定）。GDN 9.4% 次之。
 ## 工作记录
 
 - 2026-11-05 分支建立；基线与 profile 固化（本文档）。
+- 2026-11-05 实验 3（正结果，运行时开关）：decode 叠加 n-gram 草稿。
+  - `--spec mtp --draft-tokens 4 --lm-head-draft --ngram-draft-tokens 8`
+    （验证式复制草稿，数值无损）：2048 prompt decode 59.9 -> **71.8 tok/s（+20%）**；
+    7051 代码 prompt 79.5 -> **104.4 tok/s（+31%）**，超 V100 同负载（108.4 的 96%）。
+  - ngram 16 在通用文本上回退（66.7），8 是平衡点；重复性高的负载可用更大值。
+  - 注意：该路由增大 workspace 预留（sm70_project_bytes 按激活数计），
+    serve 配置需相应下调 --max-context（200000 -> 65536）和 --max-concurrency（2 -> 1）
+    才能在 22GB 卡上启动。
+
 - 2026-11-05 实验 2（正结果，已启用）：GGUF 宽产品走 dequant→FP16→cuBLAS 路由。
   - 实现：`gguf_linear.cpp` 的 `turing_cublas_route()`——Turing 卡上 t≥65 的 GGUF 产品
     复用 sm_70 的 `sm70_project`（按 slab 反量化权重到 FP16 + cublasGemmEx 到 FP32 plane
