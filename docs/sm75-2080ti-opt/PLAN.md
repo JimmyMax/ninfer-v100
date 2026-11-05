@@ -93,3 +93,14 @@ tile 配置沿用 ggml 上游常数（非本卡标定）。GDN 9.4% 次之。
 ## 工作记录
 
 - 2026-11-05 分支建立；基线与 profile 固化（本文档）。
+- 2026-11-05 实验 1（负结果）：MMQ 缩小 tile 提升 occupancy。
+  - 动机：ncu 显示 mul_mat_q 255 regs/thread、~58KiB smem/block、occupancy 25%。
+  - 实现：`mmq-config-turing.cuh`，热门口径 I=64 + nthreads=128 + J≤64
+    （mma vec-dot 的 warp 行映射不变量 `I==(nwarps/ntx)*rows_per_warp` 要求
+    I=64 配 4 warps；J=128 无法满足 footprint 减半，禁用）。
+  - 结果：prefill 2048 token **658 -> 549 tok/s（-17%）**，decode 不变。
+  - 结论：该 kernel L1/TEX 带宽绑定（baseline 已达 70%），缩小 tile 使激活
+    重读次数翻倍，occupancy 收益被带宽开销吞没。代码保留在
+    `third_party/ggml-quants/src/ggml-cuda/mmq-config-turing.cuh`，
+    dispatch 已用 `if (false && ...)` 关闭（mmq.cuh 两处）。
+  - 教训：MMQ 在 Turing 上继续调 tile 空间不大；应转向方向 #1（plane 路由）。
