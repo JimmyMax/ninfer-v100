@@ -92,6 +92,11 @@ tile 配置沿用 ggml 上游常数（非本卡标定）。GDN 9.4% 次之。
 
 ## 工作记录
 
+- 2026-11-07 硬件调优（正结果，已生效）：功耗墙 200W -> 250W（VBIOS 上限 280W）。
+  改版卡 VBIOS 保守限 200W，而内建设备 profile 是在 250W 下标定的。解锁后
+  prefill 711 -> **777 tok/s（+9.3%）**。`sudo nvidia-smi -pl 250` 即时生效，
+  但重启后需重设（可写 systemd unit 或 rc.local）。
+
 - 2026-11-05 分支建立；基线与 profile 固化（本文档）。
 - 2026-11-07 实验 5（Swift-1.5 artifact 调参）：投机参数重扫。
   - 模型换成 Swift-1.5 IQ3_S MTP 后（权重配比不同，MTP 接受率更低），
