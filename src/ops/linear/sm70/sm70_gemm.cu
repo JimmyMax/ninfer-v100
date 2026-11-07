@@ -146,8 +146,18 @@ void convert_activation(const __nv_bfloat16* x, std::int32_t k, std::int32_t tok
     }
 }
 
+// EXPERIMENT-11: 定义在 sm70_gemm_cutlass.cu，Turing 上走 CUTLASS 128x128 tile
+void gemm_cutlass(const __half* w, std::int32_t rows, std::int32_t k, const __half* x,
+                  std::int32_t tokens, float* out, std::int64_t ldc, cudaStream_t stream);
+
 void gemm(const __half* w, std::int32_t rows, std::int32_t k, const __half* x, std::int32_t tokens,
           float* out, std::int64_t ldc, cudaStream_t stream) {
+    // EXPERIMENT-11: CUTLASS 128×128 tile 慢于 cuBLAS，暂时禁用
+    // if (current_device_turing() && rows % 128 == 0 && k == 5120 && tokens >= 1024) {
+    //     gemm_cutlass(w, rows, k, x, tokens, out, ldc, stream);
+    //     return;
+    // }
+    (void)gemm_cutlass;
     cublasHandle_t blas = handle_for_current_device();
     check_blas(cublasSetStream(blas, stream), "cublasSetStream");
     const float alpha = 1.0f;

@@ -9,7 +9,8 @@ target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
 
 # 本仓库 V100 增量：Volta 构建下 sm_70 的 NVFP4/FP8 宽 T 内核依赖 CUTLASS 头文件库
 # （顶层 CMakeLists.txt 里 FetchContent，锁定 v4.4.2）。
-if(NINFER_ARCH_VOLTA)
+# EXPERIMENT-11：Turing 也需要 CUTLASS（128×128 tile GEMM）
+if(NINFER_ARCH_VOLTA OR NINFER_ARCH_TURING)
   target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
 endif()
 
