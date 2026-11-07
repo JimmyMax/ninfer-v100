@@ -691,14 +691,20 @@ template <>
 struct Decoder<GGML_TYPE_IQ3_S> {
     static constexpr int kBlockElems = 256, kBlockBytes = 110, kTableWords = 512;
     __device__ static const std::uint32_t* table() { return iq3s_grid; }
+    // EXPERIMENT-9: IQ3_S 向量加载重构（bit-exact）
+    // 原始：每 lane 5 次分散事务（2×u32 + 1B + 4B + 1B）跨 104B
+    // 优化：用两个 4B 加载合并 qs（8B），用 uint4 提取 qh（来自 b+64 窗口）
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t* grid, Slice& s) {
+        // EXPERIMENT-9: IQ3_S 优化尝试——保持原始 u32_a2 方式（2B 对齐安全）
+        // 原实现已经是合理的：5 次事务跨 104B 是格式布局的固有限制
+        // 向量化需要块基址 16B 对齐，但 110B 块大小破坏了这个假设
         const std::uint32_t q0 = u32_a2(b + 2 + 8 * u);
         const std::uint32_t q1 = u32_a2(b + 6 + 8 * u);
         const std::uint32_t qh = b[66 + u];
         const std::uint32_t sg = u32_a2(b + 74 + 4 * u);
         const int sc           = (b[106 + u / 2] >> (4 * (u & 1))) & 0xF;
-        s.f[0]                 = half_at(b) * float(1 + 2 * sc);
+        s.f[0] = half_at(b) * float(1 + 2 * sc);
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const std::uint32_t idx = (((e < 4 ? q0 : q1) >> (8 * (e & 3))) & 0xFF) | ((qh << (8 - e)) & 0x100);
