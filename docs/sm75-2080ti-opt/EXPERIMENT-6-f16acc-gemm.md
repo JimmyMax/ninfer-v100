@@ -63,6 +63,14 @@ FP16 累积器：eps ≈ 4.9e-4，max 65504。K 最长 17408 的 dot product：
   - 推论：prefill GEMM 实测 ~37 TFLOP/s ≈ Turing 峰值的 35%，瓶颈不在指令速率，
     后续 prefill 研究应转向 GEMM 形状/调度（ncu turing_s1688gemm 实例的 wave 占用）。
 
+## 实验 7：LM head 量化 —— 前提不成立（2026-11-07）
+
+设想：bf16 head（~2.4GB/token）→ Q4_K 省 24% 流量。
+实际（artifact 目录查证）：Swift-1.5 artifact 的 `text/output_head` **已是 gguf_q4_k**
+（248320×5120，715MB，GGUF 源即量化）；token_embedding 是 iq2_s（407MB）；
+proposal/head 也是 q4_k（377MB）。`--lm-head-q4` 报 cannot transcode 正是因为它已是 q4_k。
+head 流量占每 token 读量仅 ~6%，量化 head 无收益空间。实验关闭。
+
 ## Decode 研究结论（2026-11-07，ncu 实测）
 
 | 指标 | vec kernel 实测 | 解读 |
@@ -78,7 +86,6 @@ scale/sign → L1 事务爆炸）。修复 = 重写 kernel：uint4 向量化加�
 把每字节权重的 L1 事务数降下来。预期 decode 48%→75% DRAM ≈ **29.8 → 42-45 tok/s（+50%）**。
 工程量：IQ3_S/IQ3_XXS/IQ4_XS/Q4_K 四个格式各一套（第三周级）。
 
-**次因：LM head**。每 token 读取 ~2.4GB bf16 词表矩阵（占 token 流量 ~24%）。
-若在转换期把 text/output_head 重编码为 Q4_K（converter recipe override），
-decode 理论 +20% 左右，工程量 1-2 天（含验证）。下一步优先做这个（实验 7）。
-验证方式与实验 6 计划相同：贪心一致性 + perplexity。
+**次因（已排除）：LM head**。artifact 中 head 已是 q4_k（715MB，~6% 流量），无收益空间。
+decode 理论上限复核：10.9GiB/token ÷ 616GB/s ≈ 19ms → 52.6 tok/s；
+实测 29.8（55%），缺口全部来自 vec kernel 的 L1 事务效率（实测 DRAM 仅 48%）。
