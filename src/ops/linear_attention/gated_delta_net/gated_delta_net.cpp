@@ -337,7 +337,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
-#if defined(NINFER_TIER_VOLTA)
+#if defined(NINFER_TIER_VOLTA) || defined(NINFER_TIER_TURING)
     // Volta: the chunked and two-stage prefill pipelines both lose to the width-wide recurrent
     // kernel on sm_70 for the same geometry (ninfer_gated_delta_net_bench, cold L2, T=2048:
     // 7.7 ms vs 2.8 ms; T=4096: 15.9 ms vs 5.5 ms). Routing the whole width through
@@ -345,9 +345,11 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     // the recurrent tail path covers the entire prompt. That kernel keeps the state in registers,
     // normalizes q/k in-kernel, needs no workspace, and is the very kernel decode already runs, so
     // no arithmetic contract changes. NINFER_GDN_RECURRENT=0 restores the older pipelines for A/B.
+    // EXPERIMENT-12: Turing 上同样开放该开关做 A/B（two_stage 的 chunk_recurrence 在 2080 Ti
+    // 上 grid 仅 96 blocks、128 chunk 串行，profile 显示占 prefill 10%）。
     static const bool recurrent_route = [] {
         const char* value = std::getenv("NINFER_GDN_RECURRENT");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     if (recurrent_route) {
         detail::gated_delta_net::launch_recurrent_inout(q, k, v, g, beta, scale, normalize_qk,
