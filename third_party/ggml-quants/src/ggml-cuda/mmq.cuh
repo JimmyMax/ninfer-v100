@@ -291,7 +291,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
-#elif false && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+#elif 0 && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
+    // sm_75 tile downsize disabled (regressed 658->549 tok/s; see mmq-config-turing.cuh)
     return ggml_cuda_mmq_get_config_turing(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);

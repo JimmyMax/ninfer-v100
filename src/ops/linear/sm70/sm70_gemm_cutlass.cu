@@ -18,6 +18,17 @@
 #include <stdexcept>
 #include <string>
 
+#if !defined(NINFER_TIER_TURING)
+// 非 Turing 构建（如 V100/sm_70）：不实例化 CUTLASS Sm75 GEMM。
+// 运行时也会被 current_device_turing() 拦住，这里只保证链接存在。
+namespace ninfer::ops::detail::sm70 {
+void gemm_cutlass(const __half*, std::int32_t, std::int32_t, const __half*, std::int32_t, float*,
+                  std::int64_t, cudaStream_t) {
+    throw std::runtime_error("gemm_cutlass: Turing-only build");
+}
+} // namespace ninfer::ops::detail::sm70
+#else
+
 namespace ninfer::ops::detail::sm70 {
 namespace {
 
@@ -115,3 +126,5 @@ void gemm_cutlass(const __half* w, std::int32_t rows, std::int32_t k, const __ha
 }
 
 } // namespace ninfer::ops::detail::sm70
+
+#endif // NINFER_TIER_TURING
