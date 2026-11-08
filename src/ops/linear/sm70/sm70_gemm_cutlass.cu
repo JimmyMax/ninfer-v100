@@ -14,6 +14,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -54,7 +55,7 @@ using GemmKernel = cutlass::gemm::device::Gemm<
     2,    // stages
     8,    // AlignmentA
     8,    // AlignmentB
-    false // SplitKSerial
+    true  // SplitKSerial = true（启用 split-K）
 >;
 
 void* g_workspace = nullptr;
@@ -75,10 +76,24 @@ void gemm_cutlass(const __half* w, std::int32_t rows, std::int32_t k, const __ha
     // C[M,N] = A[M,K] × B[K,N]
     // A = X: [tokens, k] row-major, lda = k
     // B = W: [rows, k] col-major = W[k, rows] row-major, ldb = k
-    // C = out: [tokens, rows] col-major, ldc = ldc (传入值 = rows)
+    // C = out: [tokens, rows] col-major, ldc = ldc
     GemmKernel gemm_op;
 
     const cutlass::gemm::GemmCoord problem(tokens, rows, k);
+
+    // split_k_slices：目标 ~2000 blocks（68 SM × ~30 waves）
+    // tiles = ceil(tokens/128) × ceil(rows/128) = 16 × 136 = 2176 (M=2048, N=17408)
+    // split_k = max(1, 2048 / tiles) ≈ 1 当 tiles 已够多
+    // 但 K=5120/64 = 80 k-iters，串行太长，用 split_k=8 并行化 K
+    const int m_tiles = (tokens + 127) / 128;
+    const int n_tiles = (rows + 127) / 128;
+    const int tiles = m_tiles * n_tiles;
+    const int target_blocks = 2048;
+    int split_k = 1;
+    if (tiles < target_blocks) {
+        split_k = std::min({target_blocks / tiles, k / 64, 32});
+        split_k = std::max(1, split_k);
+    }
 
     const typename GemmKernel::Arguments args(
         problem,
@@ -86,7 +101,8 @@ void gemm_cutlass(const __half* w, std::int32_t rows, std::int32_t k, const __ha
         {reinterpret_cast<const ElementInput*>(w), k},     // B = W
         {out, static_cast<int>(ldc)},                       // C
         {out, static_cast<int>(ldc)},                       // D = C
-        {1.0f, 0.0f});
+        {1.0f, 0.0f},
+        split_k);  // split_k_slices
 
     const std::size_t workspace_bytes = GemmKernel::get_workspace_size(args);
     ensure_workspace(workspace_bytes);

@@ -149,15 +149,18 @@ void convert_activation(const __nv_bfloat16* x, std::int32_t k, std::int32_t tok
 // EXPERIMENT-11: 定义在 sm70_gemm_cutlass.cu，Turing 上走 CUTLASS 128x128 tile
 void gemm_cutlass(const __half* w, std::int32_t rows, std::int32_t k, const __half* x,
                   std::int32_t tokens, float* out, std::int64_t ldc, cudaStream_t stream);
+// EXPERIMENT-11b: 手动 split-K（cuBLAS + reduce）
+void gemm_splitk(const __half* w, std::int32_t rows, std::int32_t k, const __half* x,
+                 std::int32_t tokens, float* out, std::int64_t ldc, cudaStream_t stream, int split_k);
+extern int g_turing_splitk;  // 全局调参
 
 void gemm(const __half* w, std::int32_t rows, std::int32_t k, const __half* x, std::int32_t tokens,
           float* out, std::int64_t ldc, cudaStream_t stream) {
-    // EXPERIMENT-11: CUTLASS 128×128 tile 慢于 cuBLAS，暂时禁用
-    // if (current_device_turing() && rows % 128 == 0 && k == 5120 && tokens >= 1024) {
-    //     gemm_cutlass(w, rows, k, x, tokens, out, ldc, stream);
-    //     return;
-    // }
-    (void)gemm_cutlass;
+    if (current_device_turing() && g_turing_splitk > 1 && rows % 128 == 0 && k == 5120 && tokens >= 1024) {
+        gemm_splitk(w, rows, k, x, tokens, out, ldc, stream, g_turing_splitk);
+        return;
+    }
+    (void)gemm_cutlass; (void)gemm_splitk;
     cublasHandle_t blas = handle_for_current_device();
     check_blas(cublasSetStream(blas, stream), "cublasSetStream");
     const float alpha = 1.0f;
