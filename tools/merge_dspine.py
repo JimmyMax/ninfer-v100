@@ -6,10 +6,13 @@ import json
 import struct
 import sys
 
+import sys
+
 MODEL_DIR = "/mnt/data/dockerdata/llama-cpp/models"
-TARGET = f"{MODEL_DIR}/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer"
-DRAFTER = f"{MODEL_DIR}/Qwen3.8-27B-DSpine-b16-ninfer-v3.ninfer"
-OUT = f"{MODEL_DIR}/Qwen3.8-27B-GSQ-RCO-IQ3_S-dspine.ninfer"
+# argv: [target.ninfer] [drafter.ninfer] [out.ninfer]
+TARGET = sys.argv[1] if len(sys.argv) > 1 else f"{MODEL_DIR}/Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer"
+DRAFTER = sys.argv[2] if len(sys.argv) > 2 else f"{MODEL_DIR}/Qwen3.8-27B-DSpine-b16-ninfer-v3.ninfer"
+OUT = sys.argv[3] if len(sys.argv) > 3 else f"{MODEL_DIR}/Qwen3.8-27B-GSQ-RCO-IQ3_S-dspine.ninfer"
 
 K_HEADER = 32
 K_ALIGN = 4096
@@ -46,9 +49,9 @@ def main():
 
     # Highest weight index in the target; the drafter's weights continue after it.
     import re
-    t_max = max((int(re.match(r"weight/(\d+)", o["id"]).group(1))
-                 for o in t_objects if o["id"].startswith("weight/")), default=-1)
-    base = t_max + 1
+    _w = re.compile(r"weight/(\d+)$")
+    _nums = [int(_w.match(o["id"]).group(1)) for o in t_objects if _w.match(o["id"])]
+    base = (max(_nums) if _nums else -1) + 1
     rename = {}
     for i, o in enumerate(d_objects):
         m = re.match(r"weight/(\d+)", o["id"])
@@ -133,7 +136,7 @@ def main():
     print(f"wrote {OUT}")
     print(f"  components: {list(merged_components.keys())}")
     print(f"  objects: {len(merged_objects)} (target {len(t_objects)} + drafter {len(d_objects)})")
-    print(f"  weight rename base: {base} (target max {t_max})")
+    print(f"  weight rename base: {base}")
     print(f"  json_len={json_len} payload_start={payload_start} total_payload={total_payload}")
 
 
