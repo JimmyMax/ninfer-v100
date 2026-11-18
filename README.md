@@ -59,6 +59,7 @@ Two families load, in place, with no offline conversion:
 |---|---:|---|---|
 | `swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4-v3.ninfer` | 21.2 | native `nvfp4` | production default; 19.1 GiB on device; DFlash2 adapter + MTP head |
 | `Qwen3.8-27B-Coder390-EfficientThink-W4A4-MTP-DFlash2.ninfer` | 22.1 | native `nvfp4`/`fp8`/groupwise | Coder390 family; DFlash2 + MTP head |
+| `Qwen3.8-27B-Coder390-EfficientThink-W4A4-W8A8-MTP-DFlash2.ninfer` | 21.2 | native `nvfp4`/`fp8`/groupwise | Coder390 W8A8 activation variant; current production artifact |
 | `orcarouter-Qwen3.8-27B-Uncensored-nvfp4-NInfer.ninfer` | 20.0 | native `nvfp4` | orca's uncensored variant |
 | `Swift-1.5-Qwen3.8-27B-Q4_K_M-ninfer-v3.ninfer` | 17.0 | GGUF `q4_k` | the same 27B base as orca, converted from the GGUF |
 | `Qwen3.8-27B-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` | 14.0 | GGUF blocks, 3.5 bits | 18 block formats, IQ3_S holding 3.39 GiB |
@@ -102,6 +103,33 @@ At 85–88% acceptance the three artifacts are within 3.4–3.7%; the spread is 
 format speed (NVFP4's QPN route reads 4-bit blocks directly, the mixed GGUF blocks pay a
 dequantize pass). So the table above's 25% drafter gap is a one-token-seed trajectory, not the
 artifacts' genuine edge. Full record in [docs/performance.md](docs/performance.md).
+
+### Coder390 serving matrix (ninfer-serve, temp 0.7)
+
+A separate bench through `ninfer-serve` on the Coder390 production line (V100 at 250W, int8 KV,
+chunk 2048, lm-head-draft, concurrency 2, one seed per point; harness lives in the deployment
+repo, `bench/run_mtp_dflash2_matrix.sh`). Decode tok/s, MTP 4 drafts unless noted:
+
+| Arm | 7.3K code | 28K code | 93K code | 193K zh |
+|---|---:|---:|---:|---:|
+| NVFP (W8A8) MTP 4 | 96.2 | 96.5 | 77.9 | 44.9 |
+| NVFP MTP 7 | 102.3 | 102.9 | 78.5 | 32.3 |
+| NVFP DFlash2 4 | 79.4 | 78.7 | 69.4 | OOM |
+| IQ3_S MTP 4 | 92.3 | 89.2 | 81.6 | 48.9 |
+| Q4_K_M (Huihui) MTP 4 | 97.1 | 80.5 | 82.6 | 44.0 |
+
+Three conclusions this matrix settled (full data `/tmp/mtpdf2-matrix/rows.jsonl` at measurement
+time; rerun the harness before each release):
+
+* **MTP draft 4 is the right width on every artifact line.** Wider drafts win short context
+  (draft 7: 102–103 tok/s at ≤28K on NVFP) but collapse at 193K (32.3, acceptance 0.23); draft 3
+  wins only at 193K. Draft 4 is the only width that holds all four context points.
+* **DFlash2 loses to MTP everywhere on the V100** (11–30% behind at equal acceptance; also +2.7 GiB
+  runtime that caps NVFP at 185K context). DFlash2 is the right drafter on Ada (4080: 66.9 vs 34.9
+  tok/s nospec) where its selector/conv ops ride tensor cores — not on sm_70.
+* **GGUF Q4_K_M/IQ3_S match NVFP in decode** (±6%, each winning somewhere) and beat it beyond
+  93K (Q4_K_M 82.6 vs 77.9 at 93K; IQ3_S 48.9 vs 44.9 at 193K) on smaller weight footprints.
+  Prefill is 4–8% slower on GGUF blocks (the per-tensor dequantize-and-GEMM fragmentation above).
 
 The native profile prefills ~16% faster than the GGUF block formats (the mixed-precision
 fragmentation above), and decodes faster **with** the drafter because the draft's acceptance
