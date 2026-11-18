@@ -301,6 +301,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                  static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
                  static_cast<std::int32_t>(plan.max_concurrency)},
                 "DFlash pending target features");
+            if (draft->dspine) {
+                dflash.dspine_head_write = add_tensor(
+                    builder, DType::BF16,
+                    {static_cast<std::int32_t>(draft->dspine->rank),
+                     static_cast<std::int32_t>(config.vocab_size)},
+                    "DSpine head-write table");
+            }
         }
     }
 
@@ -1402,7 +1409,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .ngram_min_match            = options.speculative.ngram_min_match,
         .speculative_backend        = options.speculative.backend,
         .kv_storage                 = options.kv_cache,
-        .proposal_head = models::planned_proposal_head(options.speculative.proposal_head),
+        .proposal_head = options.speculative.backend == SpeculativeBackend::DSpine
+                             ? ProposalHead::Full
+                             : models::planned_proposal_head(options.speculative.proposal_head),
         .rope_yarn                  = planned_rope_yarn(parameters, options),
         .mtp_attention_window       = options.speculative.mtp_attention_window,
         .features                   = models::load_options(options),

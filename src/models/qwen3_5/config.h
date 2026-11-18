@@ -109,6 +109,21 @@ struct DFlash2Config {
     std::uint32_t selector_top_k   = 0;
 };
 
+// DSpine (Tencent, "Draft in Parallel, Condition Through Depth") adds a code bridge to the
+// drafter: after each layer it injects the previous position's predicted feature into the next
+// position through a gated message, then refines the last layer's write with a serial table over
+// the head's top candidates. It is a DFlash2 drafter with these extra fields; the convolutions and
+// selector are reused unchanged.
+struct DSpineConfig {
+    std::uint32_t code_size              = 0;   // 1024: the bridge's shared transfer width
+    std::uint32_t rank                   = 0;   // 512: the gated message's width
+    std::uint32_t head_topk              = 0;   // 16: candidates the serial table refines
+    std::uint32_t first_exact            = 0;   // last layer index whose write the table redoes
+    std::uint32_t terminal_residual_rank = 0;   // terminal-corrected bridges are refused (0 here)
+    float kappa                          = 0;   // 10.0: codebook normalization scale
+    float eps                            = 0;   // 1e-6: RMS norm epsilon inside the bridge
+};
+
 struct DraftConfig {
     AttentionConfig attention;
     std::uint32_t intermediate_size       = 0;
@@ -121,6 +136,7 @@ struct DraftConfig {
     std::vector<std::uint32_t> target_layer_ids;
     std::uint32_t mask_token_id = 0;
     std::optional<DFlash2Config> dflash2;
+    std::optional<DSpineConfig> dspine;
 
     [[nodiscard]] std::uint32_t local_layer_count() const noexcept {
         return static_cast<std::uint32_t>(std::count(layer_types.begin(), layer_types.end(),

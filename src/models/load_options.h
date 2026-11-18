@@ -53,6 +53,8 @@ struct LoadOptions {
     std::size_t ranks = 1;
     // Layers per stage (`--stage-layers`), one count per device. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
+    // dspine: path to the DSpine drafter artifact, trained for this model.
+    std::filesystem::path draft_model;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -81,7 +83,9 @@ struct LoadOptions {
         return speculative == SpeculativeBackend::DFlash2;
     }
 
-    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2(); }
+    [[nodiscard]] bool dspine() const noexcept { return speculative == SpeculativeBackend::DSpine; }
+
+    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2() || dspine(); }
 
     [[nodiscard]] bool proposal_enabled() const noexcept {
         return purpose == EnginePurpose::Generation && speculative != SpeculativeBackend::None &&
@@ -98,13 +102,16 @@ struct LoadOptions {
             return "dflash";
         case SpeculativeBackend::DFlash2:
             return "dflash2";
+        case SpeculativeBackend::DSpine:
+            return "dspine";
         }
         return {};
     }
 };
 
 [[nodiscard]] constexpr bool is_masked_draft_backend(SpeculativeBackend backend) noexcept {
-    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
+    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2 ||
+           backend == SpeculativeBackend::DSpine;
 }
 
 // The draft head a plan uses: an automatic head not yet resolved against an artifact
@@ -117,7 +124,9 @@ struct LoadOptions {
     return {.purpose        = options.purpose,
             .vision         = options.enable_vision,
             .speculative    = options.speculative.backend,
-            .proposal_head  = planned_proposal_head(options.speculative.proposal_head),
+            .proposal_head  = options.speculative.backend == SpeculativeBackend::DSpine
+                                 ? ProposalHead::Full
+                                 : planned_proposal_head(options.speculative.proposal_head),
             .lm_head_q4     = options.lm_head_q4,
             .lm_head_q6     = options.lm_head_q6,
             .embedding_q4   = options.embedding_q4,
@@ -134,7 +143,8 @@ struct LoadOptions {
             .vision_residency         = options.enable_vision ? options.vision_residency
                                                               : VisionResidency::Resident,
             .ranks = std::max<std::size_t>(options.devices.size(), 1),
-            .stage_layers = options.stage_layers};
+            .stage_layers = options.stage_layers,
+            .draft_model = options.speculative.draft_model};
 }
 
 } // namespace ninfer::models

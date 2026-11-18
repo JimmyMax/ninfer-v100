@@ -459,6 +459,27 @@ public:
                                               tensor(w.selector->predecessor_codebook),
                                               tensor(w.selector->successor_codebook)};
         }
+        if (w.dspine_bridge) {
+            DSpineCodeBridgeParameters bridge;
+            const auto& wbridge = *w.dspine_bridge;
+            bridge.gate_bias       = tensor(wbridge.gate_bias);
+            bridge.projection      = linear(wbridge.projection);
+            bridge.read_weights.reserve(wbridge.read_weights.size());
+            for (const auto& e : wbridge.read_weights) {
+                bridge.read_weights.push_back(linear(e));
+            }
+            bridge.write_weights.reserve(wbridge.write_weights.size());
+            for (const auto& e : wbridge.write_weights) {
+                bridge.write_weights.push_back(linear(e));
+            }
+            bridge.head_write      = tensor(wbridge.head_write);
+            bridge.sender_table    = tensor(wbridge.sender_table);
+            bridge.code_size       = wbridge.code_size;
+            bridge.rank            = wbridge.rank;
+            bridge.kappa           = wbridge.kappa;
+            bridge.eps             = wbridge.eps;
+            out.dspine_bridge = std::move(bridge);
+        }
         return out;
     }
 

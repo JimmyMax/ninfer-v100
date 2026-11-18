@@ -171,7 +171,10 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
     out.token_embedding =
         b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
     std::vector<std::string> head_inputs{"text/final_hidden"};
-    if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled()) {
+    // The DSpine drafter reuses the target's text/final_hidden Use (see load.cpp); it needs no
+    // dedicated speculative final_hidden input, and the artifact emits none.
+    if (options.speculative != SpeculativeBackend::None &&
+        options.speculative != SpeculativeBackend::DSpine && !options.proposal_enabled()) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");
     }
     out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},

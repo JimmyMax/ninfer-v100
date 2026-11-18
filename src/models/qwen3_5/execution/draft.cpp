@@ -16,11 +16,14 @@
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/embedding.h"
+#include "ninfer/ops/candidate_selector.h"
+#include "ninfer/ops/dspine.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/prepare_masked_block.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rmsnorm.h"
@@ -261,6 +264,199 @@ void finish_dynamic_branch(ExecutionCore& execution, const Tensor& input,
 }
 
 void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int batch,
+                           int k, DFlashEnvelopes envelopes);
+
+// DSpine (Tencent): a DFlash2 drafter with the code bridge injected between layers. After each
+// layer it writes the previous position's predicted feature into the next position through a
+// gated message (gate = sigmoid(query + sender + bias) * value), then refines the last layer's
+// write with a serial table over the head's top candidates. The convolutions and selector are
+// reused unchanged.
+// DSpine (Tencent): a plain-DFlash drafter with the code bridge injected between layers, ported
+// op-for-op from the upstream proven implementation (ninfer-wavecut src/models/dspine/drafter.cpp).
+// The anchor column is the anchor TOKEN's embedding like every other column; the target's stacked
+// features reach the drafter only through the context K/V ring (append_context_impl).
+void prepare_dspine_head_write(DFlashBatchContext& state) {
+    auto& persistent = dflash_state(state);
+    if (persistent.dspine_head_prepared) { return; }
+    const auto& target       = state.execution.parameters.model.config().text;
+    const DraftParameters& weights = *state.execution.parameters.draft;
+    const auto& bridge       = *weights.dspine_bridge;
+    const std::int32_t h     = dimension(target.hidden_size);
+    const std::int32_t rank  = dimension(bridge.rank);
+    const std::int32_t vocab = dimension(target.vocab_size);
+    auto& work               = state.execution.work;
+    const cudaStream_t stream = state.execution.device.stream;
+    // The head-write table's columns, one write row each: scaled by the final norm's weight, then
+    // through the target's head, stored transposed. A one-time startup cost; small chunks keep the
+    // logits plane inside the decode arena.
+    work.reset();
+    constexpr std::int32_t chunk = 32;
+    for (std::int32_t first = 0; first < rank; first += chunk) {
+        auto scope              = work.scope();
+        const std::int32_t n    = std::min(chunk, rank - first);
+        Tensor columns          = bridge.head_write.slice(1, first, n);
+        Tensor scaled           = work.alloc(DType::BF16, {h, n});
+        ops::dspine_scale_rows(columns, weights.final_norm, scaled, stream);
+        Tensor logits           = work.alloc(DType::BF16, {vocab, n});
+        project(scaled, weights.output_head, logits, work, stream);
+        ops::dspine_store_head_write(logits, first, persistent.dspine_head_write, stream);
+    }
+    work.reset();
+    persistent.dspine_head_prepared = true;
+}
+
+void propose_dspine_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int batch,
+                          int k, DFlashEnvelopes envelopes) {
+    if (!state.execution.parameters.model.config().draft->dspine) {
+        return;
+    }
+    const auto& target = state.execution.parameters.model.config().text;
+    const auto& config = *state.execution.parameters.model.config().draft;
+    if (config.rms_norm_eps != 1e-6F || config.rope_theta != 1e7F) {
+        throw std::invalid_argument(
+            "DSpine: fused norm/RoPE requires epsilon=1e-6 and theta=1e7");
+    }
+    const auto& dspine = *config.dspine;
+
+    const int width        = k + 1;
+    const int columns      = width * batch;
+    const int mask_columns = k * batch;
+    auto& work             = state.execution.work;
+    const cudaStream_t stream = state.execution.device.stream;
+    const DraftParameters& weights = *state.execution.parameters.draft;
+    const auto& bridge   = *weights.dspine_bridge;
+    const std::int32_t h     = dimension(target.hidden_size);
+    const std::int32_t rank  = dimension(bridge.rank);
+    const std::int32_t code  = dimension(bridge.code_size);
+    const std::int32_t d     = dimension(config.attention.head_dim);
+    const std::int32_t hq    = dimension(config.attention.num_attention_heads);
+    const std::int32_t kv    = dimension(config.attention.num_key_value_heads);
+    const std::int32_t inner = dimension(config.intermediate_size);
+    const float eps          = config.rms_norm_eps;
+
+    Tensor anchors            = frame.anchors.slice(0, 0, batch);
+    Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch);
+    Tensor valid_columns      = frame.proposal_valid_columns.slice(0, 0, batch);
+    Tensor state_destinations = frame.state_destination_slots.slice(0, 0, batch);
+    Tensor ids                = frame.proposal_ids.slice(1, 0, batch);
+    Tensor positions          = frame.proposal_positions.slice(1, 0, batch);
+    Tensor drafts             = frame.draft_tokens.slice(1, 0, batch);
+    work.reset();
+    ops::prepare_masked_block(anchors, frontiers, valid_columns,
+                              dimension(config.mask_token_id), ids, positions, stream);
+
+    // The residual stream and its normed form; the bridge's refinement state (rms, packed,
+    // message) and the last write's denominator the serial table reads.
+    Tensor residual    = work.alloc(DType::BF16, {h, width, batch});
+    Tensor normed      = work.alloc(DType::BF16, {h, width, batch});
+    Tensor rms         = work.alloc(DType::FP32, {width, batch});
+    Tensor denominator = work.alloc(DType::FP32, {width, batch});
+    Tensor packed      = work.alloc(DType::BF16, {3 * rank, width, batch});
+    Tensor message     = work.alloc(DType::BF16, {rank, width, batch});
+    Tensor residual_flat = residual.view({h, columns});
+    Tensor normed_flat   = normed.view({h, columns});
+
+    embed_tokens(ids.view({columns}), state.execution.parameters.text.token_embedding,
+                 state.execution.parameters.text.token_embedding_signs, residual_flat, stream);
+    ops::rmsnorm(residual_flat, weights.layers.front().input_norm, eps, false, normed_flat,
+                 stream);
+
+    const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d)));
+    for (std::size_t l = 0; l < weights.layers.size(); ++l) {
+        const auto& layer = weights.layers[l];
+        const bool last   = l + 1 == weights.layers.size();
+        {
+            // Attention over the normalized input, causal inside the block. The fused norm and
+            // rotation work in place on the projections' outputs.
+            auto scope   = work.scope();
+            Tensor q     = work.alloc(DType::BF16, {d, hq, width, batch});
+            Tensor key   = work.alloc(DType::BF16, {d, kv, width, batch});
+            Tensor value = work.alloc(DType::BF16, {d, kv, width, batch});
+            Tensor q_flat = q.view({d * hq, columns});
+            Tensor k_flat = key.view({d * kv, columns});
+            Tensor v_flat = value.view({d * kv, columns});
+            ops::attn_input_proj(normed_flat, layer.query_key_value.weight, q_flat, k_flat,
+                                 v_flat, stream);
+            ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, q, key, stream);
+            Tensor attended = work.alloc(DType::BF16, {d, hq, width, batch});
+            ops::sliding_window_attention(
+                q, key, value, positions, valid_columns, state_destinations, {d, hq, kv},
+                dimension(config.sliding_window.value_or(0)), scale,
+                dflash_state(state).local_layer(config.compact_layer_index(
+                    static_cast<std::uint32_t>(l))),
+                envelopes.local, work, attended, stream);
+            // The attention output's [5120, 4096] Q8 geometry is not one the fused linear_add
+            // admits on sm70; run the upstream's separate projection + residual add.
+            Tensor output = work.alloc(DType::BF16, {h, columns});
+            project(attended.view({d * hq, columns}), layer.output, output, work, stream);
+            ops::residual_add(output, residual_flat, stream);
+        }
+        {
+            // The MLP over the post-attention norm; the residual then holds the bridge's raw row.
+            auto scope     = work.scope();
+            Tensor x       = work.alloc(DType::BF16, {h, columns});
+            Tensor product = work.alloc(DType::BF16, {inner, columns});
+            ops::rmsnorm(residual_flat, layer.post_attention_norm, eps, false, x, stream);
+            project_swiglu(x, layer.mlp.gate_up, product, work, stream);
+            project_add(product, layer.mlp.down, residual_flat, work, stream);
+        }
+        {
+            // The bridge's write, and the next layer's (or the final) norm of its output.
+            auto scope        = work.scope();
+            Tensor normalized = work.alloc(DType::BF16, {h, columns});
+            Tensor rms_flat   = rms.view({columns});
+            ops::dspine_bridge_read(residual_flat, dspine.eps, normalized, rms_flat, stream);
+            Tensor codes = work.alloc(DType::BF16, {code, columns});
+            project(normalized, bridge.read_weights[l], codes, work, stream);
+            ops::dspine_bridge_codes(codes, dspine.eps, codes, stream);
+            Tensor packed_flat = packed.view({3 * rank, columns});
+            project(codes, bridge.projection, packed_flat, work, stream);
+            ops::dspine_bridge_message(packed, anchors, bridge.sender_table, bridge.gate_bias,
+                                       message, stream);
+            Tensor delta      = work.alloc(DType::BF16, {h, width, batch});
+            Tensor delta_flat = delta.view({h, columns});
+            project(message.view({rank, columns}), bridge.write_weights[l], delta_flat, work,
+                    stream);
+            const Tensor& next = last ? weights.final_norm : weights.layers[l + 1].input_norm;
+            ops::dspine_bridge_finish(residual, rms, delta, next, eps, residual, normed,
+                                      last ? &denominator : nullptr, stream);
+        }
+    }
+    // The mask columns' final hidden, packed row after row: the head's candidates, then the
+    // serial table's walk over them.
+    Tensor hidden = work.alloc(DType::BF16, {h, mask_columns});
+    const std::size_t row_bytes = std::size_t(h) * dtype_size(DType::BF16);
+    CUDA_CHECK(cudaMemcpy2DAsync(hidden.data, std::size_t(k) * row_bytes,
+                                 static_cast<const std::byte*>(normed.data) + row_bytes,
+                                 std::size_t(width) * row_bytes, std::size_t(k) * row_bytes,
+                                 std::size_t(batch), cudaMemcpyDeviceToDevice, stream));
+    Tensor candidates = work.alloc(DType::I32, {ops::kDSpineCandidates, k, batch});
+    Tensor scores     = work.alloc(DType::FP32, {ops::kDSpineCandidates, k, batch});
+    {
+        auto head_scope = work.scope();
+        Tensor logits   = work.alloc(DType::BF16, {dimension(target.vocab_size), mask_columns});
+        project(hidden, weights.output_head, logits, work, stream);
+        ops::candidate_topk(
+            logits,
+            dimension(state.execution.parameters.model.resources().public_token_count),
+            candidates, scores, work, stream);
+    }
+    // Greedy draft sampling configs, one per row, uploaded with the block.
+    static const std::vector<ops::SamplingConfig> greedy(kMaximumConcurrency);
+    DeviceSpan configs =
+        work.alloc_bytes(batch * sizeof(ops::SamplingConfig), alignof(ops::SamplingConfig));
+    CUDA_CHECK(cudaMemcpyAsync(configs.data, greedy.data(), batch * sizeof(ops::SamplingConfig),
+                               cudaMemcpyHostToDevice, stream));
+    Tensor proposal_q = work.alloc(DType::FP32, {ops::kDSpineCandidates, k, batch});
+    ops::dspine_path(candidates, scores, denominator, rms, packed, message,
+                     dflash_state(state).dspine_head_write, bridge.sender_table, bridge.gate_bias,
+                     anchors, frontiers,
+                     static_cast<const ops::SamplingConfig*>(configs.data), drafts, proposal_q,
+                     nullptr, work, stream);
+    work.reset();
+}
+
+void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int batch,
                            int k, DFlashEnvelopes envelopes) {
     if (state.execution.parameters.model.config().draft->dflash2) {
         const auto& target = state.execution.parameters.model.config().text;
@@ -391,7 +587,12 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
 
 void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
                         std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
-    if (state.execution.parameters.model.config().draft->dflash2) {
+    const auto& draft_cfg = state.execution.parameters.model.config().draft;
+    if (draft_cfg->dspine) {
+        nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
+                                         static_cast<std::uint64_t>(k + 1U) * batch_size);
+        propose_dspine_batch(state, frame, batch_size, k, envelopes);
+    } else if (draft_cfg->dflash2) {
         nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                          static_cast<std::uint64_t>(k + 1U) * batch_size);
         propose_dflash2_batch(state, frame, batch_size, k, envelopes);
@@ -744,6 +945,10 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
+    if (state.execution.parameters.model.config().draft->dspine) {
+        // A one-time table build, on the stream but outside the captured body.
+        prepare_dspine_head_write(state);
+    }
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     capture_graph(state, definition, body);
 }
@@ -752,6 +957,9 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable) {
+    if (state.execution.parameters.model.config().draft->dspine) {
+        prepare_dspine_head_write(state);
+    }
     auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
     run_prepared(state, executable, body);
 }

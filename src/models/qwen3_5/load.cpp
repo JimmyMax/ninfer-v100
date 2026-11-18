@@ -110,12 +110,23 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     std::pair<std::size_t, std::size_t> draft_parameters{bindings.weights.size(),
                                                          bindings.weights.size()};
     if (out->config.draft) {
-        out->weights.draft =
-            loading::bind_draft(bindings, *out->config.draft, text, out->weights.text,
-                                std::string(options.speculative_component()));
-        draft_parameters.second = bindings.weights.size();
+        if (options.speculative == SpeculativeBackend::DSpine && !options.draft_model.empty()) {
+            // dspine: load the DSpine drafter from a separate artifact.
+            artifact::Reader draft_reader(options.draft_model);
+            artifact::Binder draft_binder(draft_reader);
+            loading::Bindings draft_bindings(draft_binder, options);
+            out->weights.draft =
+                loading::bind_draft(draft_bindings, *out->config.draft, text, out->weights.text,
+                                    "dspine");
+            draft_parameters.second = bindings.weights.size();
+        } else {
+            out->weights.draft =
+                loading::bind_draft(bindings, *out->config.draft, text, out->weights.text,
+                                    std::string(options.speculative_component()));
+            draft_parameters.second = bindings.weights.size();
+        }
     }
-    if (options.proposal_enabled()) {
+    if (options.proposal_enabled() && options.speculative != SpeculativeBackend::DSpine) {
         const auto& proposal = reader.directory().component("text").proposal;
         if (!proposal) {
             throw artifact::ArtifactError("selected proposal head is absent from artifact");
@@ -149,9 +160,16 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
             bindings.use(out->weights.mtp->output_head, "mtp/final_hidden");
     }
     if (out->weights.draft) {
-        out->weights.draft->output_head_use =
-            bindings.use(out->weights.draft->output_head,
-                         std::string(options.speculative_component()) + "/final_hidden");
+        if (options.speculative == SpeculativeBackend::DSpine) {
+            // dspine: the drafter reuses the target's output head, so its Use is text/final_hidden
+            // whether the drafter is a companion component or a separate --draft-model artifact.
+            out->weights.draft->output_head_use =
+                bindings.use(out->weights.draft->output_head, "text/final_hidden");
+        } else {
+            out->weights.draft->output_head_use =
+                bindings.use(out->weights.draft->output_head,
+                             std::string(options.speculative_component()) + "/final_hidden");
+        }
     }
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish(
@@ -248,7 +266,7 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
             head_bytes += parameter_bytes(reader, bindings, WeightId{index});
         }
     }
-    if (config.draft && options.masked_draft()) {
+    if (config.draft && options.masked_draft() && !(options.speculative == SpeculativeBackend::DSpine && !options.draft_model.empty())) {
         // The drafter shares the target's embedding and head, so only what it binds anew counts.
         const std::size_t first = bindings.weights.size();
         (void)loading::bind_draft(bindings, *config.draft, text, weights,

@@ -117,6 +117,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    DSpine,
 };
 
 // How many of its drafts an MTP round verifies: always all of them, or a width the Engine adapts
@@ -155,6 +156,8 @@ struct SpeculativeOptions {
     // its query instead of the whole history; target verification keeps full attention, so the
     // committed tokens do not depend on it. Zero reads the whole history.
     std::uint32_t mtp_attention_window = 0;
+    // dspine: path to the DSpine drafter artifact, trained for this model.
+    std::filesystem::path draft_model;
 };
 
 enum class StartupPhase : std::uint8_t {

@@ -143,10 +143,24 @@ struct SelectorWeights {
     WeightId hidden_projection, predecessor_codebook, successor_codebook;
 };
 
+struct DSpineCodeBridgeWeights {
+    WeightId gate_bias;                           // [rank]
+    WeightId projection;                          // [rank, hidden]
+    std::vector<WeightId> read_weights;           // [code_size, hidden] per layer
+    std::vector<WeightId> write_weights;          // [hidden, rank] per layer
+    WeightId head_write;                          // [hidden, rank]
+    WeightId sender_table;                        // [vocab, code_size]
+    std::uint32_t code_size = 0;
+    std::uint32_t rank      = 0;
+    float kappa             = 0;
+    float eps               = 0;
+};
+
 struct DraftWeights {
     WeightId feature_projection, context_norm, final_norm;
     std::vector<DraftBlockWeights> layers;
     std::optional<SelectorWeights> selector;
+    std::optional<DSpineCodeBridgeWeights> dspine_bridge;
     WeightId token_embedding, output_head;
     WeightUseId output_head_use;
 };

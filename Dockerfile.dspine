@@ -1,0 +1,43 @@
+# Dockerfile.dspine — Build DSpine branch on V100 (sm_70)
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04 AS build
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN rm -f /etc/apt/sources.list.d/cuda*.list \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        git \
+        python3 \
+        cmake \
+        ninja-build \
+        pkg-config \
+        libavformat-dev \
+        libavcodec-dev \
+        libavutil-dev \
+        libswscale-dev \
+        libcurl4-openssl-dev \
+        zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+# third_party/cutlass is gitignored: fetch the pinned tag when the checkout is absent.
+RUN if [ ! -f third_party/cutlass/include/cutlass/cutlass.h ]; then \
+        rm -rf third_party/cutlass && \
+        git clone --depth 1 --branch v4.4.2 https://github.com/nvidia/cutlass.git third_party/cutlass; \
+    fi \
+    && cmake -S . -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=70 \
+        -DNINFER_BUILD_APPS=ON \
+        -DBUILD_TESTING=OFF \
+        -DNINFER_BUILD_BENCHMARKS=OFF \
+        -DFETCHCONTENT_SOURCE_DIR_CUTLASS=/src/third_party/cutlass \
+    && cmake --build /build --parallel 32 --target ninfer-serve
+
+FROM ninfer:v100-stable
+COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+RUN chmod +x /usr/local/bin/ninfer-serve
+WORKDIR /workspace
+EXPOSE 8000
+CMD ["ninfer-serve", "--help"]

@@ -8,6 +8,7 @@
 #include "ops/linear/sm70/sm70_gemm.cuh"
 #include "ops/linear/sm70/sm70_integer.h"
 #include "ops/linear/sm70/sm70_small.h"
+#include "ops/linear/q8/q8_dispatch.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -171,7 +172,10 @@ bool covers(const Weight& w, std::int32_t tokens) {
     // 它们比 sm_70 的通用 small_project 快得多：Q8 150 us 对 282 us，并直接决定 MTP 层
     //（全 W8G32）每轮 4 次草稿的成本。让出窄宽度。
     if (tokens <= 8 && (w.qtype == QType::Q8_G32_FP16 || w.qtype == QType::Q4_G64_FP16)) {
-        return false;
+        // Only registered geometries have a dedicated decode kernel; anything else (the DSpine
+        // drafter's [5120,4096] attention output) falls through to this Op's GEMM, whose
+        // dequantizer takes every dense Q8 shape.
+        if (w.qtype != QType::Q8_G32_FP16 || q8_shape_registered(w.n, w.k)) { return false; }
     }
 #endif
     return true;

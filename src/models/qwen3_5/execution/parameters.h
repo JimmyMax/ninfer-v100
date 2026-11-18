@@ -163,11 +163,28 @@ struct SelectorParameters {
     Tensor predecessor_codebook, successor_codebook;
 };
 
+// DSpine code bridge: the gated adjacent injection between drafter layers. The message width is
+// `rank` (512); the shared transfer width is `code_size` (1024). Weights live under
+// `selected_prefix_bridge/` in the artifact, beside the DFlash2 drafter layers.
+struct DSpineCodeBridgeParameters {
+    Tensor gate_bias;                                     // [rank]
+    LinearParameters projection;                          // [rank, hidden]
+    std::vector<LinearParameters> read_weights;           // [code_size, hidden] per layer
+    std::vector<LinearParameters> write_weights;          // [hidden, rank] per layer
+    Tensor head_write;                                    // [rank, hidden] (no Use in artifact)
+    Tensor sender_table;                                  // [vocab, code_size]
+    std::uint32_t code_size = 0;
+    std::uint32_t rank      = 0;
+    float kappa             = 0;
+    float eps               = 0;
+};
+
 struct DraftParameters {
     LinearParameters feature_projection;
     Tensor context_norm, final_norm;
     std::vector<DraftBlockParameters> layers;
     std::optional<SelectorParameters> selector;
+    std::optional<DSpineCodeBridgeParameters> dspine_bridge;
     LinearParameters output_head;
 };
 

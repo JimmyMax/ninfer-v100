@@ -1,5 +1,6 @@
 #include "models/qwen3_5/config.h"
 
+#include "artifact/reader.h"
 #include "artifact/schema.h"
 
 #include <algorithm>
@@ -213,7 +214,7 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
                      "num_key_value_heads", "head_dim", "num_hidden_layers",
                      "max_position_embeddings", "rms_norm_eps", "rope_parameters", "layer_types",
                      "dflash_config"},
-                    {"sliding_window"}, "draft config");
+                    {"sliding_window", "block_size", "num_target_layers", "hidden_size", "vocab_size", "dspine_config"}, "draft config");
     if (architecture(value) != (dflash2 ? "DFlash2DraftModel" : "DFlashDraftModel") ||
         value.at("model_type") != "qwen3") {
         throw ArtifactError("draft architecture/model_type mismatch");
@@ -246,11 +247,17 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
         out.sliding_window = dimension(value, "sliding_window");
     }
     const auto& config = value.at("dflash_config");
+    const bool dspine = config.contains("selected_prefix_code_bridge");
     if (dflash2) {
         require_members(config,
                         {"target_layer_ids", "mask_token_id", "conv_kernel_size", "conv_group_size",
                          "selector_rank", "selector_top_k"},
                         {}, "DFlash2 config");
+    } else if (dspine) {
+        require_members(config,
+                        {"target_layer_ids", "mask_token_id", "selected_prefix_code_bridge",
+                         "selected_prefix_feature_layers", "code_bridge_second_pass"},
+                        {}, "DSpine config");
     } else {
         require_members(config, {"target_layer_ids", "mask_token_id"}, {}, "DFlash config");
     }
@@ -278,8 +285,70 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
             throw ArtifactError("DFlash2 conv group does not divide hidden width");
         }
         out.dflash2 = extra;
+    } else if (dspine) {
+        DSpineConfig extra{
+            dimension(config.at("selected_prefix_code_bridge"), "code_size"),
+            dimension(config.at("selected_prefix_code_bridge"), "rank"),
+            dimension(config.at("code_bridge_second_pass"), "head_topk"),
+            dimension(config.at("code_bridge_second_pass"), "first_exact"),
+            0,  // terminal-corrected bridges are refused (0 = none)
+            positive_float(config.at("selected_prefix_code_bridge"), "kappa"),
+            positive_float(config.at("selected_prefix_code_bridge"), "eps")};
+        if (extra.code_size == 0 || extra.rank == 0 || extra.head_topk == 0) {
+            throw ArtifactError("DSpine code bridge needs a positive code_size, rank and head_topk");
+        }
+        if (extra.first_exact != out.num_hidden_layers - 1) {
+            throw ArtifactError(
+                "DSpine serial_table redoes the LAST write only: first_exact must be "
+                "num_hidden_layers - 1");
+        }
+        if ((extra.head_topk & (extra.head_topk - 1)) != 0 || extra.head_topk > 64) {
+            throw ArtifactError("DSpine head_topk must be a power of two in [2, 64]");
+        }
+        out.dspine = extra;
     }
     return out;
+}
+
+// The DSpine drafter artifact stores its config under `dspine_config` with DSpine field names;
+// draft() expects the DFlash shape. This maps one onto the other so a `dspine` component can be
+// loaded through the same DFlash drafter path whether it is a companion in the target artifact or
+// a separate --draft-model file.
+Json map_dspine_config(Json value) {
+    value["architectures"] = Json::array({"DFlashDraftModel"});
+    if (!value.contains("rms_norm_eps")) { value["rms_norm_eps"] = 1e-6; }
+    if (!value.contains("rope_parameters")) {
+        value["rope_parameters"] = {{"rope_theta", 1000000.0}};
+    }
+    if (!value.contains("layer_types")) {
+        // All DSpine layers are sliding attention (sliding_window = max_position_embeddings).
+        Json layers = Json::array();
+        for (std::uint32_t i = 0; i < value.at("num_hidden_layers"); ++i) {
+            layers.push_back("sliding_attention");
+        }
+        value["layer_types"] = layers;
+    }
+    // The drafter's sliding window spans only its own draft block (context is injected through
+    // the code bridge, not the drafter's KV cache), so the declared 8192 window can be capped to
+    // the largest window the sliding-window attention kernels register.
+    if (dimension(value, "sliding_window") > 4096) { value["sliding_window"] = 4096; }
+    if (value.contains("dspine_config")) {
+        const auto& sc = value.at("dspine_config");
+        Json dc;
+        dc["target_layer_ids"] = sc.at("target_layer_ids");
+        dc["mask_token_id"]    = sc.at("mask_token_id");
+        dc["selected_prefix_code_bridge"] =
+            Json{{"code_size", sc.at("code_size")}, {"rank", sc.at("rank")}, {"kappa", 10.0},
+                 {"eps", sc.value("bridge_eps", 1e-6)}};
+        dc["code_bridge_second_pass"] =
+            Json{{"head_topk", sc.at("head_top_k")},
+                 {"first_exact", static_cast<std::uint32_t>(value.at("num_hidden_layers")) - 1}};
+        dc["selected_prefix_feature_layers"] = sc.at("target_layer_ids");
+        value["dflash_config"] = dc;
+    } else if (!value.contains("dflash_config")) {
+        value["dflash_config"] = Json::object();
+    }
+    return value;
 }
 
 } // namespace
@@ -335,9 +404,22 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             }
         }
         if (options.speculative == SpeculativeBackend::DFlash ||
-            options.speculative == SpeculativeBackend::DFlash2) {
-            out.draft = draft(companion(directory, options.speculative_component()).config,
-                              out.text, options.speculative == SpeculativeBackend::DFlash2);
+            options.speculative == SpeculativeBackend::DFlash2 ||
+            options.speculative == SpeculativeBackend::DSpine) {
+            if (options.speculative == SpeculativeBackend::DSpine && !options.draft_model.empty()) {
+                // dspine: load the DSpine drafter from a separate artifact.
+                artifact::Reader reader(options.draft_model);
+                auto draft_directory = reader.directory();
+                out.draft = draft(map_dspine_config(draft_directory.component("dspine").config),
+                                  out.text, false);
+            } else if (options.speculative == SpeculativeBackend::DSpine) {
+                // dspine drafter shipped as a companion component of the target artifact.
+                out.draft = draft(map_dspine_config(companion(directory, "dspine").config),
+                                  out.text, false);
+            } else {
+                out.draft = draft(companion(directory, options.speculative_component()).config,
+                                  out.text, options.speculative == SpeculativeBackend::DFlash2);
+            }
         }
         return out;
     } catch (const std::exception& error) {

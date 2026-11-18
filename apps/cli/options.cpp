@@ -199,7 +199,9 @@ std::string usage_text(const char* argv0) {
            "                                rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
-           "  --spec mtp|dflash|dflash2     speculative decoding backend\n"
+           "  --spec mtp|dflash|dflash2|dspine     speculative decoding backend\n"
+           "  --draft-model PATH            dspine: the DSpine drafter artifact, trained for\n"
+           "                                this model\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
@@ -399,6 +401,8 @@ Options parse_options(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = value(arg);
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--draft-min-p") {

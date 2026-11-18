@@ -92,3 +92,11 @@ third_party/webui/
 
 # 本仓库 V100 增量：秒级重打包用的二进制，不入库
 docker-runtime/
+
+# Local build/test artifacts (never commit)
+ninfer-bin
+ninfer-serve-bin
+
+# CUTLASS is fetched at image build time (Dockerfile.dspine); the local vendored
+# checkout under third_party/ is a build convenience only (~6900 files).
+third_party/cutlass/

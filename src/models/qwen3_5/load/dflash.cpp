@@ -41,6 +41,10 @@ DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig
         out.layers.push_back(std::move(layer));
     }
     if (config.dflash2) { bind_dflash2(b, out, config, target); }
+    if (config.dspine) {
+        out.dspine_bridge.emplace();
+        bind_dspine_code_bridge(b, *out.dspine_bridge, config, target);
+    }
     return out;
 }
 

@@ -2,6 +2,7 @@
 
 #include "artifact/binder.h"
 #include "models/qwen3_5/config.h"
+#include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/expert_sources.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
@@ -99,6 +100,8 @@ private:
                                       const std::string& component);
 void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& config,
                   const TextConfig& target);
+void bind_dspine_code_bridge(Bindings& bindings, DSpineCodeBridgeWeights& weights,
+                             const DraftConfig& config, const TextConfig& target);
 [[nodiscard]] ProposalWeights bind_proposal(Bindings& bindings, const artifact::Proposal& proposal,
                                             const TextConfig& target, const LoadOptions& options,
                                             std::uint32_t public_tokens);

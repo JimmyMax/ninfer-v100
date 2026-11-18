@@ -16,6 +16,9 @@ struct DFlashPersistentState {
     Tensor prefill_features;
     Tensor prefill_positions;
     Tensor pending_features;
+    // DSpine: the serial table's head-write plane [rank, vocab], built once outside the graphs.
+    Tensor dspine_head_write;
+    bool dspine_head_prepared = false;
 
     DFlashPersistentState(DeviceSpan backing, const DFlashPersistentLayout& layout,
                           CyclicKVCache& local_state);

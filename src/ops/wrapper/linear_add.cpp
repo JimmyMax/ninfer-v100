@@ -4,6 +4,7 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/residual_add.h"
 
+
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
