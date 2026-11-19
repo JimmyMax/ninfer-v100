@@ -216,6 +216,7 @@ struct ggml_cuda_mmq_config {
 #include "mmq-config-pascal-older.cuh"
 #include "mmq-config-pascal-dp4a.cuh"
 #include "mmq-config-ampere.cuh"
+#include "mmq-config-sm70.cuh"
 #include "mmq-config-turing.cuh"
 #include "mmq-config-blackwell.cuh"
 
@@ -261,6 +262,9 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
         return ggml_cuda_mmq_get_config_turing(type, J, fallback);
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
+        if (cc == GGML_CUDA_CC_VOLTA) {
+            return ggml_cuda_mmq_get_config_sm70(type, J, fallback);
+        }
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A) {
@@ -294,6 +298,8 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #elif 0 && __CUDA_ARCH__ == GGML_CUDA_CC_TURING
     // sm_75 tile downsize disabled (regressed 658->549 tok/s; see mmq-config-turing.cuh)
     return ggml_cuda_mmq_get_config_turing(type, J, fallback);
+#elif __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+    return ggml_cuda_mmq_get_config_sm70(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
