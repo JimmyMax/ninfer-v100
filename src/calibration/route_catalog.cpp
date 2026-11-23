@@ -1,8 +1,8 @@
 #include "calibration/route_catalog.h"
 
 #include "ops/linear/common/route_table.h"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
-#include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/small_t_route.h"
 
 #include <algorithm>
 #include <array>
@@ -23,10 +23,28 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
         catalog.push_back({std::move(key), std::move(candidates)});
     };
 
+    add("gguf_vector/q4_k", {"scalar", "cooperative"});
+    add("gguf_vector/q6_k", {"scalar", "cooperative"});
+    add("gguf_moe_vector/q4_k", {"scalar", "cooperative"});
+    add("gguf_moe_vector/q6_k", {"scalar", "cooperative"});
+    add("gguf_moe_up/q4_k", {"scalar", "cooperative"});
+    add("gguf_moe_up/q6_k", {"scalar", "cooperative"});
+    if (!volta && !turing_shapes) {
+        // The asynchronous MMQ tile loop per format (ggml_cuda_mmq_async_row_bytes); IQ1_M has
+        // the routed-expert matrix kernel only.
+        for (const char* format :
+             {"q4_k", "q5_k", "q4_0", "q5_0", "q8_0", "iq4_nl", "q2_0", "iq4_xs", "nvfp4"}) {
+            add(std::string("gguf_matrix/") + format, {"async"});
+            add(std::string("gguf_moe_matrix/") + format, {"async"});
+        }
+        add("gguf_moe_matrix/iq1_m", {"async"});
+    }
+
     if (!volta) {
         // A Volta card runs its own projection, decode-attention and single-row prompt routes
-        // (ops/linear/sm70, small_t_sm70.cuh, prompt_sm70.cu), which consult none of the projection
-        // and attention keys below; it calibrates the GDN prefill switch alone.
+        // (ops/linear/sm70, small_t_sm70_*.cuh, sm70/prompt.cu), which consult none of the projection
+        // and attention keys below; besides the GGUF load schedules above it calibrates the GDN
+        // prefill switch alone.
 
         // Ternary Bonsai 2 projections: the small-T kernel's row and column tiles per shape, and
         // the small-T kernel against the prefill GEMM per width.
@@ -69,6 +87,18 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
                  {"unified/q4_q5_attn_input", "unified/q4_q5_gdn_input",
                   "unified/q5_linear_add/5120x6144", "unified/q5_linear_add/5120x17408",
                   "unified/q4_linear_swiglu", "unified/q4_linear_add"}) {
+                add(key, {"unified"});
+            }
+            // QUASAR NVFP4 fused projections: the A16 chain choice at every width a fused launch
+            // serves (the own chain's per-width kernels against the unified templates), and the
+            // int8 family's own four keys (--nvfp4-w4a8-int), where the band picks which chain's
+            // mainloop answers (own runs MMQ, unified runs the grouped ladder, and T <= 8 runs the
+            // row-form kernel under either). The two families carry separate keys so that
+            // calibrating one never overwrites the other.
+            for (const char* key : {"unified/nvfp4_attn_input", "unified/nvfp4_gdn_input",
+                                    "unified/nvfp4_linear_add", "unified/nvfp4_linear_swiglu",
+                                    "nvfp4_int8/attn_input", "nvfp4_int8/gdn_input",
+                                    "nvfp4_int8/linear_add", "nvfp4_int8/linear_swiglu"}) {
                 add(key, {"unified"});
             }
         }

@@ -3,10 +3,13 @@
 #include "calibration/route_catalog.h"
 
 #include "core/arena.h"
-#include "core/device.h"
+#include "core/device_buffer.h"
+#include "core/device_launch.h"
+#include "core/device_wait.h"
 #include "core/dtype.h"
-#include "core/paged_kv_cache.h"
+#include "core/paged_kv_view.h"
 #include "core/paged_kv_storage.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
@@ -15,16 +18,22 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/linear/common/route_table.h"
+#include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/t2/t2_a8.h"
+#include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 #include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
+#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
-#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_policy.h"
 
 #include <cuda_runtime.h>
 
@@ -36,6 +45,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -147,7 +157,7 @@ SyntheticWeight row_split_weight(QType qtype, std::int32_t n, std::int32_t k) {
     fill_u16_kernel<<<fill_grid(groups), 256>>>(
         reinterpret_cast<std::uint16_t*>(base + scale_offset), groups, 0x3c00);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(ninfer::wait_for_device());
 
     Weight& w           = result.weight;
     w.payload           = base;
@@ -168,6 +178,55 @@ SyntheticWeight row_split_weight(QType qtype, std::int32_t n, std::int32_t k) {
     w.group             = group;
     w.layout            = QuantLayout::RowSplit;
     w.scale_dtype       = DType::FP16;
+    return result;
+}
+
+// An NVFP4 weight in the layout the artifacts use: an E2M1 code plane, one E4M3 block scale per
+// 16 elements of a 128x4 tile, and one weight divisor past the scale plane. The field list is
+// exactly what ops::detail::validate_nvfp4_weight requires, including N%128, K%64, the 16-byte
+// plane alignment and the divisor row count.
+SyntheticWeight block_scale_nvfp4_weight(std::int32_t n, std::int32_t k) {
+    const auto align = [](std::uint64_t value) { return (value + 255) / 256 * 256; };
+    const std::uint64_t elements = static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k);
+    const std::uint64_t code_plane_bytes   = elements / 2;
+    const std::uint64_t scale_plane_offset = align(code_plane_bytes);
+    const std::uint64_t scale_plane_bytes  = elements / 16;
+    const std::uint64_t divisor_offset     = scale_plane_offset + scale_plane_bytes;
+    const std::uint64_t total              = divisor_offset + sizeof(float);
+
+    SyntheticWeight result{DeviceBuffer(static_cast<std::size_t>(total)), {}};
+    auto* base = static_cast<std::uint8_t*>(result.storage.p);
+    fill_random(base, code_plane_bytes, 0x4e56u + static_cast<std::uint32_t>(n));
+    // E4M3 1.0 is 0x38: a finite scale of one keeps the chains' products comparable, where a
+    // non-finite scale would make the output check reject every candidate.
+    CUDA_CHECK(cudaMemsetAsync(base + scale_plane_offset, 0x38, scale_plane_bytes, nullptr));
+    fill_f32_kernel<<<fill_grid(1), 256>>>(reinterpret_cast<float*>(base + divisor_offset), 1, 1.0f);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(ninfer::wait_for_device());
+
+    Weight& w              = result.weight;
+    w.payload              = base;
+    w.payload_bytes        = total;
+    w.high_plane_bytes     = 0;
+    w.qtype                = QType::NVFP4;
+    w.group_size           = 16;
+    w.shape[0]             = n;
+    w.shape[1]             = k;
+    w.padded_shape[0]      = n;
+    w.padded_shape[1]      = k;
+    w.ndim                 = 2;
+    w.qdata                = base;
+    w.qhigh                = nullptr;
+    w.scales               = base + scale_plane_offset;
+    w.n                    = n;
+    w.k                    = k;
+    w.group                = 16;
+    w.layout               = QuantLayout::BlockScaleK16M128x4;
+    w.scale_dtype          = DType::FP8_E4M3FN;
+    w.weight_scale_divisor = 1.0F;
+    w.input_scale_divisor  = 1.0F;
+    w.weight_divisors      = base + divisor_offset;
+    w.weight_divisor_rows  = n;
     return result;
 }
 
@@ -193,7 +252,7 @@ public:
                 flush();
                 launch(nullptr);
             }
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(ninfer::wait_for_device());
             std::vector<float> samples;
             samples.reserve(static_cast<std::size_t>(options_.repeat));
             for (int index = 0; index < options_.repeat; ++index) {
@@ -201,7 +260,7 @@ public:
                 CUDA_CHECK(cudaEventRecord(start_, nullptr));
                 launch(nullptr);
                 CUDA_CHECK(cudaEventRecord(stop_, nullptr));
-                CUDA_CHECK(cudaEventSynchronize(stop_));
+                CUDA_CHECK(ninfer::wait_for_event(stop_));
                 float ms = 0.0f;
                 CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_));
                 samples.push_back(ms);
@@ -210,7 +269,7 @@ public:
             return 1000.0 * samples[samples.size() / 2];
         } catch (const std::exception&) {
             cudaGetLastError();
-            cudaDeviceSynchronize();
+            ninfer::wait_for_device();
             return std::numeric_limits<double>::infinity();
         }
     }
@@ -245,7 +304,8 @@ struct Family {
 
 std::vector<float> bf16_host(std::pair<const void*, std::size_t> output) {
     std::vector<std::uint16_t> raw(output.second);
-    CUDA_CHECK(cudaMemcpy(raw.data(), output.first, raw.size() * 2, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(
+        ninfer::copy_and_wait(raw.data(), output.first, raw.size() * 2, cudaMemcpyDeviceToHost));
     std::vector<float> values(raw.size());
     for (std::size_t index = 0; index < raw.size(); ++index) {
         const std::uint32_t bits = static_cast<std::uint32_t>(raw[index]) << 16;
@@ -287,7 +347,7 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
         if (family.output) {
             if (family.reset) { family.reset(); }
             family.run(width, nullptr);
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(ninfer::wait_for_device());
             reference = bf16_host(family.output(width));
         }
         double best_us = compiled;
@@ -299,7 +359,7 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
                 try {
                     if (family.reset) { family.reset(); }
                     family.run(width, nullptr);
-                    CUDA_CHECK(cudaDeviceSynchronize());
+                    CUDA_CHECK(ninfer::wait_for_device());
                 } catch (const std::exception&) {
                     cudaGetLastError();
                     continue;
@@ -350,8 +410,504 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
     return bands;
 }
 
+std::vector<ops::DeviceRouteBand> common_cooperative_bands(
+    const std::vector<std::int32_t>& widths, const std::vector<ops::DeviceRouteBand>& first,
+    const std::vector<ops::DeviceRouteBand>& second) {
+    const auto schedule_at = [](const std::vector<ops::DeviceRouteBand>& bands,
+                                std::int32_t width) -> std::string_view {
+        for (const auto& band : bands) {
+            if (width <= band.last) { return band.schedule; }
+        }
+        return {};
+    };
+    std::vector<ops::DeviceRouteBand> result;
+    for (const std::int32_t width : widths) {
+        const std::string schedule =
+            schedule_at(first, width) == "cooperative" && schedule_at(second, width) == "cooperative"
+                ? "cooperative"
+                : "";
+        if (!result.empty() && result.back().schedule == schedule) {
+            result.back().last = width;
+        } else {
+            result.push_back({width, schedule});
+        }
+    }
+    return result;
+}
+
 std::vector<std::int32_t> decode_widths() {
     return {1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32};
+}
+
+SyntheticWeight gguf_vector_weight(QType qtype, std::int32_t n, std::int32_t k,
+                                   std::uint32_t seed = 0) {
+    const GgufBlockShape block = gguf_block_shape(qtype);
+    const bool known = qtype == QType::GGUF_Q4_K || qtype == QType::GGUF_Q6_K ||
+                       qtype == QType::GGUF_Q5_K || qtype == QType::GGUF_Q4_0 ||
+                       qtype == QType::GGUF_Q5_0 || qtype == QType::GGUF_Q8_0 ||
+                       qtype == QType::GGUF_IQ4_NL || qtype == QType::GGUF_IQ4_XS ||
+                       qtype == QType::GGUF_Q2_0 || qtype == QType::GGUF_IQ1_M ||
+                       qtype == QType::GGUF_NVFP4;
+    if (!known || block.elements == 0 || k % block.elements != 0) {
+        throw std::invalid_argument("calibration: unsupported GGUF vector weight format");
+    }
+    const std::uint64_t blocks = static_cast<std::uint64_t>(n) * (k / block.elements);
+    const std::uint64_t bytes  = blocks * block.bytes;
+    std::vector<std::uint8_t> host(static_cast<std::size_t>(bytes));
+    std::uint64_t state = 0x9e3779b97f4a7c15ULL ^ seed;
+    for (auto& value : host) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        value = static_cast<std::uint8_t>(state >> 56);
+    }
+    for (std::uint64_t index = 0; index < blocks; ++index) {
+        const std::size_t base = static_cast<std::size_t>(index) * block.bytes;
+        const std::uint16_t d = 0x3c00;
+        if (qtype == QType::GGUF_IQ1_M) {
+            // IQ1_M spreads its FP16 scale over the top nibbles of its four scale words (bytes 48
+            // to 55): nibble i of d tops word i.
+            for (int i = 0; i < 4; ++i) {
+                std::uint8_t& high = host[base + 48 + 2 * i + 1];
+                high = static_cast<std::uint8_t>((high & 0x0f) | (((d >> (4 * i)) & 0xf) << 4));
+            }
+            continue;
+        }
+        if (qtype == QType::GGUF_NVFP4) {
+            // Four UE4M3 scales of 1.0, one per 16 values.
+            std::memset(host.data() + base, 0x38, 4);
+            continue;
+        }
+        std::memcpy(host.data() + base + (qtype == QType::GGUF_Q6_K ? 208 : 0), &d, sizeof(d));
+        if (qtype == QType::GGUF_Q4_K || qtype == QType::GGUF_Q5_K) {
+            const std::uint16_t dmin = 0x3800;
+            std::memcpy(host.data() + base + 2, &dmin, sizeof(dmin));
+        }
+    }
+    SyntheticWeight result{DeviceBuffer(static_cast<std::size_t>(bytes)), {}};
+    result.storage.copy_from_host(host.data(), host.size());
+    Weight& weight         = result.weight;
+    weight.payload         = result.storage.p;
+    weight.payload_bytes   = bytes;
+    weight.qtype           = qtype;
+    weight.group_size      = static_cast<std::uint32_t>(block.elements);
+    weight.shape[0]        = n;
+    weight.shape[1]        = k;
+    weight.padded_shape[0] = n;
+    weight.padded_shape[1] = k;
+    weight.ndim            = 2;
+    weight.qdata           = result.storage.p;
+    weight.n                = n;
+    weight.k                = k;
+    weight.group            = block.elements;
+    weight.layout           = QuantLayout::GgufBlocks;
+    weight.scale_dtype      = DType::FP16;
+    return result;
+}
+
+void calibrate_gguf_vector(ops::DeviceRouteProfile& profile, Timer& timer,
+                           const CalibrationOptions& options) {
+    constexpr std::int32_t max_tokens = 8;
+    const std::vector<std::int32_t> widths = {1, 2, 3, 4, 5, 6, 7, 8};
+    for (const auto& format : {std::pair{QType::GGUF_Q4_K, std::string("q4_k")},
+                               std::pair{QType::GGUF_Q6_K, std::string("q6_k")}}) {
+        const std::string key = "gguf_vector/" + format.second;
+        if (!options.only.empty() && key.rfind(options.only, 0) != 0) { continue; }
+        SyntheticWeight wide       = gguf_vector_weight(format.first, 17408, 5120);
+        SyntheticWeight tall       = gguf_vector_weight(format.first, 5120, 17408);
+        DeviceBuffer wide_input    = bf16_buffer(static_cast<std::size_t>(5120) * max_tokens);
+        DeviceBuffer tall_input    = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+        DeviceBuffer output        = bf16_buffer(static_cast<std::size_t>(17408 + 5120) * max_tokens);
+        WorkspaceArena workspace(std::max<std::size_t>({
+            ops::linear_workspace_capacity_bytes(format.first, 17408, 5120,
+                                                   ops::LinearPolicy::A16Only, 1, max_tokens),
+            ops::linear_workspace_capacity_bytes(format.first, 5120, 17408,
+                                                   ops::LinearPolicy::A16Only, 1, max_tokens),
+            256}));
+        SyntheticWeight gate_up = gguf_vector_weight(format.first, 34816, 5120);
+        DeviceBuffer fused_input = bf16_buffer(static_cast<std::size_t>(5120) * max_tokens);
+        std::vector<DeviceBuffer> fused_activations;
+        fused_activations.reserve(max_tokens);
+        for (std::int32_t tokens = 1; tokens <= max_tokens; ++tokens) {
+            fused_activations.emplace_back(ops::gguf::vector_activation_bytes(5120, tokens));
+            ops::gguf::quantize_vector_activation(
+                static_cast<const __nv_bfloat16*>(fused_input.p), 5120, tokens, nullptr,
+                fused_activations.back().p, nullptr);
+        }
+        DeviceBuffer fused_output = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+        const std::int64_t row_bytes =
+            static_cast<std::int64_t>(5120 / gguf_block_shape(format.first).elements) *
+            gguf_block_shape(format.first).bytes;
+        const Family family{
+            key,
+            widths,
+            [&](std::int32_t tokens, cudaStream_t stream) {
+                const Tensor wide_x(wide_input.p, DType::BF16, {5120, tokens});
+                const Tensor tall_x(tall_input.p, DType::BF16, {17408, tokens});
+                Tensor wide_out(output.p, DType::BF16, {17408, tokens});
+                Tensor tall_out(static_cast<std::uint8_t*>(output.p) +
+                                    static_cast<std::size_t>(17408) * tokens * sizeof(std::uint16_t),
+                                DType::BF16, {5120, tokens});
+                ops::linear(wide_x, wide.weight, wide_out, ops::LinearPolicy::A16Only, workspace, stream);
+                ops::linear(tall_x, tall.weight, tall_out, ops::LinearPolicy::A16Only, workspace, stream);
+            },
+            [&](std::int32_t tokens) {
+                return std::pair<const void*, std::size_t>{
+                    output.p, static_cast<std::size_t>(17408 + 5120) * tokens};
+            },
+            {}};
+        const Family fused_family{
+            key,
+            widths,
+            [&](std::int32_t tokens, cudaStream_t stream) {
+                ops::gguf::vector_swiglu(
+                    format.first == QType::GGUF_Q4_K ? ops::gguf::GgmlType::Q4_K
+                                                      : ops::gguf::GgmlType::Q6_K,
+                    gate_up.weight.qdata, row_bytes, 17408, 5120,
+                    fused_activations[static_cast<std::size_t>(tokens - 1)].p, tokens,
+                    static_cast<__nv_bfloat16*>(fused_output.p), 17408, stream);
+            },
+            [&](std::int32_t tokens) {
+                return std::pair<const void*, std::size_t>{
+                    fused_output.p, static_cast<std::size_t>(17408) * tokens};
+            },
+            {}};
+        auto bands = common_cooperative_bands(widths, sweep(family, timer, options),
+                                              sweep(fused_family, timer, options));
+        if (!bands.empty()) {
+            profile.routes[family.key] = std::move(bands);
+            ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+        }
+    }
+}
+
+// The formats whose matrix products have the asynchronous tile loop (ggml_bridge_mmq.cuh
+// async_matrix_key), with their key suffixes and bridge types.
+struct AsyncMatrixFormat {
+    QType qtype;
+    const char* name;
+    ops::gguf::GgmlType ggml;
+    bool dense = true; // false: the routed-expert matrix kernel only (IQ1_M)
+};
+constexpr AsyncMatrixFormat kAsyncMatrixFormats[] = {
+    {QType::GGUF_Q4_K, "q4_k", ops::gguf::GgmlType::Q4_K},
+    {QType::GGUF_Q5_K, "q5_k", ops::gguf::GgmlType::Q5_K},
+    {QType::GGUF_Q4_0, "q4_0", ops::gguf::GgmlType::Q4_0},
+    {QType::GGUF_Q5_0, "q5_0", ops::gguf::GgmlType::Q5_0},
+    {QType::GGUF_Q8_0, "q8_0", ops::gguf::GgmlType::Q8_0},
+    {QType::GGUF_IQ4_NL, "iq4_nl", ops::gguf::GgmlType::IQ4_NL},
+    {QType::GGUF_Q2_0, "q2_0", ops::gguf::GgmlType::Q2_0},
+    {QType::GGUF_IQ4_XS, "iq4_xs", ops::gguf::GgmlType::IQ4_XS},
+    {QType::GGUF_NVFP4, "nvfp4", ops::gguf::GgmlType::NVFP4},
+    {QType::GGUF_IQ1_M, "iq1_m", ops::gguf::GgmlType::IQ1_M, false},
+};
+
+void calibrate_gguf_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
+                           const CalibrationOptions& options, const AsyncMatrixFormat& format) {
+    constexpr std::int32_t max_tokens = 4096;
+    const std::vector<std::int32_t> widths = {9,    16,   17,   32,   33,   64,   65,   128, 129,
+                                              256,  512,  768,  1024, 1280, 1536, 2048, 3072, 4096};
+    const std::string key = std::string("gguf_matrix/") + format.name;
+    if (!format.dense || (!options.only.empty() && key.rfind(options.only, 0) != 0)) { return; }
+    SyntheticWeight wide    = gguf_vector_weight(format.qtype, 17408, 5120);
+    SyntheticWeight tall    = gguf_vector_weight(format.qtype, 5120, 17408);
+    DeviceBuffer wide_input = bf16_buffer(static_cast<std::size_t>(5120) * max_tokens);
+    DeviceBuffer tall_input = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+    DeviceBuffer output     = bf16_buffer(static_cast<std::size_t>(17408 + 5120) * max_tokens);
+    WorkspaceArena workspace(std::max<std::size_t>({
+        ops::linear_workspace_capacity_bytes(format.qtype, 17408, 5120,
+                                             ops::LinearPolicy::A16Only, widths.front(),
+                                             max_tokens),
+        ops::linear_workspace_capacity_bytes(format.qtype, 5120, 17408,
+                                             ops::LinearPolicy::A16Only, widths.front(),
+                                             max_tokens),
+        256}));
+    const Family family{
+        key,
+        widths,
+        [&](std::int32_t tokens, cudaStream_t stream) {
+            const Tensor wide_x(wide_input.p, DType::BF16, {5120, tokens});
+            const Tensor tall_x(tall_input.p, DType::BF16, {17408, tokens});
+            Tensor wide_out(output.p, DType::BF16, {17408, tokens});
+            Tensor tall_out(static_cast<std::uint8_t*>(output.p) +
+                                static_cast<std::size_t>(17408) * tokens * sizeof(std::uint16_t),
+                            DType::BF16, {5120, tokens});
+            ops::linear(wide_x, wide.weight, wide_out, ops::LinearPolicy::A16Only, workspace,
+                        stream);
+            ops::linear(tall_x, tall.weight, tall_out, ops::LinearPolicy::A16Only, workspace,
+                        stream);
+        },
+        [&](std::int32_t tokens) {
+            return std::pair<const void*, std::size_t>{
+                output.p, static_cast<std::size_t>(17408 + 5120) * tokens};
+        },
+        {}};
+    auto bands = sweep(family, timer, options);
+    if (!bands.empty()) {
+        profile.routes[family.key] = std::move(bands);
+        ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+    }
+}
+
+__global__ void cast_f32_to_bf16_kernel(const float* __restrict__ in,
+                                        __nv_bfloat16* __restrict__ out, std::size_t count) {
+    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) { out[i] = __float2bfloat16(in[i]); }
+}
+
+void calibrate_gguf_moe_matrix(ops::DeviceRouteProfile& profile, Timer& timer,
+                               const CalibrationOptions& options, const AsyncMatrixFormat& format) {
+    constexpr std::int32_t rows = 640;
+    constexpr std::int32_t k = 2560;
+    constexpr int experts = 64;
+    constexpr int per_token = 2;
+    const std::vector<std::int32_t> widths = {8, 16, 17, 32, 33, 48, 64, 65, 128, 256, 512, 1024};
+    const std::string key = std::string("gguf_moe_matrix/") + format.name;
+    if (!options.only.empty() && key.rfind(options.only, 0) != 0) { return; }
+    const GgufBlockShape block = gguf_block_shape(format.qtype);
+    std::vector<SyntheticWeight> weights;
+    std::vector<const void*> pointers;
+    weights.reserve(experts);
+    for (int expert = 0; expert < experts; ++expert) {
+        weights.push_back(gguf_vector_weight(format.qtype, rows, k,
+                                             0x2f6b91c3U + static_cast<std::uint32_t>(expert)));
+        pointers.push_back(weights.back().storage.p);
+    }
+    DeviceBuffer table_storage(experts * sizeof(const void*));
+    table_storage.copy_from_host(pointers.data(), table_storage.bytes);
+    const std::int32_t max_pairs = widths.back() * experts;
+    std::vector<std::int32_t> ids(max_pairs);
+    for (int p = 0; p < max_pairs; ++p) { ids[p] = p % experts; }
+    DeviceBuffer ids_device(ids.size() * sizeof(std::int32_t));
+    ids_device.copy_from_host(ids.data(), ids_device.bytes);
+    DeviceBuffer input = bf16_buffer(static_cast<std::size_t>(k) * (max_pairs / per_token));
+    DeviceBuffer plane(static_cast<std::size_t>(rows) * max_pairs * sizeof(float));
+    DeviceBuffer output = bf16_buffer(static_cast<std::size_t>(rows) * max_pairs);
+    struct Prepared {
+        DeviceBuffer routing_workspace;
+        ops::gguf::MoeRouting routing;
+        DeviceBuffer activation;
+    };
+    std::map<std::int32_t, Prepared> prepared;
+    for (const std::int32_t columns : widths) {
+        const std::int32_t pairs = columns * experts;
+        Prepared entry{DeviceBuffer(ops::gguf::moe_routing_bytes(experts, pairs)), {},
+                       DeviceBuffer(ops::gguf::moe_matrix_activation_bytes(k, pairs))};
+        entry.routing = ops::gguf::moe_sort_routes(
+            static_cast<const std::int32_t*>(ids_device.p), pairs, experts,
+            entry.routing_workspace.p, nullptr);
+        ops::gguf::quantize_moe_matrix_activation(
+            format.ggml, static_cast<const __nv_bfloat16*>(input.p), k,
+            entry.routing, pairs, per_token, entry.activation.p, nullptr);
+        prepared.emplace(columns, std::move(entry));
+    }
+    CUDA_CHECK(ninfer::wait_for_device());
+    const ops::gguf::MoeTable table{
+        reinterpret_cast<const void* const*>(table_storage.p),
+        static_cast<std::int64_t>(k / block.elements) * block.bytes, rows, k, true};
+    const Family family{
+        key,
+        widths,
+        [&](std::int32_t columns, cudaStream_t stream) {
+            const std::int32_t pairs = columns * experts;
+            const Prepared& entry = prepared.at(columns);
+            ops::gguf::moe_matrix_product(format.ggml, table, entry.routing,
+                                          experts, pairs, true, entry.activation.p,
+                                          static_cast<float*>(plane.p), stream);
+            const std::size_t count = static_cast<std::size_t>(rows) * pairs;
+            cast_f32_to_bf16_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0,
+                                      stream>>>(static_cast<const float*>(plane.p),
+                                                static_cast<__nv_bfloat16*>(output.p), count);
+        },
+        [&](std::int32_t columns) {
+            return std::pair<const void*, std::size_t>{
+                output.p, static_cast<std::size_t>(rows) * columns * experts};
+        },
+        {}};
+    auto bands = sweep(family, timer, options);
+    if (!bands.empty()) {
+        profile.routes[family.key] = std::move(bands);
+        ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+    }
+}
+
+void calibrate_gguf_moe_vector(ops::DeviceRouteProfile& profile, Timer& timer,
+                               const CalibrationOptions& options) {
+    constexpr std::int32_t rows = 640;
+    constexpr std::int32_t k = 2560;
+    constexpr int experts = 3;
+    constexpr int columns = 8;
+    constexpr int per_token = 2;
+    constexpr int pairs = columns * per_token;
+    const std::vector<std::int32_t> chunks = {1, 2, 4, 8};
+    const std::array<std::int32_t, pairs> ids = {2, 0, 1, 2, 1, 0, 2, 1,
+                                                 0, 2, 1, 0, 2, 1, 0, 2};
+    for (const auto& format : {std::pair{QType::GGUF_Q4_K, std::string("q4_k")},
+                               std::pair{QType::GGUF_Q6_K, std::string("q6_k")}}) {
+        const std::string key = "gguf_moe_vector/" + format.second;
+        if (!options.only.empty() && key.rfind(options.only, 0) != 0) { continue; }
+        const GgufBlockShape block = gguf_block_shape(format.first);
+        std::vector<SyntheticWeight> weights;
+        std::vector<const void*> expert_pointers;
+        weights.reserve(experts);
+        expert_pointers.reserve(experts);
+        for (int expert = 0; expert < experts; ++expert) {
+            weights.push_back(gguf_vector_weight(format.first, rows, k,
+                                                 0x51ed270bU + static_cast<std::uint32_t>(expert)));
+            expert_pointers.push_back(weights.back().storage.p);
+        }
+        DeviceBuffer table_storage(experts * sizeof(const void*));
+        table_storage.copy_from_host(expert_pointers.data(), table_storage.bytes);
+        std::vector<SyntheticWeight> gate_weights;
+        std::vector<SyntheticWeight> up_weights;
+        std::vector<const void*> gate_pointers;
+        std::vector<const void*> up_pointers;
+        gate_weights.reserve(experts);
+        up_weights.reserve(experts);
+        gate_pointers.reserve(experts);
+        up_pointers.reserve(experts);
+        for (int expert = 0; expert < experts; ++expert) {
+            gate_weights.push_back(gguf_vector_weight(
+                format.first, rows, k, 0x9135a2cdU + static_cast<std::uint32_t>(expert)));
+            up_weights.push_back(gguf_vector_weight(
+                format.first, rows, k, 0x7b2d15f3U + static_cast<std::uint32_t>(expert)));
+            gate_pointers.push_back(gate_weights.back().storage.p);
+            up_pointers.push_back(up_weights.back().storage.p);
+        }
+        DeviceBuffer gate_table_storage(experts * sizeof(const void*));
+        DeviceBuffer up_table_storage(experts * sizeof(const void*));
+        gate_table_storage.copy_from_host(gate_pointers.data(), gate_table_storage.bytes);
+        up_table_storage.copy_from_host(up_pointers.data(), up_table_storage.bytes);
+        DeviceBuffer input = bf16_buffer(static_cast<std::size_t>(k) * columns);
+        DeviceBuffer activation(ops::gguf::vector_activation_bytes(k, columns));
+        ops::gguf::quantize_vector_activation(static_cast<const __nv_bfloat16*>(input.p), k,
+                                             columns, nullptr, activation.p, nullptr);
+        DeviceBuffer ids_device(sizeof(ids));
+        ids_device.copy_from_host(ids.data(), sizeof(ids));
+        DeviceBuffer routing_workspace(ops::gguf::moe_routing_bytes(experts, pairs));
+        const ops::gguf::MoeRouting routing = ops::gguf::moe_sort_routes(
+            static_cast<const std::int32_t*>(ids_device.p), pairs, experts, routing_workspace.p,
+            nullptr);
+        DeviceBuffer output = bf16_buffer(static_cast<std::size_t>(rows) * pairs);
+        CUDA_CHECK(ninfer::wait_for_device());
+        const ops::gguf::MoeTable table{
+            reinterpret_cast<const void* const*>(table_storage.p),
+            static_cast<std::int64_t>(k / block.elements) * block.bytes, rows, k};
+        const ops::gguf::MoeTable gate_table{
+            reinterpret_cast<const void* const*>(gate_table_storage.p),
+            static_cast<std::int64_t>(k / block.elements) * block.bytes, rows, k};
+        const ops::gguf::MoeTable up_table{
+            reinterpret_cast<const void* const*>(up_table_storage.p),
+            static_cast<std::int64_t>(k / block.elements) * block.bytes, rows, k};
+        ops::gguf::MoeOutput result{};
+        result.bf16 = static_cast<__nv_bfloat16*>(output.p);
+        DeviceBuffer fused_output = bf16_buffer(static_cast<std::size_t>(rows) * pairs);
+        const Family family{
+            key,
+            chunks,
+            [&](std::int32_t chunk, cudaStream_t stream) {
+                ops::gguf::moe_vector_product(
+                    format.first == QType::GGUF_Q4_K ? ops::gguf::GgmlType::Q4_K
+                                                      : ops::gguf::GgmlType::Q6_K,
+                    table, routing, experts, per_token, per_token, activation.p, columns, result,
+                    chunk, stream);
+            },
+            [&](std::int32_t) {
+                return std::pair<const void*, std::size_t>{output.p,
+                                                          static_cast<std::size_t>(rows) * pairs};
+            },
+            {}};
+        const Family fused_family{
+            key,
+            chunks,
+            [&](std::int32_t chunk, cudaStream_t stream) {
+                ops::gguf::moe_vector_swiglu(
+                    format.first == QType::GGUF_Q4_K ? ops::gguf::GgmlType::Q4_K
+                                                      : ops::gguf::GgmlType::Q6_K,
+                    gate_table, up_table, routing, experts, per_token, activation.p, columns,
+                    static_cast<__nv_bfloat16*>(fused_output.p), chunk, stream);
+            },
+            [&](std::int32_t) {
+                return std::pair<const void*, std::size_t>{fused_output.p,
+                                                          static_cast<std::size_t>(rows) * pairs};
+            },
+            {}};
+        auto bands = common_cooperative_bands(chunks, sweep(family, timer, options),
+                                              sweep(fused_family, timer, options));
+        if (!bands.empty()) {
+            profile.routes[family.key] = std::move(bands);
+            ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+        }
+    }
+}
+
+void calibrate_gguf_moe_up(ops::DeviceRouteProfile& profile, Timer& timer,
+                           const CalibrationOptions& options) {
+    constexpr std::int32_t rows = 640;
+    constexpr std::int32_t k = 2560;
+    constexpr int experts = 3;
+    constexpr int slots = 8;
+    const std::vector<std::int32_t> chunks = {1, 2, 4};
+    const std::array<std::int32_t, slots> ids = {2, 0, 1, 2, 1, 0, 2, 1};
+    for (const auto& format : {std::pair{QType::GGUF_Q4_K, std::string("q4_k")},
+                               std::pair{QType::GGUF_Q6_K, std::string("q6_k")}}) {
+        const std::string key = "gguf_moe_up/" + format.second;
+        if (!options.only.empty() && key.rfind(options.only, 0) != 0) { continue; }
+        const GgufBlockShape block = gguf_block_shape(format.first);
+        std::vector<SyntheticWeight> gate_weights;
+        std::vector<SyntheticWeight> up_weights;
+        std::vector<const void*> gate_pointers;
+        std::vector<const void*> up_pointers;
+        gate_weights.reserve(experts);
+        up_weights.reserve(experts);
+        gate_pointers.reserve(experts);
+        up_pointers.reserve(experts);
+        for (int expert = 0; expert < experts; ++expert) {
+            gate_weights.push_back(gguf_vector_weight(
+                format.first, rows, k, 0x51ed270bU + static_cast<std::uint32_t>(expert)));
+            up_weights.push_back(gguf_vector_weight(
+                format.first, rows, k, 0x9e3779b9U + static_cast<std::uint32_t>(expert)));
+            gate_pointers.push_back(gate_weights.back().storage.p);
+            up_pointers.push_back(up_weights.back().storage.p);
+        }
+        DeviceBuffer gate_table(experts * sizeof(const void*));
+        DeviceBuffer up_table(experts * sizeof(const void*));
+        gate_table.copy_from_host(gate_pointers.data(), gate_table.bytes);
+        up_table.copy_from_host(up_pointers.data(), up_table.bytes);
+        DeviceBuffer input = bf16_buffer(static_cast<std::size_t>(k) * slots);
+        DeviceBuffer ids_device(sizeof(ids));
+        ids_device.copy_from_host(ids.data(), sizeof(ids));
+        DeviceBuffer output = bf16_buffer(static_cast<std::size_t>(rows) * slots);
+        CUDA_CHECK(ninfer::wait_for_device());
+        ops::gguf::MoeDecodeUpArgs args{};
+        args.m = static_cast<const __nv_bfloat16*>(input.p);
+        args.k = k;
+        args.rows = rows;
+        args.ids = static_cast<const std::int32_t*>(ids_device.p);
+        args.slots = slots;
+        args.per_token = 1;
+        args.gate = reinterpret_cast<const std::uint8_t* const*>(gate_table.p);
+        args.up = reinterpret_cast<const std::uint8_t* const*>(up_table.p);
+        args.row_bytes = static_cast<std::int64_t>(k / block.elements) * block.bytes;
+        args.middle = static_cast<__nv_bfloat16*>(output.p);
+        const Family family{
+            key,
+            chunks,
+            [&](std::int32_t chunk, cudaStream_t stream) {
+                ops::gguf::moe_decode_up(
+                    format.first == QType::GGUF_Q4_K ? ops::gguf::GgmlType::Q4_K
+                                                      : ops::gguf::GgmlType::Q6_K,
+                    args, chunk, stream);
+            },
+            [&](std::int32_t) {
+                return std::pair<const void*, std::size_t>{output.p,
+                                                          static_cast<std::size_t>(rows) * slots};
+            },
+            {}};
+        auto bands = sweep(family, timer, options);
+        if (!bands.empty()) {
+            profile.routes[family.key] = std::move(bands);
+            ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+        }
+    }
 }
 
 // Ternary Bonsai 2 27B projections, in the launches the model makes: the GDN and attention input
@@ -435,7 +991,8 @@ void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
     const auto reset_residual = [&]() {
-        CUDA_CHECK(cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
     const std::vector<Family> families = {
         {"t2_i8_small/4096+12288x5120", decode_widths(), gdn_pair, view(qkv, 10240), {}},
@@ -505,7 +1062,8 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
     const auto reset_residual = [&]() {
-        CUDA_CHECK(cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
 
     const std::vector<Family> families = {
@@ -636,6 +1194,174 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
     }
 }
 
+// The NVFP4 fused projections: the A16 chain choice under the four `unified/nvfp4_*` keys, and the
+// mainloop choice of the int8 family under the four `nvfp4_int8_*` keys (--nvfp4-w4a8-int). Both
+// families are measured through the same dispatch the serving call takes, so the route table under
+// test decides the kernel in both arms.
+//
+// Under A16Only every chain is registered at every width a fused launch serves, so the A16 keys
+// are a W4A16 chain choice and nothing else: the own chain's per-width kernels against the unified
+// chain's own, which is a 32-token tiling loop against one launch at prefill widths and two
+// distinct small-T kernel families below them. Past 16 columns both chains resolve to the same wide
+// fused A16 MMA kernel, so the SwiGLU A16 key stops there: above it there is no switch to measure.
+// The int8 keys cover every width -- that family pads rather than stopping at 16.
+void calibrate_nvfp4_fused(ops::DeviceRouteProfile& profile, Timer& timer,
+                           const CalibrationOptions& options) {
+    // A card that cannot select the unified table has no switch onto it to measure.
+    if (!ops::detail::unified_linear_routes_here()) { return; }
+    constexpr std::int32_t hidden     = 5120;
+    constexpr std::int32_t max_tokens = 1024;
+    SyntheticWeight attn     = block_scale_nvfp4_weight(14336, hidden);
+    SyntheticWeight gdn      = block_scale_nvfp4_weight(16384, hidden);
+    SyntheticWeight out_proj = block_scale_nvfp4_weight(hidden, 6144);
+    SyntheticWeight down     = block_scale_nvfp4_weight(hidden, 17408);
+    SyntheticWeight gate_up  = block_scale_nvfp4_weight(34816, hidden);
+    DeviceBuffer x_hidden   = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+    DeviceBuffer x_mixer    = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+    DeviceBuffer x_inter    = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+    DeviceBuffer q          = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+    DeviceBuffer gate       = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+    DeviceBuffer k_plane    = bf16_buffer(static_cast<std::size_t>(1024) * max_tokens);
+    DeviceBuffer v_plane    = bf16_buffer(static_cast<std::size_t>(1024) * max_tokens);
+    DeviceBuffer qkv        = bf16_buffer(static_cast<std::size_t>(10240) * max_tokens);
+    DeviceBuffer z_plane    = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
+    DeviceBuffer residual   = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+    DeviceBuffer swiglu_out = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+    // The row feeding an input projection is the RMSNorm of the residual, and the int8 route can
+    // fold that norm into its own quantise pass. Both halves of the comparison therefore need the
+    // norm's weight and the BF16 row the non-folding arm writes.
+    DeviceBuffer norm_weight        = bf16_buffer(static_cast<std::size_t>(hidden));
+    DeviceBuffer x_normed           = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+    constexpr float kNormEps        = 1e-6F;
+    WorkspaceArena workspace(256ULL << 20);
+
+    const auto tensor = [](DeviceBuffer& buffer, std::int32_t rows, std::int32_t cols) {
+        return Tensor(buffer.p, DType::BF16, {rows, cols});
+    };
+    const auto view = [](DeviceBuffer& buffer, std::size_t rows) {
+        return [&buffer, rows](std::int32_t cols) {
+            return std::pair<const void*, std::size_t>{buffer.p,
+                                                       rows * static_cast<std::size_t>(cols)};
+        };
+    };
+    DeviceBuffer residual_pristine = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
+    const auto reset_residual      = [&]() {
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
+    };
+
+    const auto attn_run = [&](ops::LinearPolicy policy, std::int32_t cols, cudaStream_t stream) {
+        auto scope      = workspace.scope();
+        Tensor q_out    = tensor(q, 6144, cols);
+        Tensor gate_out = tensor(gate, 6144, cols);
+        Tensor k_out    = tensor(k_plane, 1024, cols);
+        Tensor v_out    = tensor(v_plane, 1024, cols);
+        // Under the int8 policy the timed region is the edge: if the fused entry is eligible under
+        // the route state this candidate is timed in it runs, otherwise the standalone rmsnorm is
+        // issued first. Both arms are charged for what they really pay, and an A16 arm is a bare
+        // projection because both of its sides pay the same norm.
+        if (policy == ops::LinearPolicy::AllowNvfp4Int8) {
+            Tensor normed = tensor(x_normed, hidden, cols);
+            if (ops::attn_input_proj_fused_rmsnorm_int8_eligible(attn.weight, policy, cols)) {
+                ops::attn_input_proj_fused_rmsnorm_int8(tensor(residual, hidden, cols),
+                                                        tensor(norm_weight, hidden, 1), kNormEps,
+                                                        attn.weight, q_out, gate_out, k_out, v_out,
+                                                        policy, workspace, stream);
+                return;
+            }
+            ops::rmsnorm(tensor(residual, hidden, cols), tensor(norm_weight, hidden, 1), kNormEps,
+                         true, normed, stream);
+            ops::detail::nvfp4_attn_input_dispatch(normed, attn.weight, q_out, gate_out, k_out,
+                                                   v_out, policy, &workspace, stream);
+            return;
+        }
+        ops::detail::nvfp4_attn_input_dispatch(tensor(x_hidden, hidden, cols), attn.weight, q_out,
+                                               gate_out, k_out, v_out, policy, &workspace, stream);
+    };
+    const auto gdn_run = [&](ops::LinearPolicy policy, std::int32_t cols, cudaStream_t stream) {
+        auto scope     = workspace.scope();
+        Tensor x       = tensor(x_hidden, hidden, cols);
+        Tensor qkv_out = tensor(qkv, 10240, cols);
+        Tensor z_out   = tensor(z_plane, 6144, cols);
+        ops::detail::nvfp4_gdn_input_dispatch(x, gdn.weight, qkv_out, z_out, policy, &workspace,
+                                              stream);
+    };
+    // One key steers both residual adds, so a run exercises the pair the way a layer does.
+    const auto add_run = [&](ops::LinearPolicy policy, std::int32_t cols, cudaStream_t stream) {
+        auto scope = workspace.scope();
+        Tensor x   = tensor(x_mixer, 6144, cols);
+        Tensor res = tensor(residual, hidden, cols);
+        ops::detail::nvfp4_linear_add_dispatch(x, out_proj.weight, res, policy, workspace, stream);
+        Tensor x2   = tensor(x_inter, 17408, cols);
+        Tensor res2 = tensor(residual, hidden, cols);
+        ops::detail::nvfp4_linear_add_dispatch(x2, down.weight, res2, policy, workspace, stream);
+    };
+    const auto swiglu_run = [&](ops::LinearPolicy policy, std::int32_t cols,
+                                cudaStream_t stream) {
+        auto scope = workspace.scope();
+        Tensor o   = tensor(swiglu_out, 17408, cols);
+        if (policy == ops::LinearPolicy::AllowNvfp4Int8) {
+            Tensor normed = tensor(x_normed, hidden, cols);
+            if (ops::linear_swiglu_fused_rmsnorm_int8_eligible(gate_up.weight, policy, cols)) {
+                ops::linear_swiglu_fused_rmsnorm_int8(tensor(residual, hidden, cols),
+                                                      tensor(norm_weight, hidden, 1), kNormEps,
+                                                      gate_up.weight, o, policy, workspace, stream);
+                return;
+            }
+            ops::rmsnorm(tensor(residual, hidden, cols), tensor(norm_weight, hidden, 1), kNormEps,
+                         true, normed, stream);
+            ops::detail::nvfp4_linear_swiglu_dispatch(normed, gate_up.weight, o, policy, workspace,
+                                                      stream);
+            return;
+        }
+        ops::detail::nvfp4_linear_swiglu_dispatch(tensor(x_hidden, hidden, cols), gate_up.weight, o,
+                                                  policy, workspace, stream);
+    };
+
+    // The decode step, the speculative verify widths, the small-T band, and the prefill chunks a
+    // 27B serves: the bands a profile stores have to answer all of them.
+    const std::vector<std::int32_t> widths = {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 12, 14,
+                                              16, 20, 24, 28, 32, 48, 64, 96, 128, 256, 512, 1024};
+    const std::vector<std::int32_t> small_t_widths = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16};
+    const auto bind_policy = [](const auto& run, ops::LinearPolicy policy) {
+        return std::function<void(std::int32_t, cudaStream_t)>(
+            [&run, policy](std::int32_t cols, cudaStream_t stream) { run(policy, cols, stream); });
+    };
+    const std::vector<Family> families = {
+        {"unified/nvfp4_attn_input", widths, bind_policy(attn_run, ops::LinearPolicy::A16Only),
+         view(q, 6144), {}},
+        {"unified/nvfp4_gdn_input", widths, bind_policy(gdn_run, ops::LinearPolicy::A16Only),
+         view(qkv, 10240), {}},
+        {"unified/nvfp4_linear_add", widths, bind_policy(add_run, ops::LinearPolicy::A16Only),
+         view(residual, hidden), reset_residual},
+        {"unified/nvfp4_linear_swiglu", small_t_widths,
+         bind_policy(swiglu_run, ops::LinearPolicy::A16Only), view(swiglu_out, 17408), {}},
+    };
+    // The int8 family's own four keys: the same weights and buffers, only the policy differs, so
+    // the sweep measures which chain's int8 mainloop answers at each width.
+    const std::vector<Family> int8_families = {
+        {"nvfp4_int8/attn_input", widths,
+         bind_policy(attn_run, ops::LinearPolicy::AllowNvfp4Int8), view(q, 6144), {}},
+        {"nvfp4_int8/gdn_input", widths,
+         bind_policy(gdn_run, ops::LinearPolicy::AllowNvfp4Int8), view(qkv, 10240), {}},
+        {"nvfp4_int8/linear_add", widths,
+         bind_policy(add_run, ops::LinearPolicy::AllowNvfp4Int8), view(residual, hidden),
+         reset_residual},
+        {"nvfp4_int8/linear_swiglu", widths,
+         bind_policy(swiglu_run, ops::LinearPolicy::AllowNvfp4Int8), view(swiglu_out, 17408), {}},
+    };
+    for (const auto* set : {&families, &int8_families}) {
+        for (const Family& family : *set) {
+            auto bands = sweep(family, timer, options);
+            if (!bands.empty()) {
+                profile.routes[family.key] = std::move(bands);
+                ops::install_device_route_profile(
+                    std::make_shared<const ops::DeviceRouteProfile>(profile));
+            }
+        }
+    }
+}
+
 // The cuBLAS prefill route's width gate (--prefill-cublas) per Op, through the public Ops under
 // AllowPrefillCublas, at the 27B's registered shapes. Each Op is timed twice: at widths the integer
 // A8 mainloop cannot take, where the A16 mainloop is the alternative, and at multiples of its
@@ -715,8 +1441,8 @@ void calibrate_cublas_prefill(ops::DeviceRouteProfile& profile, Timer& timer,
         };
     };
     const auto reset_residual = [&]() {
-        CUDA_CHECK(
-            cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
+        CUDA_CHECK(ninfer::copy_and_wait(residual.p, residual_pristine.p, residual.bytes,
+                                         cudaMemcpyDeviceToDevice));
     };
     const auto run_gate_up = [&](std::int32_t cols, cudaStream_t stream) {
         Tensor x = tensor(x_hidden, hidden, cols), o = tensor(swiglu_out, 17408, cols);
@@ -1044,7 +1770,7 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
                     std::make_shared<const ops::DeviceRouteProfile>(profile));
             }
         }
-        // Key splits of the fast prompt kernel (prompt_i8_fast_plan.h) against unsplit launches,
+        // Key splits of the fast prompt kernel (int8/prompt_fast_plan.h) against unsplit launches,
         // where the fast kernel now serves prompts: a 256-token continuation at 32K and 131K of
         // context, where few row blocks leave SMs idle, and a wave-aligned chunk at 131K. The
         // split partials need their own workspace, sized with the fast kernel selected.
@@ -1199,6 +1925,7 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     ops::DeviceRouteProfile profile;
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
+    ops::install_device_route_profile(device, nullptr);
     cudaDeviceProp properties{};
     CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
     profile.multiprocessors = properties.multiProcessorCount;
@@ -1207,14 +1934,29 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     // The families outside a Volta card's catalog (calibration/route_catalog.cpp) steer routes it
     // never takes.
     const bool projections = !ops::current_device_volta();
-    const bool attention   = projections && options.attention;
-    if (projections && options.ternary) { calibrate_ternary(profile, timer, options); }
-    if (projections && options.groupwise) {
-        calibrate_groupwise(profile, timer, options);
-        calibrate_cublas_prefill(profile, timer, options);
-        calibrate_q8_ksplit(profile, timer, options);
+    const bool gguf_only   = options.only.rfind("gguf_", 0) == 0;
+    const bool attention   = projections && options.attention && !gguf_only;
+    if (projections && options.ternary && !gguf_only) {
+        calibrate_ternary(profile, timer, options);
     }
-    if (options.linear_attention) { calibrate_linear_attention(profile, timer, options); }
+    if (options.groupwise) {
+        if (projections && !gguf_only) {
+            calibrate_groupwise(profile, timer, options);
+            calibrate_cublas_prefill(profile, timer, options);
+            calibrate_q8_ksplit(profile, timer, options);
+        }
+        calibrate_gguf_vector(profile, timer, options);
+        calibrate_gguf_moe_vector(profile, timer, options);
+        calibrate_gguf_moe_up(profile, timer, options);
+        if (projections && !ops::turing_shapes_here()) {
+            for (const AsyncMatrixFormat& format : kAsyncMatrixFormats) {
+                calibrate_gguf_matrix(profile, timer, options, format);
+                calibrate_gguf_moe_matrix(profile, timer, options, format);
+            }
+        }
+    }
+    if (projections && options.nvfp4 && !gguf_only) { calibrate_nvfp4_fused(profile, timer, options); }
+    if (options.linear_attention && !gguf_only) { calibrate_linear_attention(profile, timer, options); }
     if (attention) {
         calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
                             "rk8v4");
