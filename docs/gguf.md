@@ -29,7 +29,10 @@ those of `ggml-quants.c`.
 - **Up to eight columns** (decode, speculative verification, small batches), the vector kernel
   (`src/ops/linear/gguf/ggml_bridge_vec.cuh`) decodes each 32-value slice of a row once into int8
   words and dots it with every column. A warp owns two rows; a `[gate; up]` pair of one type is one
-  launch that writes `silu(gate) * up`.
+  launch that writes `silu(gate) * up`. A layer's separate products of one input format (Inkling's
+  query, gate, relative, key and value rows; Gemma 4's and Flint's query, key and value parts of
+  one block type) share launches of up to four products and 10 blocks per SM, each product's rows
+  computed as alone, so the outputs are the same bits.
 - **More columns** (prompts) take llama.cpp's integer tensor-core kernel (`mul_mat_q`, vendored
   unmodified in `third_party/ggml-quants` under its MIT license) with its Ampere tile table.
   `IQ1_M` has no such kernel; its wide products dequantize to BF16 and run cuBLAS.
