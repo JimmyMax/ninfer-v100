@@ -17,8 +17,8 @@ Inkling 2 Mini（looped MoE，26.4B params，3.4B active）在 V100 上完整运
 
 | 指标 | 值 |
 |---|---|
-| decode | **~70 tok/s**（DSpark 3 drafts，42% accepted） |
-| prefill | **~12,500 tok/s** |
+| decode | **~70-94 tok/s**（DSpark 3 drafts，42% accepted） |
+| prefill | **~1000-1300 tok/s**（新鲜 prompt；prefix cache 命中时 ~12K tok/s） |
 | max context | **600,000 tokens**（int8 KV，VRAM 32 GB 满） |
 | plain decode（--spec none） | ~66 tok/s |
 

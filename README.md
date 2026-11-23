@@ -245,7 +245,7 @@ int8 KV, `--expert-residency device`, 600K-token context:
 
 | Decode | Prefill | Context | Notes |
 |---:|---:|---:|---|
-| **~70 tok/s** (DSpark 3 drafts, 42% accepted) | ~12.5K tok/s | 600K tokens | 24 layers, 48 visits; NVFP4 experts software-emulated on sm_70 |
+| **~70-94 tok/s** (DSpark 3 drafts, 42% accepted) | **~1000-1300 tok/s** | 600K tokens | 24 layers, 48 visits; NVFP4 experts software-emulated on sm_70 |
 
 DSpark is the artifact's drafter (3 layers over a block of 8); it starts automatically with the
 artifact. `--spec none` disables it for pure decode (~66 tok/s). The NVFP4 experts are the decode
