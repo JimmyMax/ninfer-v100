@@ -41,7 +41,10 @@ namespace ninfer::product {
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
     if (!std::isfinite(options.draft_min_p) || options.draft_min_p < 0 ||
         options.draft_min_p > 1 ||
-        (options.draft_min_p != 0 && options.backend != SpeculativeBackend::Mtp)) {
+        (options.draft_min_p != 0 && options.backend != SpeculativeBackend::Mtp &&
+         options.backend != SpeculativeBackend::None)) {
+        // backend None keeps a user --draft-min-p for the same inkling2 auto-DSpark tuning as
+        // --draft-tokens above.
         throw std::invalid_argument("--draft-min-p requires --spec mtp and a finite value in [0,1]");
     }
     if (options.ngram_archive_bytes != 0 &&
@@ -67,7 +70,11 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     }
     switch (options.backend) {
     case SpeculativeBackend::None:
-        if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Auto) {
+        // --draft-tokens without --spec is how an inkling2 user tunes the artifact's auto-enabled
+        // DSpark drafter; other families reject it here and the inkling2 core validates the range
+        // against the artifact's block size. --lm-head-draft/--full-draft-head stay strict.
+        if (options.proposal_head != ProposalHead::Auto ||
+            (options.draft_tokens != 0 && options.draft_tokens > 7)) {
             throw std::invalid_argument("--draft-tokens, --lm-head-draft and --full-draft-head "
                                         "require --spec mtp|dflash|dflash2");
         }

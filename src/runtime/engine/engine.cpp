@@ -59,9 +59,13 @@ EngineOptions with_family_options(EngineOptions options) {
     }
     if (inkling2 && !options.speculative.spec_explicit && options.max_concurrency == 1 &&
         artifact::Reader(options.artifact_path).directory().components.contains("dspark")) {
-        options.speculative.backend      = SpeculativeBackend::DSpark;
-        options.speculative.draft_tokens = SpeculativeOptions::kAutomaticDSparkTokens;
-        options.speculative.mtp_policy   = MtpDraftPolicy::Adaptive;
+        options.speculative.backend = SpeculativeBackend::DSpark;
+        // An explicit --draft-tokens/--draft-min-p wins over the automatic defaults; only fill
+        // in what the user left unset (0 means "not given" for both).
+        if (options.speculative.draft_tokens == 0) {
+            options.speculative.draft_tokens = SpeculativeOptions::kAutomaticDSparkTokens;
+        }
+        options.speculative.mtp_policy = MtpDraftPolicy::Adaptive;
         if (!options.speculative.draft_min_p) {
             options.speculative.draft_min_p = SpeculativeOptions::kAutomaticDSparkMinP;
         }
