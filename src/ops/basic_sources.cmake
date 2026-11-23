@@ -1,15 +1,26 @@
+if(NINFER_WINDOWS_KERNEL_DLL)
+  # Both the GGML bridge and Ops use one device-tier probe and cache, and one store of installed
+  # route profiles, in the DLL: the bridge's vector kernels read their schedules from the profiles.
+  add_library(ninfer_device_tier OBJECT "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
+  ninfer_internal_includes(ninfer_device_tier)
+  ninfer_cuda_archive(ninfer_device_tier)
+  add_library(ninfer_device_route OBJECT "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp")
+  ninfer_internal_includes(ninfer_device_route)
+  target_link_libraries(ninfer_device_route PRIVATE ${NINFER_CUDART_TARGET})
+else()
+  target_sources(ninfer_ops PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
+endif()
+
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/add_bias.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/argmax.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/cast.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/causal_conv1d.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/embed_gather.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gdn_gating.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/launcher/gqa_attention_volta_flash.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/launcher/volta_flash_llama.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gelu.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/hadamard_transform.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/l2norm.cu"
@@ -27,11 +38,12 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/rmsnorm_pack_tail.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/rope.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/sampling.cu"
-  "${CMAKE_CURRENT_LIST_DIR}/launcher/readout_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/scalar.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/scatter.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/sigmoid_gate_mul.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/silu_and_mul.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/steer_residual.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/readout_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/target_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/vision_pos_embed.cu"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/add_bias.cpp"
@@ -57,7 +69,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/rmsnorm_pack_tail.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/rope.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/sampling.cpp"
-  "${CMAKE_CURRENT_LIST_DIR}/wrapper/readout_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/scalar.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/scatter.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/sigmoid_mul.cpp"
@@ -66,13 +77,18 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/ple_inject/ngram_rows.cu"
   "${CMAKE_CURRENT_LIST_DIR}/qsa_indexer/qsa_indexer.cu"
   "${CMAKE_CURRENT_LIST_DIR}/sparse_attention/sparse_attention.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kv_stream/kv_stream.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_route/moe_route.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_experts_bf16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_experts_gguf.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_latent_gguf.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_expert_prefetch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_experts_native.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_expert_cpu.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/silu_mul.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/wrapper/steer_residual.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/wrapper/readout_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/target_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pos_embed.cpp"
 )
@@ -111,34 +127,5 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
       PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512dq;-mf16c;-mfma"
       COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
-  endif()
-endif()
-
-# The CPU experts' fast arithmetic: ggml-cpu's vecdot kernels, vendored as C translation units
-# (llama.cpp a25c9865, MIT), plus the C++ wrapper in the ops directory.
-set(ggml_cpu_dir "${PROJECT_SOURCE_DIR}/third_party/ggml-quants")
-set(ggml_cpu_includes "-I${ggml_cpu_dir}/include;-I${ggml_cpu_dir}/src;-I${ggml_cpu_dir}/src/ggml-cpu")
-if(NOT MSVC)
-  set(ggml_cpu_includes "${ggml_cpu_includes};${gguf_cpu_no_contract}")
-endif()
-target_sources(ninfer_ops PRIVATE
-  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_ggml.cpp"
-  "${ggml_cpu_dir}/src/ggml-quants.c"
-  "${ggml_cpu_dir}/src/ggml-cpu/quants.c"
-  "${ggml_cpu_dir}/src/ggml-cpu/quants_host.c")
-set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_ggml.cpp"
-  PROPERTIES COMPILE_OPTIONS "${ggml_cpu_includes}")
-set_source_files_properties("${ggml_cpu_dir}/src/ggml-quants.c"
-  "${ggml_cpu_dir}/src/ggml-cpu/quants.c"
-  "${ggml_cpu_dir}/src/ggml-cpu/quants_host.c"
-  PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes}")
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
-  target_sources(ninfer_ops PRIVATE "${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c")
-  if(MSVC)
-    set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
-      PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};/arch:AVX2")
-  else()
-    set_source_files_properties("${ggml_cpu_dir}/src/ggml-cpu/arch/x86/quants.c"
-      PROPERTIES C_STANDARD 11 COMPILE_OPTIONS "${ggml_cpu_includes};-mavx2;-mfma")
   endif()
 endif()
