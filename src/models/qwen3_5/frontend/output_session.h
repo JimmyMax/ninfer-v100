@@ -1,4 +1,6 @@
 #pragma once
+#include "ninfer/base.h"
+#include "ninfer/observability/execution.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
@@ -16,6 +18,9 @@ namespace frontend {
 class Tokenizer;
 struct ToolCallOutputContract;
 struct GemmaMarkers;
+struct FlintMarkers;
+struct DeepSeekMarkers;
+struct InklingMarkers;
 } // namespace frontend
 class Frontend;
 
@@ -89,6 +94,9 @@ public:
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;
     // True once a session that began inside a reasoning block has committed its close.
     [[nodiscard]] bool reasoning_closed() const noexcept;
+    // The reasoning opener a model that opens its own reasoning (Inkling, Flint, Gemma) cannot
+    // write again after an early close.
+    [[nodiscard]] std::optional<TokenId> banned_token() const noexcept;
     [[nodiscard]] std::optional<std::string> matched_stop_string() const;
 
 private:
@@ -97,8 +105,11 @@ private:
                   OutputOptions output, bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
                   std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
-                  std::shared_ptr<text::GrammarState> grammar          = {},
-                  std::shared_ptr<const frontend::GemmaMarkers> gemma = {});
+                  std::shared_ptr<text::GrammarState> grammar               = {},
+                  std::shared_ptr<const frontend::GemmaMarkers> gemma       = {},
+                  std::shared_ptr<const frontend::FlintMarkers> flint       = {},
+                  std::shared_ptr<const frontend::DeepSeekMarkers> deepseek = {},
+                  std::shared_ptr<const frontend::InklingMarkers> inkling   = {});
     std::unique_ptr<Impl> impl_;
 
     friend class Frontend;

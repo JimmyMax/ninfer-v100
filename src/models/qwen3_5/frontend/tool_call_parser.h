@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::frontend {
@@ -93,12 +94,24 @@ struct ParsedToolCallOutput {
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled,
                                 std::string_view forced_tool_name = {});
 
+// A call whose arguments came as untyped text, (name, value) pairs in order (Qwen's syntax and
+// Flint's), with each value read by its declared parameter's types; a mismatch or an undeclared
+// parameter is counted in `diagnostics` and kept.
+[[nodiscard]] GeneratedToolCall normalize_untyped_tool_call(
+    std::string_view name, std::span<const std::pair<std::string_view, std::string_view>> arguments,
+    const ToolCallOutputContract& contract, ToolCallParseDiagnostics& diagnostics);
+
 // Native Qwen tool-call envelope for a structured final-response request. A strict tool's
 // arguments follow its parameters' JSON Schema; another's remain non-strict values, with each
 // declared parameter emitted at most once in declaration order.
 [[nodiscard]] std::string structured_tool_call_format(const ToolCallOutputContract& contract);
 
 [[nodiscard]] bool has_strict_tools(const ToolCallOutputContract& contract) noexcept;
+
+// A strict tool's parameters' JSON Schema, normalized, under which its arguments are generated. A
+// schema strict arguments cannot honor (unsupported, not an object, or uniqueItems, which only the
+// final-response path enforces) throws std::invalid_argument.
+[[nodiscard]] std::string strict_tool_parameters_schema(const ToolCallOutputContract::Tool& tool);
 
 // For a response without a structured final format: free text in which every tool call follows
 // the envelope above, starting inside the forced call when the prompt opened one. An XGrammar

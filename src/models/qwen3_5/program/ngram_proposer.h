@@ -1,13 +1,18 @@
 #pragma once
 
+#include "core/zero_pages.h"
 #include "models/qwen3_5/ngram.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <exception>
 #include <limits>
+#include <memory>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -18,7 +23,10 @@
 namespace ninfer::models::qwen3_5::detail {
 
 // A bounded, position-indexed proposal corpus. It never owns target state.
-// Absolute positions make overwritten ring entries rejectable before a read.
+// Absolute positions make overwritten ring entries rejectable before a read. The ring and the
+// buckets live on zero pages (an empty bucket entry has width 0, which no window has, and a ring
+// position is read only once written), so a request pays for the pages its tokens reach rather
+// than for the whole 36 MiB at construction.
 class NgramProposer {
 public:
     using Token = std::int32_t;
@@ -32,7 +40,7 @@ public:
 
     explicit NgramProposer(std::size_t token_capacity = 1U << 20,
                            std::size_t bucket_count   = 1U << 19)
-        : tokens_(power_of_two(token_capacity) && token_capacity >= 64 ? token_capacity : 0, -1),
+        : tokens_(power_of_two(token_capacity) && token_capacity >= 64 ? token_capacity : 0),
           buckets_(power_of_two(bucket_count) ? bucket_count : 0),
           token_mask_(token_capacity - 1U) {
         if (tokens_.empty() || buckets_.empty()) {
@@ -59,6 +67,14 @@ public:
     // never spans a boundary, so the input holds exactly the tokens the ring then holds, and the
     // index is the one token-by-token append() builds.
     void ingest(std::span<const Token> tokens) {
+        // Three windows per token land in random buckets, so a span this long reaches most of
+        // the 32 MiB table's 4 KiB pages; fault it in 2 MiB pages instead (measured under WSL2:
+        // 3.6K tokens 23 -> 1.6 ms, 28K 34 -> 2.2 ms). Shorter spans touch few pages, which
+        // huge pages would make cost more (24 tokens 0.16 -> 1.1 ms).
+        if (tokens.size() >= kHugePageIngestTokens && !huge_buckets_) {
+            buckets_.advise_huge_pages();
+            huge_buckets_ = true;
+        }
         boundary();
         constexpr std::size_t kLookahead = 8;
         std::array<std::array<std::uint64_t, widths_.size()>, kLookahead> ahead{};
@@ -163,9 +179,11 @@ private:
     };
 
     static constexpr std::array<std::uint32_t, 3> widths_{16, 8, 4};
-    std::vector<Token> tokens_;
+    static constexpr std::size_t kHugePageIngestTokens = 256;
+    ZeroPageArray<Token> tokens_;
     std::vector<Token> boundaries_;
-    std::vector<std::array<Entry, 4>> buckets_;
+    ZeroPageArray<std::array<Entry, 4>> buckets_;
+    bool huge_buckets_ = false;
     std::uint64_t token_mask_    = 0;
     std::uint64_t end_           = 0;
     std::uint64_t segment_start_ = 0;
@@ -235,6 +253,48 @@ private:
         for (std::uint32_t j = 0; j < n; ++j) { h = mix(h, at(p + j)); }
         return finalize_hash(h);
     }
+};
+
+// A request's live ngram index built on a thread of its own: the prompt tokens, then each
+// proposal source, one ingest() span apiece. Its first proposal is in the request's first decode
+// round, after its prefill, so the build runs beside admission and prefill instead of ahead of
+// them (indexing a 156K-token prompt took 15 ms, 2026-10-28). A request that goes away leaves a
+// running build to finish and be discarded.
+class NgramIndexBuild final {
+public:
+    using Token = NgramProposer::Token;
+
+    [[nodiscard]] static std::shared_ptr<NgramIndexBuild>
+    start(std::vector<Token> boundaries, std::vector<Token> tokens,
+          std::vector<std::vector<Token>> sources) {
+        auto build = std::make_shared<NgramIndexBuild>();
+        std::thread([build, boundaries = std::move(boundaries), tokens = std::move(tokens),
+                     sources = std::move(sources)]() mutable {
+            try {
+                auto index = std::make_unique<NgramProposer>();
+                index->set_boundaries(std::move(boundaries));
+                index->ingest(tokens);
+                for (const auto& source : sources) { index->ingest(source); }
+                build->index_ = std::move(index);
+            } catch (...) { build->error_ = std::current_exception(); }
+            build->done_.store(true, std::memory_order_release);
+            build->done_.notify_all();
+        }).detach();
+        return build;
+    }
+
+    // Waits for the build and takes its index, once; rethrows the build's failure.
+    [[nodiscard]] std::unique_ptr<NgramProposer> take() {
+        done_.wait(false, std::memory_order_acquire);
+        if (error_) { std::rethrow_exception(error_); }
+        if (!index_) { throw std::logic_error("ngram index build was already taken"); }
+        return std::move(index_);
+    }
+
+private:
+    std::unique_ptr<NgramProposer> index_;
+    std::exception_ptr error_;
+    std::atomic<bool> done_{false};
 };
 
 } // namespace ninfer::models::qwen3_5::detail

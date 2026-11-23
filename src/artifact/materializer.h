@@ -125,6 +125,9 @@ public:
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
     [[nodiscard]] const WeightParent& pinned_parent(ObjectHandle handle) const;
+    // Whether the object's bytes are in the page-locked Host block (a Pinned placement always is;
+    // consulted before falling back to reading the artifact's files).
+    [[nodiscard]] bool pinned(ObjectHandle handle) const noexcept;
     [[nodiscard]] std::span<const std::byte> pinned_block() const noexcept;
     // Present when the device backing was supplied by an eviction pool.
     [[nodiscard]] EvictableWeightPool* weight_pool() const noexcept { return pool_.get(); }

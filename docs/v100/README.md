@@ -18,6 +18,8 @@
 | [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md) | 外部报告的 1.5→1.6 接受率落差：度量口径、验证端 KV 切分、FP16 范围饱和三条原因与收敛计划 |
 | v1.6.2 发布说明（已移出仓库，保留在 v1.6.2 tag 与 GitHub Release 中） | 九次提交的实测矩阵、代价与已知缺口 |
 
+| [S0-result-inkling2-2026-11-23.md](S0-result-inkling2-2026-11-23.md) | **Inkling 2 Mini**（looped MoE）：sm70 桥接（NVFP4/MXFP4 MMQ/Vec kernel）、GGUF 格式白名单、DSpark 投机、vision；V100 上 ~70 tok/s decode / ~12.5K tok/s prefill / 600K ctx |
+
 相关资产：
 
 | 路径 | 用途 |

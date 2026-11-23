@@ -6,7 +6,7 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/speculative_round.cuh"
-#include "core/device.h"
+#include "core/device_launch.h"
 #include "core/pdl.cuh"
 
 #include <algorithm>
@@ -69,29 +69,31 @@ void speculative_overlay_copy_proposals_launch(const Tensor& copy_rows, const Te
     CUDA_CHECK(cudaGetLastError());
 }
 
-void speculative_accept_coupled_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
-                                              const Tensor& drafts, const Tensor& current_extents,
-                                              Tensor& lengths, Tensor& anchors,
-                                              Tensor& licensed_tokens, Tensor& licensed_counts,
-                                              Tensor& accepted, std::int32_t token_domain,
-                                              const SamplingConfig* configs, DeviceSpan workspace,
-                                              cudaStream_t stream) {
+namespace {
+
+template <typename Logit>
+void accept_coupled_drafts_typed(const Tensor& target_tokens, const Tensor& logits,
+                                 const Tensor& drafts, const Tensor& current_extents,
+                                 Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
+                                 Tensor& licensed_counts, Tensor& accepted,
+                                 std::int32_t token_domain, const SamplingConfig* configs,
+                                 const std::int32_t* column_starts, DeviceSpan workspace,
+                                 cudaStream_t stream) {
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t cols          = drafts.ne[0] + 1;
     const std::int32_t batch         = drafts.ne[1];
     const SamplingWorkspaceLayout layout =
         make_sampling_workspace_layout(token_domain, cols, kSpeculativeSamplerMaxColumns);
     if (!layout.multiblock) {
-        speculative_accept_coupled_drafts_kernel<<<batch, kSamplerBlock, 0, stream>>>(
+        speculative_accept_coupled_drafts_kernel<Logit><<<batch, kSamplerBlock, 0, stream>>>(
             static_cast<const std::int32_t*>(target_tokens.data),
-            static_cast<const __nv_bfloat16*>(logits.data),
-            static_cast<const std::int32_t*>(drafts.data),
+            static_cast<const Logit*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
             static_cast<const std::int32_t*>(current_extents.data),
             static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
             static_cast<std::int32_t*>(licensed_tokens.data),
             static_cast<std::int32_t*>(licensed_counts.data),
             static_cast<std::int32_t*>(accepted.data), configs, token_domain, physical_rows,
-            drafts.ne[0]);
+            drafts.ne[0], column_starts);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -102,46 +104,48 @@ void speculative_accept_coupled_drafts_launch(const Tensor& target_tokens, const
                             static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(partial_grid), dim3(kSamplerBlock), 0, stream},
-        speculative_sampling_partial_topk_kernel, static_cast<const __nv_bfloat16*>(logits.data),
+        speculative_sampling_partial_topk_kernel<Logit>, static_cast<const Logit*>(logits.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
-        physical_rows, cols, drafts.ne[0], scratch, layout.bytes));
+        physical_rows, cols, drafts.ne[0], scratch, layout.bytes, column_starts));
     CUDA_CHECK(cudaGetLastError());
     const dim3 batched_group_grid(static_cast<unsigned int>(groups),
                                   static_cast<unsigned int>(cols),
                                   static_cast<unsigned int>(batch));
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(batched_group_grid), dim3(kSamplerGroupBlock), 0, stream},
-        speculative_sampling_group_finalize_kernel<false>,
+        speculative_sampling_group_finalize_kernel<Logit, false>,
         static_cast<const std::int32_t*>(target_tokens.data),
-        static_cast<const __nv_bfloat16*>(logits.data),
-        static_cast<const std::int32_t*>(drafts.data), nullptr, nullptr,
-        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<const Logit*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
+        nullptr, nullptr, static_cast<const std::int32_t*>(current_extents.data),
         static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
         static_cast<std::int32_t*>(licensed_tokens.data),
         static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
-        configs, token_domain, cols, partial_blocks, groups, physical_rows, scratch, layout.bytes));
+        configs, token_domain, cols, partial_blocks, groups, physical_rows, scratch, layout.bytes,
+        column_starts));
     CUDA_CHECK(cudaGetLastError());
 }
 
-void speculative_accept_sparse_drafts_launch(
-    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
-    const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
-    Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
-    Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
-    bool raw_greedy, DeviceSpan workspace, cudaStream_t stream) {
+template <typename Logit>
+void accept_sparse_drafts_typed(const Tensor& target_tokens, const Tensor& logits,
+                                const Tensor& drafts, const Tensor& candidate_ids,
+                                const Tensor& proposal_q, const Tensor& current_extents,
+                                Tensor& round_lengths, Tensor& round_anchors,
+                                Tensor& licensed_tokens, Tensor& licensed_counts,
+                                Tensor& accepted_drafts, std::int32_t token_domain,
+                                const SamplingConfig* configs, bool raw_greedy,
+                                DeviceSpan workspace, cudaStream_t stream) {
     const std::int32_t batch         = drafts.ne[1];
     const std::int32_t k             = drafts.ne[0];
     const std::int32_t cols          = k + 1;
     const std::int32_t physical_rows = logits.ne[0];
     if (raw_greedy) {
-        speculative_accept_sparse_warp_greedy_kernel<<<1, 32 * batch, 0, stream>>>(
-            static_cast<const int*>(target_tokens.data),
-            static_cast<const __nv_bfloat16*>(logits.data), static_cast<const int*>(drafts.data),
-            static_cast<const int*>(current_extents.data), static_cast<int*>(round_lengths.data),
-            static_cast<int*>(round_anchors.data), static_cast<int*>(licensed_tokens.data),
-            static_cast<int*>(licensed_counts.data), static_cast<int*>(accepted_drafts.data), k,
-            physical_rows);
+        speculative_accept_sparse_warp_greedy_kernel<Logit><<<1, 32 * batch, 0, stream>>>(
+            static_cast<const int*>(target_tokens.data), static_cast<const Logit*>(logits.data),
+            static_cast<const int*>(drafts.data), static_cast<const int*>(current_extents.data),
+            static_cast<int*>(round_lengths.data), static_cast<int*>(round_anchors.data),
+            static_cast<int*>(licensed_tokens.data), static_cast<int*>(licensed_counts.data),
+            static_cast<int*>(accepted_drafts.data), k, physical_rows);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -153,34 +157,74 @@ void speculative_accept_sparse_drafts_launch(
     const SamplingWorkspace scratch   = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
-    CUDA_CHECK(pdl::launch_consumer({dim3(partial_grid), dim3(kSamplerBlock), 0, stream},
-                                    speculative_sampling_partial_topk_kernel,
-                                    static_cast<const __nv_bfloat16*>(logits.data),
-                                    static_cast<const std::int32_t*>(drafts.data),
-                                    static_cast<const std::int32_t*>(current_extents.data), configs,
-                                    token_domain, logits.ne[0], cols, k, scratch, layout.bytes));
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(partial_grid), dim3(kSamplerBlock), 0, stream},
+        speculative_sampling_partial_topk_kernel<Logit>, static_cast<const Logit*>(logits.data),
+        static_cast<const std::int32_t*>(drafts.data),
+        static_cast<const std::int32_t*>(current_extents.data), configs, token_domain, logits.ne[0],
+        cols, k, scratch, layout.bytes, static_cast<const std::int32_t*>(nullptr)));
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(cols),
                           static_cast<unsigned int>(batch));
 
-    CUDA_CHECK(pdl::launch_consumer({dim3(group_grid), dim3(kSamplerGroupBlock), 0, stream},
-                                    speculative_sampling_group_finalize_kernel<true>,
-                                    static_cast<const std::int32_t*>(target_tokens.data),
-                                    static_cast<const __nv_bfloat16*>(logits.data),
-                                    static_cast<const std::int32_t*>(drafts.data),
-                                    static_cast<const std::int32_t*>(candidate_ids.data),
-                                    static_cast<const float*>(proposal_q.data),
-                                    static_cast<const std::int32_t*>(current_extents.data),
-                                    static_cast<std::int32_t*>(round_lengths.data),
-                                    static_cast<std::int32_t*>(round_anchors.data),
-                                    static_cast<std::int32_t*>(licensed_tokens.data),
-                                    static_cast<std::int32_t*>(licensed_counts.data),
-                                    static_cast<std::int32_t*>(accepted_drafts.data), configs,
-                                    token_domain, cols, partial_blocks, groups, physical_rows,
-                                    scratch, layout.bytes));
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(group_grid), dim3(kSamplerGroupBlock), 0, stream},
+        speculative_sampling_group_finalize_kernel<Logit, true>,
+        static_cast<const std::int32_t*>(target_tokens.data),
+        static_cast<const Logit*>(logits.data), static_cast<const std::int32_t*>(drafts.data),
+        static_cast<const std::int32_t*>(candidate_ids.data),
+        static_cast<const float*>(proposal_q.data),
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(round_lengths.data),
+        static_cast<std::int32_t*>(round_anchors.data),
+        static_cast<std::int32_t*>(licensed_tokens.data),
+        static_cast<std::int32_t*>(licensed_counts.data),
+        static_cast<std::int32_t*>(accepted_drafts.data), configs, token_domain, cols,
+        partial_blocks, groups, physical_rows, scratch, layout.bytes,
+        static_cast<const std::int32_t*>(nullptr)));
 
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void speculative_accept_coupled_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+                                              const Tensor& drafts, const Tensor& current_extents,
+                                              Tensor& lengths, Tensor& anchors,
+                                              Tensor& licensed_tokens, Tensor& licensed_counts,
+                                              Tensor& accepted, std::int32_t token_domain,
+                                              const SamplingConfig* configs,
+                                              const std::int32_t* column_starts,
+                                              DeviceSpan workspace, cudaStream_t stream) {
+    if (logits.dtype == DType::FP32) {
+        accept_coupled_drafts_typed<float>(target_tokens, logits, drafts, current_extents, lengths,
+                                           anchors, licensed_tokens, licensed_counts, accepted,
+                                           token_domain, configs, column_starts, workspace, stream);
+        return;
+    }
+    accept_coupled_drafts_typed<__nv_bfloat16>(
+        target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
+        licensed_counts, accepted, token_domain, configs, column_starts, workspace, stream);
+}
+
+void speculative_accept_sparse_drafts_launch(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
+    Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
+    Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
+    bool raw_greedy, DeviceSpan workspace, cudaStream_t stream) {
+    if (logits.dtype == DType::FP32) {
+        accept_sparse_drafts_typed<float>(target_tokens, logits, drafts, candidate_ids, proposal_q,
+                                          current_extents, round_lengths, round_anchors,
+                                          licensed_tokens, licensed_counts, accepted_drafts,
+                                          token_domain, configs, raw_greedy, workspace, stream);
+        return;
+    }
+    accept_sparse_drafts_typed<__nv_bfloat16>(
+        target_tokens, logits, drafts, candidate_ids, proposal_q, current_extents, round_lengths,
+        round_anchors, licensed_tokens, licensed_counts, accepted_drafts, token_domain, configs,
+        raw_greedy, workspace, stream);
 }
 
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
@@ -205,6 +249,40 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
     const int grid       = std::max(1, div_up(count, kBlock));
     proposal_remap_token_ids_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<std::int32_t*>(proposal_tokens.data), count, id_map, n);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void proposal_expand_logits_launch(const Tensor& subset, const std::int32_t* id_map,
+                                   std::int32_t n, Tensor& expanded, cudaStream_t stream) {
+    constexpr int kBlock        = 256;
+    const std::int32_t rows     = expanded.ne[0];
+    const std::int32_t columns  = expanded.ne[1];
+    const std::int64_t elements = static_cast<std::int64_t>(rows) * columns;
+    const auto fill_grid        = static_cast<unsigned int>(
+        std::min<std::int64_t>(div_up(elements, std::int64_t{kBlock}), 4096));
+    auto* out                   = static_cast<float*>(expanded.data);
+    proposal_fill_logits_kernel<<<fill_grid, kBlock, 0, stream>>>(out, elements);
+    CUDA_CHECK(cudaGetLastError());
+    const dim3 grid(static_cast<unsigned int>(div_up(n, kBlock)),
+                    static_cast<unsigned int>(columns));
+    if (subset.dtype == DType::FP32) {
+        proposal_scatter_logits_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const float*>(subset.data), id_map, n, rows, out);
+    } else {
+        proposal_scatter_logits_kernel<<<grid, kBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(subset.data), id_map, n, rows, out);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void proposal_select_sampled_launch(Tensor& proposal_tokens, const Tensor& sampled,
+                                    const SamplingConfig* configs, cudaStream_t stream) {
+    constexpr int kBlock = 256;
+    const int count      = proposal_tokens.ne[0];
+    const int grid       = std::max(1, div_up(count, kBlock));
+    proposal_select_sampled_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<std::int32_t*>(proposal_tokens.data),
+        static_cast<const std::int32_t*>(sampled.data), configs, count);
     CUDA_CHECK(cudaGetLastError());
 }
 

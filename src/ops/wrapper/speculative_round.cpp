@@ -1,7 +1,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/launcher/speculative_round.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
 
 #include <algorithm>
 #include <limits>
@@ -41,6 +41,11 @@ void require_dtype(const Tensor& t, DType dtype, const char* op, const char* nam
         throw std::invalid_argument(std::string(op) + ": invalid dtype for " + name);
     }
     require_contiguous_nonnull(t, op, name);
+}
+
+// Verification logits are BF16, or FP32 where the head writes its unrounded sums.
+DType logits_dtype(const Tensor& logits) {
+    return logits.dtype == DType::FP32 ? DType::FP32 : DType::BF16;
 }
 
 void require_scalar(const Tensor& t, DType dtype, const char* op, const char* name) {
@@ -185,7 +190,8 @@ void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor
                                        Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                        Tensor& licensed_counts, Tensor& accepted,
                                        std::int32_t token_domain, const SamplingConfig* configs,
-                                       WorkspaceArena& workspace, cudaStream_t stream) {
+                                       WorkspaceArena& workspace, cudaStream_t stream,
+                                       const Tensor* column_starts) {
     constexpr const char* op = "speculative_accept_coupled_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -193,11 +199,23 @@ void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor
     if (batch < 1) {
         throw std::invalid_argument("speculative_accept_coupled_drafts: B must be >=1");
     }
-    require_matrix(target_tokens, DType::I32, k + 1, batch, op, "target_tokens");
-    require_dtype(logits, DType::BF16, op, "logits");
-    if (logits.ne[0] <= 0 || logits.ne[1] != k + 1 || logits.ne[2] != batch || logits.ne[3] != 1) {
-        throw std::invalid_argument(
-            "speculative_accept_coupled_drafts: logits must be [physical_rows,K+1,B]");
+    require_dtype(logits, logits_dtype(logits), op, "logits");
+    if (column_starts != nullptr) {
+        require_vector(*column_starts, DType::I32, batch, op, "column_starts");
+        const std::int32_t columns = target_tokens.ne[0];
+        require_vector(target_tokens, DType::I32, columns, op, "target_tokens");
+        if (columns < batch || logits.ne[0] <= 0 || logits.ne[1] != columns ||
+            logits.ne[2] != 1 || logits.ne[3] != 1) {
+            throw std::invalid_argument(
+                "speculative_accept_coupled_drafts: packed logits must be [physical_rows,columns]");
+        }
+    } else {
+        require_matrix(target_tokens, DType::I32, k + 1, batch, op, "target_tokens");
+        if (logits.ne[0] <= 0 || logits.ne[1] != k + 1 || logits.ne[2] != batch ||
+            logits.ne[3] != 1) {
+            throw std::invalid_argument(
+                "speculative_accept_coupled_drafts: logits must be [physical_rows,K+1,B]");
+        }
     }
     if (token_domain <= 0 || token_domain > logits.ne[0]) {
         throw std::invalid_argument(
@@ -219,7 +237,9 @@ void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_coupled_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs, scratch, stream);
+        licensed_counts, accepted, token_domain, configs,
+        column_starts != nullptr ? static_cast<const std::int32_t*>(column_starts->data) : nullptr,
+        scratch, stream);
 }
 
 void speculative_accept_sparse_drafts(
@@ -245,7 +265,8 @@ void speculative_accept_sparse_drafts(
         throw std::invalid_argument("speculative_accept_sparse_drafts: K>31 requires B=1");
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
-    require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_tensor3(logits, logits_dtype(logits), kSparsePhysicalRows, columns, batch, op,
+                    "logits");
     require_matrix(drafts, DType::I32, k, batch, op, "drafts");
     require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
     require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");
@@ -298,6 +319,40 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
         throw std::invalid_argument("proposal_remap_token_ids: id_map must be non-null and n>0");
     }
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
+}
+
+void proposal_expand_logits(const Tensor& subset, const std::int32_t* id_map, std::int32_t count,
+                            Tensor& expanded, cudaStream_t stream) {
+    constexpr const char* op = "proposal_expand_logits";
+    require_dtype(subset, logits_dtype(subset), op, "subset");
+    require_dtype(expanded, DType::FP32, op, "expanded");
+    if (subset.ne[2] != 1 || subset.ne[3] != 1 || expanded.ne[2] != 1 || expanded.ne[3] != 1 ||
+        subset.ne[1] <= 0 || expanded.ne[1] != subset.ne[1]) {
+        throw std::invalid_argument(
+            "proposal_expand_logits: subset [count,T] and expanded [V,T] must share T>0");
+    }
+    if (id_map == nullptr || count <= 0 || subset.ne[0] != count || expanded.ne[0] < count) {
+        throw std::invalid_argument(
+            "proposal_expand_logits: id_map must be non-null with count = subset rows <= V");
+    }
+    detail::proposal_expand_logits_launch(subset, id_map, count, expanded, stream);
+}
+
+void proposal_select_sampled(Tensor& proposal_tokens, const Tensor& sampled,
+                             const SamplingConfig* configs, cudaStream_t stream) {
+    constexpr const char* op = "proposal_select_sampled";
+    require_vector(proposal_tokens, DType::I32, proposal_tokens.ne[0], op, "proposal_tokens");
+    require_vector(sampled, DType::I32, proposal_tokens.ne[0], op, "sampled");
+    if (!proposal_tokens.is_contiguous() || !sampled.is_contiguous()) {
+        throw std::invalid_argument("proposal_select_sampled: vectors must be contiguous");
+    }
+    if (configs == nullptr) {
+        throw std::invalid_argument("proposal_select_sampled: configs must be non-null");
+    }
+    if (proposal_tokens.data == sampled.data) {
+        throw std::invalid_argument("proposal_select_sampled: sampled must be distinct");
+    }
+    detail::proposal_select_sampled_launch(proposal_tokens, sampled, configs, stream);
 }
 
 } // namespace ninfer::ops

@@ -34,6 +34,10 @@ void ensure_driver_initialized();
 // the one that owns the physical memory; the rest are peers that address it directly.
 void set_access(CUdeviceptr va, std::size_t bytes, std::span<const int> devices);
 
+// cuMemUnmap, which CUDA documents as synchronous for most uses: a device wait of the calling
+// thread (core/device_wait.h).
+CUresult unmap(CUdeviceptr va, std::size_t bytes) noexcept;
+
 void map(CUdeviceptr va, std::size_t bytes, CUmemGenericAllocationHandle handle,
          std::span<const int> devices);
 

@@ -1,4 +1,5 @@
 #include "core/vmm.h"
+#include "core/device_wait.h"
 
 #include <algorithm>
 #include <mutex>
@@ -66,6 +67,11 @@ CUmemGenericAllocationHandle create(std::size_t bytes, int device) {
     CUmemGenericAllocationHandle handle{};
     NINFER_CU_CHECK(cuMemCreate(&handle, bytes, &prop, 0));
     return handle;
+}
+
+CUresult unmap(CUdeviceptr va, std::size_t bytes) noexcept {
+    const DeviceWaitScope waiting("an unmap");
+    return cuMemUnmap(va, bytes);
 }
 
 void set_access(CUdeviceptr va, std::size_t bytes, std::span<const int> devices) {

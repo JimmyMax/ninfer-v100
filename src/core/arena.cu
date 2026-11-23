@@ -459,9 +459,10 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
 
 PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
 
-HostMemoryRegistration::HostMemoryRegistration(void* data, std::size_t bytes) {
+HostMemoryRegistration::HostMemoryRegistration(void* data, std::size_t bytes, bool mapped) {
     if (!data || !bytes) { throw std::invalid_argument("host registration needs a nonempty allocation"); }
-    const cudaError_t error = cudaHostRegister(data, bytes, cudaHostRegisterPortable);
+    const unsigned flags = cudaHostRegisterPortable | (mapped ? cudaHostRegisterMapped : 0U);
+    const cudaError_t error = cudaHostRegister(data, bytes, flags);
     if (error != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaHostRegister failed", error));
     }

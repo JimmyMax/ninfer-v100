@@ -15,6 +15,13 @@ namespace ninfer::ops {
 
 inline constexpr int kTargetLogprobsBlock = 256;
 
+// Logits are BF16, or FP32 where the head writes its unrounded sums.
+__device__ __forceinline__ float logprob_logit(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+__device__ __forceinline__ float logprob_logit(float value) { return value; }
+
 template <int BlockSize>
 __device__ __forceinline__ float target_logprobs_block_max(float value) {
     static_assert(BlockSize >= kWarpSize && BlockSize <= 1024);

@@ -74,6 +74,17 @@ enum class KvCacheStorage : std::uint8_t {
     // a residual axis (two bytes per block) over a group-64 scale, paired with the rk8v4 packed
     // int4 value plane. Opt-in through --kv-dtype rk2v4-e8.
     RotatedE8RootKeyInt4Value,
+    // bf16p: BF16's K and V values packed losslessly to 384 bytes and an 8-byte side record a D256
+    // row (ops/kv_cache/bf16p_codec.cuh), 23% fewer bytes than BFloat16; a row with no packed form
+    // ends its request as one with non-finite logits. Opt-in through --kv-dtype bf16p.
+    Bf16Packed,
+    // Native binary16 K/V, rounded directly from FP32 cache-producing operands (Flash-Next).
+    Float16,
+    // mxfp8 (Inkling 2): E4M3 values over one UE8M0 power-of-two scale per 32 dimensions, the
+    // group's absolute maximum over 448 rounded up to a power of two (the release's MXFP8 rule),
+    // the format Inkling 2's release trained its KV with and that family's default.
+    Mxfp8,
+
 };
 
 enum class EnginePurpose : std::uint8_t {
@@ -117,6 +128,8 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    DSpark, // the release's DSpark drafter (DeepSeek-V4.1, Inkling 2)
+    DSpine, // a standalone DSpine drafter artifact (SpeculativeOptions::draft_model)
 };
 
 // How many of its drafts an MTP round verifies: always all of them, or a width the Engine adapts
@@ -128,12 +141,29 @@ enum class MtpDraftPolicy : std::uint8_t {
 };
 
 struct SpeculativeOptions {
+    // True when the operator passed --spec explicitly; the Engine's per-family auto-config
+    // (for example Inkling 2's DSpark drafter) then leaves the choice alone.
+    bool spec_explicit = false;
+    // Resolved drafting defaults the Engine applies per family.
+    static constexpr std::uint32_t kAutomaticDraftTokens   = 3;
+    static constexpr float kAutomaticDraftMinP             = 0.5F;
+    static constexpr std::uint32_t kAutomaticDFlash2Tokens = 4;
+    static constexpr float kAutomaticDFlash2MinP           = 0.7F;
+    static constexpr std::uint32_t kAutomaticDSparkTokens  = 3;
+    static constexpr float kAutomaticDSparkMinP            = 0.5F;
+
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP, DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     // Flash-Next MTP: truncate verification after the first draft whose absolute probability
     // is at or below this floor. Zero keeps the full window; drafting still runs the captured chain.
     float draft_min_p = 0;
+    // DSpark: verify a round's drafts up to the first its confidence head scores below this, in
+    // [0,1]; 0 keeps every draft (the drafter's default floor).
+    float draft_confidence = 0;
+    // --spec dspine: the DSpine drafter artifact, trained for the model's hidden width,
+    // vocabulary and layers. Empty otherwise.
+    std::string draft_model;
     // An Engine's options() report the resolved head.
     ProposalHead proposal_head = ProposalHead::Auto;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and
@@ -506,6 +536,9 @@ enum class ExpertResidency : std::uint8_t {
 // device cache lacks. By default every miss executes on the GPU; a DMA share below one lets the CPU
 // compute the rest: for GGUF banks the GPU's results bit for bit, for native banks different
 // numerical results (and concurrency one).
+// Disk experts: NVMe reads straight into device memory (core/expert_direct.h).
+enum class ExpertDirect : std::uint8_t { Auto, On, Off };
+
 struct HybridExpertOptions {
     float dma_share = 1; // 0..1 of distinct uncached experts per decode/verify call
     // GGUF experts: each call splits its misses between copies and the CPU by measured speeds
@@ -531,6 +564,16 @@ struct HybridExpertOptions {
     bool cpu_ggml = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
+    // Disk experts: a directory on a second drive holding byte-identical copies of the artifact's
+    // files (by file name). A read goes to one of the two copies by the 1 MiB stripe of its offset,
+    // so both drives serve a call's misses. Empty: the artifact's files only.
+    std::filesystem::path mirror;
+    // Disk experts: NVMe reads straight into device memory (ExpertDirect).
+    ExpertDirect direct = ExpertDirect::Auto;
+    // Host-resident experts: the bytes of expert blocks kept in pinned host memory. Unset splits
+    // the host's available memory and, on Windows, what the GPU's shared memory segment can still
+    // lock (about half the RAM) less 4 GiB.
+    std::optional<std::uint64_t> host_bytes;
 };
 
 // Qwen3.8-Flash-Next: where the n-gram table's rows come from.
@@ -730,6 +773,11 @@ struct EngineOptions {
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
+    // Tensor-parallel switches (inkling2): split attention/experts across the listed devices.
+    bool tensor_parallel = false;
+    std::vector<double> tensor_split;
+    // Per-prefill-chunk decode interleaving budget in ms; 0 keeps the chunks back to back.
+    std::uint32_t prefill_stall_budget_ms = 0;
     StartupObserver startup_observer;
     DiagnosticObserver diagnostic_observer;
     SlotAutoSaveOptions slot_auto_save;
@@ -784,6 +832,11 @@ struct ResolvedSamplingParameters {
     float presence_penalty  = 0.0F;
     float frequency_penalty = 0.0F;
     std::uint64_t seed      = 0;
+    // The sampled token is the one with the largest log probability plus a Gumbel noise keyed by
+    // its id, instead of the one whose cumulative probability first passes one keyed uniform
+    // (EngineOptions::gumbel_sampling). Both draw from the same distribution; for the same seed
+    // they give different tokens.
+    bool gumbel = false;
 };
 
 enum class OutputChannel : std::uint8_t {
@@ -1057,6 +1110,32 @@ enum class PromptContinuationMode : std::uint8_t {
     ContinueFinalAssistant,
 };
 
+inline constexpr std::size_t kMaximumLoraAdapters = 8;
+
+// One loaded LoRA adapter's scale for a request: `id` indexes EngineOptions::lora_adapters.
+struct LoraScale {
+    std::uint32_t id = 0;
+    float scale      = 0.0F;
+};
+
+// A loaded abliteration-style LoRA adapter (B = -r, A = r^T W) and its default request scale.
+struct LoraAdapterSource {
+    std::filesystem::path path;
+    float scale = 1.0F;
+};
+
+// A control vector in llama.cpp's GGUF form: F32 direction.N tensors added to the residual.
+struct ControlVectorSource {
+    std::filesystem::path path;
+    float scale = 1.0F;
+};
+
+// The layers [first, last] the control vectors steer.
+struct ControlVectorLayers {
+    std::uint32_t first = 1;
+    std::uint32_t last  = 0;
+};
+
 struct PromptOptions {
     PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
     std::optional<bool> enable_thinking;
@@ -1070,7 +1149,15 @@ struct PromptOptions {
     // answer can only continue inside that call. Requires a new assistant turn with thinking off.
     std::string forced_tool_name;
     // Name of an EngineOptions::grafts entry to place in front of the rendered prompt; empty for
-    // none. The rendered prompt should carry no system turn of its own: the graft already holds one.
+    // none. The rendered prompt should carry no system turn of its own: the graft already holds one.    // Open a new assistant answer block: Inkling 2 writes its own block header.
+    bool open_answer = false;
+    // The request's LoRA adapters (EngineOptions::lora_adapters, by index): each listed adapter
+    // runs at its scale and every other at zero. Unset runs each at its EngineOptions scale.
+    std::optional<std::vector<LoraScale>> lora;
+    // The request drafts (ExecutionOptions::speculative_drafting). False prepares no n-gram
+    // proposal index or sources: a request that does not draft reads one token.
+    bool speculative_drafting = true;
+
     std::string graft;
 };
 
@@ -1181,6 +1268,7 @@ enum class RequestErrorKind : std::uint8_t {
     QueueTimeout,
     Cancelled,
     Unavailable,
+    NumericalFailure,
 };
 
 class RequestError final : public std::invalid_argument {
@@ -1255,6 +1343,9 @@ inline constexpr float kLogprobSentinel = -9999.0f;
 // One generated content token: its id, log probability and decoded bytes (possibly part of a UTF-8
 // sequence), and the kMaximumTokenLogprobs most likely tokens at its position in descending order,
 // the lower id first on a tie. Slots past the last token the mask admits hold id -1.
+// The most readout tokens one request's first-token record carries (Engine contract).
+inline constexpr std::size_t kMaximumReadoutTokens = 32;
+
 struct TokenLogprob {
     TokenId id        = 0;
     float logprob     = 0.0f;
@@ -1263,6 +1354,9 @@ struct TokenLogprob {
     std::array<float, kMaximumTokenLogprobs> top_values{};
     // Decoded byte string for each top-k alternative, aligned with top_ids.
     std::array<std::string, kMaximumTokenLogprobs> top_bytes;
+    // The typed readout (ExecutionOptions::readout_tokens): the named tokens' log probabilities in
+    // the request's order, on the first-token record.
+    std::vector<float> readout;
 };
 
 struct OutputDelta {
@@ -1548,6 +1642,13 @@ struct NgramArchiveStats {
     std::optional<std::uint64_t> sampling_seed;
 };
 
+// One prompt of Engine::submit_branches: its length, shared prefix included, and the record of the
+// first token the model generates after it.
+struct BranchResult {
+    std::uint32_t prompt_tokens = 0;
+    TokenLogprob first;
+};
+
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
@@ -1561,6 +1662,8 @@ struct GenerationResult {
     FinishReason finish_reason     = FinishReason::None;
     std::optional<std::string> matched_stop_string;
     std::uint32_t reused_prompt_tokens = 0;
+    // Engine::submit_branches: one record per branch, in order; empty for every other request.
+    std::vector<BranchResult> branches;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
     MaterializationDiagnostics materialization;
     // The private catalog cell the finished session was retained in and its session digest, or
@@ -1989,6 +2092,16 @@ public:
     using std::invalid_argument::invalid_argument;
 };
 
+// What the Engine applied to positions past the model's native window (ops/rope.h), reported by
+// LoadSummary and the server's startup record.
+enum class RopeScalingType : std::uint8_t { None, Yarn, Interpolation };
+
+struct RopeScalingSummary {
+    RopeScalingType type         = RopeScalingType::None;
+    float factor                 = 1.0F;
+    std::uint32_t native_context = 0;
+};
+
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
@@ -2005,6 +2118,7 @@ struct LoadSummary {
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;
+    RopeScalingSummary rope;
 
     // Hybrid prefix cache restored from its persistent file at startup.
     struct PrefixCacheRestore {

@@ -61,7 +61,7 @@ __global__ void swiglu_kernel(const float* __restrict__ gate, const float* __res
                               __nv_bfloat16* __restrict__ out, std::int64_t count) {
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
-    out[i] = __float2bfloat16(silu(gate[i]) * up[i]);
+    out[i] = __float2bfloat16(portable_silu(gate[i]) * up[i]);
 }
 
 // fixed[t][r] += each of token t's pairs' contribution weights[p] * down[p][r] in 2^-32 fixed

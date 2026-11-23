@@ -1046,9 +1046,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     // one-hot either way, so verify treats them identically and a wrong guess costs
                     // throughput rather than correctness.
                     if (lookup_ngram != 0) {
+                        std::size_t lookup_lag = 0;
                         const auto found = ::ninfer::runtime::lookup_draft(
                             std::span<const TokenId>(sequence.ledger), lookup_ngram, draft_window,
-                            sequence.mtp_drafts.data());
+                            sequence.mtp_drafts.data(), lookup_lag);
                         if (found != 0) { sequence.mtp_draft_count = found; }
                     }
                 }

@@ -7,6 +7,9 @@
 #include <optional>
 
 namespace ninfer {
+namespace handshake {
+struct DeviceMailbox;
+}
 
 // One in-flight exchange between a CUDA stream and a host worker. Every launch is capturable;
 // eager waits block the calling host thread to allow first-use CUDA kernel loading, while a
@@ -20,12 +23,18 @@ public:
         std::uint32_t sequence, tag, width, flags;
     };
 
-    explicit CudaHostHandshake(const RankContext& rank);
+    // `sequence`: a zeroed device word the owner keeps for the handshake's lifetime, the last
+    // request's sequence. Only the device writes it; resume() restores it after its backing was
+    // replaced.
+    CudaHostHandshake(const RankContext& rank, std::uint32_t* sequence);
     ~CudaHostHandshake();
     CudaHostHandshake(const CudaHostHandshake&) = delete;
     CudaHostHandshake& operator=(const CudaHostHandshake&) = delete;
 
     void publish(std::uint32_t tag, std::uint32_t width, std::uint32_t flags, cudaStream_t stream);
+    // For a kernel that publishes the request itself (handshake::publish, cuda_host_handshake.cuh).
+    [[nodiscard]] handshake::DeviceMailbox device() const noexcept;
+    void resume();
     void wait_prepared(cudaStream_t stream);
     void wait_completed(cudaStream_t stream);
     void retire(cudaStream_t stream);
@@ -40,6 +49,10 @@ public:
 private:
     void* host_ = nullptr;
     void* device_ = nullptr;
+    std::uint32_t* sequence_ = nullptr;
+    // The CUDA device whose requests this answers: each answer counts as host-service progress
+    // for a wait on that device (note_host_service_progress).
+    int ordinal_ = 0;
 };
 
 } // namespace ninfer

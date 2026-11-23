@@ -8,7 +8,7 @@ first use: no route changes a numeric contract, and the numbers below are that c
 
 [Quick start](#quick-start) · [Artifacts and formats](#artifacts-and-formats) ·
 [Measured performance](#measured-performance) · [Technical highlights](#technical-highlights) ·
-[Flash-Next](#flash-next) · [Gemma 4](#gemma-4) · [Docker](#docker) · [Building](#building) ·
+[Flash-Next](#flash-next) · [Gemma 4](#gemma-4) · [Inkling 2 Mini](#inkling-2-mini) · [Docker](#docker) · [Building](#building) ·
 [Documentation](docs/README.md)
 
 The `sm_89` (RTX 4080 SUPER) build is carried in the same image and serves the same artifacts; this
@@ -232,6 +232,40 @@ about 517 GB/s of the ~790 GB/s this card's HBM2 moves with ECC on. Speculation 
 drafts verified per weight read take the same traffic to 54.1 tok/s. The A4B's file is only 4%
 smaller, but a token touches 8 of 128 experts, so it decodes 4.4× faster and gains less from
 drafting.
+
+## Inkling 2 Mini
+
+The [Inkling 2 Mini](docs/inkling2.md) looped MoE (26.4B params, 3.4B active) runs from any
+Inkling GGUF release converted to `.ninfer` by `tools/convert/inkling2.py`, with vision and the
+DSpark drafter. On the V100-32GB it loads UD-Q4_K_XL (18.7 GiB) with `gguf_q8_0` dense layers
+and `gguf_nvfp4` routed experts, or any other quantization (IQ4_XS, Q2_K_XL, Q3_K_XL, Q8_K_XL).
+The engine also loads upstream NInfer-v3 artifacts directly ([WaveCut's
+pack](https://huggingface.co/WaveCut/Inkling-2-Mini-UD-IQ4_XS-NInfer-v3)). Measured on GPU 1,
+int8 KV, `--expert-residency device`, 600K-token context:
+
+| Decode | Prefill | Context | Notes |
+|---:|---:|---:|---|
+| **~70 tok/s** (DSpark 3 drafts, 42% accepted) | ~12.5K tok/s | 600K tokens | 24 layers, 48 visits; NVFP4 experts software-emulated on sm_70 |
+
+DSpark is the artifact's drafter (3 layers over a block of 8); it starts automatically with the
+artifact. `--spec none` disables it for pure decode (~66 tok/s). The NVFP4 experts are the decode
+bottleneck on this card — V100 has no FP4 tensor core, so they run through a sm_70-specific
+software-emulation path. On cards with FP4 hardware (H100/B200) the same artifact runs much
+faster.
+
+```bash
+# From a GGUF release
+python -m tools.convert --model models/inkling2/hf --recipe inkling2_gguf \
+  --source gguf=models/inkling2/Inkling-2-Mini-UD-Q4_K_XL.gguf \
+  --source vision=models/inkling2/mmproj-Inkling-2-Mini-Q8_0.gguf \
+  --source dspark=models/inkling2/dspark-Inkling-2-Mini-Q8_0.gguf \
+  --components text,vision,dspark --out models/inkling2/Inkling-2-Mini-UD-Q4_K_XL.ninfer \
+  --device cpu
+
+# Serve
+ninfer-serve models/inkling2/Inkling-2-Mini-UD-Q4_K_XL.ninfer --model-id inkling2 \
+  --max-context 600000 --kv-dtype int8 --expert-residency device --vision
+```
 
 ## Docker
 

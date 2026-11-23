@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/base.h"
+#include "ninfer/observability/resources.h"
 #include "ninfer/types.h"
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen3_5/frontend/graft.h"
@@ -11,12 +13,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace ninfer::models::qwen3_5 {
+
+struct Steering;
 
 [[nodiscard]] ModelSamplingDefaults default_sampling(Architecture architecture);
 
@@ -53,6 +58,9 @@ struct FrontendOptions {
     std::uint32_t progress_anchor_tokens = 0;
     // Hidden prompt prefixes a request may select through PromptOptions::graft.
     std::vector<PromptGraft> grafts;
+    // The loaded LoRA adapters and control vectors; null without either. A request's
+    // PromptOptions::lora scales the adapters.
+    std::shared_ptr<const Steering> steering;
 };
 
 struct FrontendResources;
@@ -60,6 +68,18 @@ struct PreparedPromptData;
 class Frontend;
 class FrontendTestAccess;
 class PreparedPromptAccess;
+class PreparedPrompt;
+
+// Engine::submit_branches: prompts that share a prefix, split into that prefix and each prompt's
+// own tokens.
+struct BranchedPrompt;
+
+// The prefix ends at the deepest explicit cache boundary of the first prompt inside the tokens all
+// prompts share, or where they stop agreeing when there is none, and leaves every prompt at least
+// one token of its own. It carries the first prompt's cache hints, taps, identity and graft up to
+// there, so the cache serves and keeps it as it would that prompt's. Prompts with media are
+// refused.
+[[nodiscard]] BranchedPrompt split_branches(std::vector<PreparedPrompt> prompts);
 
 class PreparedPrompt {
 public:
@@ -85,6 +105,13 @@ private:
     friend class Frontend;
     friend class FrontendTestAccess;
     friend class PreparedPromptAccess;
+    friend BranchedPrompt split_branches(std::vector<PreparedPrompt> prompts);
+};
+
+struct BranchedPrompt {
+    PreparedPrompt prefix;
+    // Each prompt's tokens after the prefix, in order; none is empty.
+    std::vector<std::vector<TokenId>> suffixes;
 };
 
 class Frontend {
@@ -99,12 +126,18 @@ public:
                                          const PreparationControl& control = {}) const;
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
-    [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
-                                                bool allow_prefix_identity = true,
-                                                bool anchor_prompt_end     = false) const;
+    [[nodiscard]] PreparedPrompt
+    prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity = true,
+                   bool anchor_prompt_end = false, bool speculative_drafting = true,
+                   const std::optional<std::vector<LoraScale>>& lora = std::nullopt) const;
+    [[nodiscard]] PreparedPrompt append_read_tokens(PreparedPrompt prompt,
+                                                    std::span<const TokenId> tokens) const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text,
                                                      bool parse_special = true) const;
     [[nodiscard]] std::string token_bytes(TokenId token) const;
+    // The public record of a raw logprob record: the bytes of its token and of each alternative,
+    // and its typed readout.
+    [[nodiscard]] TokenLogprob token_logprob(const runtime::RawTokenLogprob& raw) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession
     make_output_session(const PreparedPrompt& prompt, const StopPolicy& caller_stop,

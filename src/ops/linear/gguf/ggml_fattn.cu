@@ -1,5 +1,6 @@
 // llama.cpp's flash_attn_ext_f16 (fattn-mma-f16.cuh) launched without ggml's backend context: the
-// host side of launch_fattn and ggml_cuda_flash_attn_ext_mma_f16_case, for the two Gemma 4 shapes.
+// host side of launch_fattn and ggml_cuda_flash_attn_ext_mma_f16_case, for Gemma 4's two shapes and
+// Flint's.
 
 #include "ggml_fattn.h"
 #include "ggml_bridge_internal.cuh"
@@ -69,11 +70,11 @@ template <DeviceTier Tier>
 inline constexpr int kMaxTileColumns = Tier == DeviceTier::Turing ? 32 : 1 << 20;
 
 // The most query rows per tile, up to `widest`, whose tile the tier's device code has and whose
-// shared memory fits a block of its shape set: ggml's prompt choices (32 rows at width 256, 8 at
-// width 512) where they do, and on Turing 16 rows at width 256 and 4 at width 512 (its kernel has
-// no tile wider than 32 columns). The vendored combine barrier
-// (third_party/ggml-quants/README.ninfer.md) keeps the tiles that hold Q in shared memory free of
-// the race the upstream kernel had at width 512.
+// shared memory fits a block of its shape set: ggml's prompt choices (8 rows at width 128 with
+// eight heads a tile, 32 at width 256, 8 at width 512) where they do, and on Turing 4 rows at
+// widths 128 and 512 and 16 at width 256 (its kernel has no tile wider than 32 columns). The
+// vendored combine barrier (third_party/ggml-quants/README.ninfer.md) keeps the tiles that hold Q
+// in shared memory free of the race the upstream kernel had at width 512.
 template <int D, int ncols2, DeviceTier Tier>
 constexpr int fitting_ncols1(int widest) {
     for (int ncols1 = widest; ncols1 >= 1; ncols1 /= 2) {
@@ -89,10 +90,18 @@ constexpr int fitting_ncols1(int widest) {
     return 0;
 }
 
-// The configurations instantiated per tier: width 256 with two query heads per key/value head,
-// width 512 with eight, each with the most query rows per tile that fit (fitting_ncols1).
+// The configurations instantiated per tier: width 128 with eight query heads per key/value head
+// (Flint), width 256 with two and width 512 with eight (Gemma 4), each with the most query rows per
+// tile that fit (fitting_ncols1).
 template <int D, DeviceTier Tier>
 struct Shape;
+
+template <DeviceTier Tier>
+struct Shape<128, Tier> {
+    static constexpr int ncols2 = 8;
+    static constexpr int ncols1 = fitting_ncols1<128, ncols2, Tier>(8);
+    static_assert(ncols1 > 0, "no flash-attention tile of this tier fits Flint's width 128");
+};
 
 template <DeviceTier Tier>
 struct Shape<256, Tier> {
@@ -108,11 +117,14 @@ struct Shape<512, Tier> {
     static_assert(ncols1 > 0, "no flash-attention tile of this tier fits Gemma 4's width 512");
 };
 
-static_assert(Shape<256, DeviceTier::Turing>::ncols1 == 16 &&
+static_assert(Shape<128, DeviceTier::Turing>::ncols1 == 4 &&
+              Shape<256, DeviceTier::Turing>::ncols1 == 16 &&
               Shape<512, DeviceTier::Turing>::ncols1 == 4);
-static_assert(Shape<256, DeviceTier::Ampere>::ncols1 == 32 &&
+static_assert(Shape<128, DeviceTier::Ampere>::ncols1 == 8 &&
+              Shape<256, DeviceTier::Ampere>::ncols1 == 32 &&
               Shape<512, DeviceTier::Ampere>::ncols1 == 8);
-static_assert(Shape<256, DeviceTier::Blackwell>::ncols1 == 32 &&
+static_assert(Shape<128, DeviceTier::Blackwell>::ncols1 == 8 &&
+              Shape<256, DeviceTier::Blackwell>::ncols1 == 32 &&
               Shape<512, DeviceTier::Blackwell>::ncols1 == 8);
 
 struct Launch {
@@ -229,7 +241,8 @@ void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_byt
     const dim3 block(WARP_SIZE, launch.threads / WARP_SIZE, 1);
     launch.kernel<<<dim3(g.blocks, 1, 1), block, launch.shared, stream>>>(
         reinterpret_cast<const char*>(a.q), static_cast<const char*>(a.k),
-        static_cast<const char*>(a.v), static_cast<const char*>(a.mask), nullptr, a.kv_max, a.out,
+        static_cast<const char*>(a.v), static_cast<const char*>(a.mask),
+        reinterpret_cast<const char*>(a.sinks), a.kv_max, a.out,
         meta, a.scale, 0.0f, 1.0f, 1.0f, 1u, 0.0f, D, ne01, a.query_heads, 1, nb01, nb02, nb03, D,
         a.slots, a.kv_heads, 1, static_cast<std::int32_t>(a.row_bytes),
         static_cast<std::int32_t>(a.head_bytes), a.head_bytes * a.kv_heads,
@@ -266,6 +279,10 @@ void run(const FlashAttentionArgs& a, void* workspace, std::size_t workspace_byt
 std::size_t flash_attention_workspace_bytes(int head_dim, int query_heads, int kv_heads,
                                             int max_tokens) {
     switch (head_dim) {
+    case 128:
+        return with_current_tier([&]<DeviceTier Tier>() {
+            return workspace_for<128, Tier>(query_heads, kv_heads, max_tokens);
+        });
     case 256:
         return with_current_tier([&]<DeviceTier Tier>() {
             return workspace_for<256, Tier>(query_heads, kv_heads, max_tokens);
@@ -276,11 +293,13 @@ std::size_t flash_attention_workspace_bytes(int head_dim, int query_heads, int k
         });
     default: break;
     }
-    throw std::invalid_argument("gguf flash attention: head width must be 256 or 512");
+    throw std::invalid_argument("gguf flash attention: head width must be 128, 256 or 512");
 }
 
 int flash_attention_tile_rows(int head_dim) {
     switch (head_dim) {
+    case 128:
+        return with_current_tier([]<DeviceTier Tier>() { return Shape<128, Tier>::ncols1; });
     case 256:
         return with_current_tier([]<DeviceTier Tier>() { return Shape<256, Tier>::ncols1; });
     case 512:
@@ -288,7 +307,7 @@ int flash_attention_tile_rows(int head_dim) {
     default:
         break;
     }
-    throw std::invalid_argument("gguf flash attention: head width must be 256 or 512");
+    throw std::invalid_argument("gguf flash attention: head width must be 128, 256 or 512");
 }
 
 void flash_attention(const FlashAttentionArgs& args, void* workspace, std::size_t workspace_bytes,
@@ -301,6 +320,9 @@ void flash_attention(const FlashAttentionArgs& args, void* workspace, std::size_
         throw std::invalid_argument("gguf flash attention: invalid arguments");
     }
     switch (args.head_dim) {
+    case 128:
+        return with_current_tier(
+            [&]<DeviceTier Tier>() { run<128, Tier>(args, workspace, workspace_bytes, stream); });
     case 256:
         return with_current_tier(
             [&]<DeviceTier Tier>() { run<256, Tier>(args, workspace, workspace_bytes, stream); });
@@ -309,7 +331,7 @@ void flash_attention(const FlashAttentionArgs& args, void* workspace, std::size_
             [&]<DeviceTier Tier>() { run<512, Tier>(args, workspace, workspace_bytes, stream); });
     default: break;
     }
-    throw std::invalid_argument("gguf flash attention: head width must be 256 or 512");
+    throw std::invalid_argument("gguf flash attention: head width must be 128, 256 or 512");
 }
 
 } // namespace ninfer::ops::gguf

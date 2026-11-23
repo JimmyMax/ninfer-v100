@@ -126,7 +126,7 @@ struct HybridExperts::Impl {
         std::vector<double> score;
     };
     struct Rank {
-        DeviceBuffer slots, tables, parts, cpu_sum;
+        DeviceBuffer slots, tables, parts, cpu_sum, sequence;
         std::array<std::unique_ptr<CudaCompletionEvent>, 2> staged;
         std::unique_ptr<CudaHostHandshake> handshake;
         std::atomic<std::uint32_t> served{0};
@@ -221,7 +221,10 @@ struct HybridExperts::Impl {
             rank.tables = DeviceBuffer(3 * rank.experts * sizeof(Weight));
             rank.parts = DeviceBuffer(kTop * tokens);
             rank.cpu_sum = DeviceBuffer(kCpuTokens * kHidden * sizeof(float));
-            rank.handshake = std::make_unique<CudaHostHandshake>(device.rank(r));
+            rank.sequence = DeviceBuffer(sizeof(std::uint32_t));
+            rank.sequence.fill();
+            rank.handshake = std::make_unique<CudaHostHandshake>(
+                device.rank(r), static_cast<std::uint32_t*>(rank.sequence.p));
             for (auto& event : rank.staged) { event = std::make_unique<CudaCompletionEvent>(device.rank(r)); }
         }
         routes = std::make_unique<PinnedHostBuffer>(kTop * tokens * sizeof(std::int32_t));

@@ -51,6 +51,7 @@ add_library(ninfer_engine STATIC
   engine/model_instance.cpp
   engine/qwen4_exp_core.cpp
   engine/gemma4_core.cpp
+  engine/inkling2_core.cpp
   contract/sampling.cpp
   engine/engine.cpp
 )

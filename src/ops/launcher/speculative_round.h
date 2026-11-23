@@ -24,8 +24,9 @@ void speculative_accept_coupled_drafts_launch(const Tensor& target_tokens, const
                                               Tensor& lengths, Tensor& anchors,
                                               Tensor& licensed_tokens, Tensor& licensed_counts,
                                               Tensor& accepted, std::int32_t token_domain,
-                                              const SamplingConfig* configs, DeviceSpan workspace,
-                                              cudaStream_t stream);
+                                              const SamplingConfig* configs,
+                                              const std::int32_t* column_starts,
+                                              DeviceSpan workspace, cudaStream_t stream);
 
 void speculative_accept_sparse_drafts_launch(
     const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
@@ -39,5 +40,11 @@ void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tenso
 
 void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t* id_map,
                                      std::int32_t n, cudaStream_t stream);
+
+void proposal_expand_logits_launch(const Tensor& subset, const std::int32_t* id_map,
+                                   std::int32_t n, Tensor& expanded, cudaStream_t stream);
+
+void proposal_select_sampled_launch(Tensor& proposal_tokens, const Tensor& sampled,
+                                    const SamplingConfig* configs, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

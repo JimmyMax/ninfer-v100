@@ -1100,6 +1100,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
+            options.speculative.spec_explicit = true;
             continue;
         }
         if (arg == "--draft-tokens") {

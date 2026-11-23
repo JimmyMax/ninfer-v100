@@ -146,6 +146,9 @@ struct PrepareStats {
 // (docs/maintainer/hybrid-prefix-cache-spec.md §7.1). Frontiers are exact token positions.
 struct PreparedTapHints {
     std::vector<runtime::prefix_cache::TapHint> hints;
+    // CacheRetentionHint::Disposable: no request continues this one, so it supersedes nothing it
+    // resumed from.
+    bool disposable = false;
 };
 
 struct PreparedPromptData {
@@ -157,6 +160,10 @@ struct PreparedPromptData {
     // The request's live ngram index over token_ids and ngram_sources, present whenever ngram
     // drafting is enabled. Preparation builds it so admission only moves it into the request.
     std::unique_ptr<detail::NgramProposer> ngram_index;
+    // The request's scale for each loaded LoRA adapter (frontend/steering.h), zero past them, and
+    // what the scales add to the prompt's cache identity: zero when every scale is zero.
+    std::array<float, kMaximumLoraAdapters> lora_scales{};
+    std::array<std::uint64_t, 2> lora_key{};
     // Hybrid prefix-cache lookup keys over token_ids (program/prefix/block_keys.h): one chained
     // hash per full 64-token block and, with media, one cumulative Vision key per block.
     std::vector<std::uint64_t> block_hashes;

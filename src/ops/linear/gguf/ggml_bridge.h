@@ -4,6 +4,8 @@
 // define their own CUDA_CHECK and friends, so only the bridge's own translation unit includes them;
 // everything here is raw pointers and cudaStream_t.
 
+#include "ggml_bridge_args.h"
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -13,7 +15,8 @@
 
 namespace ninfer::ops::gguf {
 
-// The block type's id in a GGUF tensor directory (ggml_type).
+// The block type's id in a GGUF tensor directory (ggml_type). The kernel units hold it opaque
+// (ggml_bridge_args.h): a new type recompiles the bridge's dispatch, not every type's kernels.
 enum class GgmlType : int {
     Q4_0    = 2,
     Q5_0    = 6,
@@ -32,6 +35,8 @@ enum class GgmlType : int {
     IQ2_S   = 22,
     IQ4_XS  = 23,
     IQ1_M   = 29,
+    MXFP4   = 39,
+    NVFP4   = 40,
     Q2_0    = 42,
 };
 
@@ -45,8 +50,9 @@ struct BlockShape {
 // Streaming multiprocessors of the current device (cached per device).
 [[nodiscard]] int multiprocessor_count();
 
-// Whether the integer tensor-core prefill kernel exists for the type. IQ1_M has none (nor does it in
-// llama.cpp); its wide products dequantize and take a BF16 GEMM.
+// Whether the integer tensor-core prefill kernel exists for the type's dense products. IQ1_M's and
+// MXFP4's wide dense products dequantize and take a BF16 GEMM; IQ1_M's routed experts do have one
+// (moe_matrix_supported), off sm_70.
 [[nodiscard]] bool has_matrix_kernel(GgmlType type);
 
 // Columns the vector kernel takes in one launch; wider products take the matrix kernel.
@@ -60,19 +66,11 @@ inline constexpr int kMaxVectorColumns = 8;
 // `input_columns` (optional, [k]) makes element c of each column x[input_columns[c]].
 void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
                                 const std::int32_t* input_columns, void* out, cudaStream_t stream);
-
-enum class Epilogue : int {
-    Store,       // out = y
-    Accumulate,  // out = out + y
-    GateProduct, // out = act(gate) * y, gate read from a float plane
-};
-
-// The activation a gated product applies to its gate: SiLU (SwiGLU) or tanh-approximated GELU
-// (GeGLU, Gemma 4).
-enum class GateActivation : int {
-    Silu     = 0,
-    GeluTanh = 1,
-};
+// The same activation from FP32 columns: output column c holds x column source[c] (zeros for a
+// negative entry; column c without `source`), each value first multiplied by scale[i] when `scale`
+// ([k]) is given, quantized as the BF16 form quantizes its values.
+void quantize_vector_activation_f32(const float* x, int k, int columns, const std::int32_t* source,
+                                    const float* scale, void* out, cudaStream_t stream);
 
 struct VectorOutput {
     __nv_bfloat16* bf16 = nullptr; // exactly one of bf16 / f32
@@ -86,11 +84,9 @@ struct VectorOutput {
 
 // out[r, c] <- epilogue(sum_k W[r, k] x[k, c]) for rows [0, rows) and columns [0, columns),
 // columns <= kMaxVectorColumns. `weight` points at row 0; rows are `row_bytes` apart.
-// 本仓库 V100 增量：`dense` selects the Q6_K dense per-row layout (QuantLayout::VoltaQ6KDense);
-// it is valid for Q6_K only and must match the weight's stored layout.
 void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, const VectorOutput& out,
-                    cudaStream_t stream, bool dense = false);
+                    cudaStream_t stream);
 
 // out[r, c] = act(gate_r . x_c) * (up_r . x_c) where gate row r and up row r are rows r and
 // rows + r of one parent of this type.
@@ -102,6 +98,12 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
 // Activation for the matrix kernel, laid out for the type's scale/sum schedule. Types that share a
 // schedule share an activation, see matrix_activation_layout().
 [[nodiscard]] int matrix_activation_layout(GgmlType type);
+// Whether the type's matrix activation keeps each 32 values' sum in F16 (Q4_0, Q4_1, Q5_1, Q4_K,
+// Q5_K, IQ1_S): a sum past 65504 is infinite there, so callers whose rows can reach it scale them.
+[[nodiscard]] bool matrix_activation_f16_sums(GgmlType type);
+// Whether the type's vector dot reads each 32 values' F16 sum of its vector activation (Q4_K, Q5_K,
+// IQ1_S): the same limit holds there.
+[[nodiscard]] bool vector_activation_f16_sums(GgmlType type);
 [[nodiscard]] std::size_t matrix_activation_bytes(int k, int columns);
 void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, int columns,
                                 const std::int32_t* input_columns, void* out, cudaStream_t stream);
@@ -126,6 +128,11 @@ void quantize_matrix_activation_padded(GgmlType type, const __nv_bfloat16* x, in
                                        const std::int32_t* input_columns, void* out,
                                        cudaStream_t stream);
 
+void matrix_product_bf16(GgmlType type, const void* weight, std::int64_t row_bytes, int rows,
+                         int k, const void* activation, int columns, __nv_bfloat16* out,
+                         std::int64_t out_column_stride, float* partial, void* fixup,
+                         cudaStream_t stream, bool accumulate = false, bool tail = false);
+
 // out <- epilogue(in) for an FP32 [rows, columns] plane whose columns are `in_column_stride` apart.
 void store_plane(const float* in, std::int64_t in_column_stride, int rows, int columns,
                  const VectorOutput& out, cudaStream_t stream);
@@ -148,29 +155,51 @@ void dequantized_product(GgmlType type, const void* weight, std::int64_t row_byt
 // --- Mixture of experts -------------------------------------------------------------------------
 // A product over the experts a router selected: pair p (token p / per_token, its slot p %
 // per_token) multiplies the rows of expert ids[p]. Experts are reached through a device table of
-// base pointers, so an expert may live in a device bank, a cache slot or mapped host memory.
-
-// The pairs grouped by expert: `sorted` lists the pairs of expert e at [bounds[e], bounds[e + 1]),
-// and `active` the `*active_count` experts that have any, ascending. Device arrays.
-// moe_sort_routes also lists the matrix kernel's work for each of its column tile widths
-// (16, 32, 64 and 128 pairs, list w for width 16 << w): every (expert, column tile) that holds a
-// pair, expert | tile << 16, ascending, `tile_count[w]` of them at tiles + w * tile_capacity.
-struct MoeRouting {
-    const std::int32_t* bounds       = nullptr; // [experts + 1]
-    const std::int32_t* sorted       = nullptr; // [pairs]
-    const std::int32_t* active       = nullptr; // [experts]
-    const std::int32_t* active_count = nullptr; // [1]
-    const std::int32_t* tile_count   = nullptr; // [4]
-    const std::int32_t* tiles        = nullptr; // [4][tile_capacity]
-    int tile_capacity                = 0;
-};
+// base pointers, so an expert may live in a device bank, a cache slot or mapped host memory. The
+// pairs grouped by expert are a MoeRouting (ggml_bridge_args.h).
 
 [[nodiscard]] std::size_t moe_routing_bytes(int experts, int pairs);
-// Groups the pairs of `ids` ([pairs], each in [0, experts)) into `workspace` (moe_routing_bytes).
-// Within one expert the pairs keep no particular order; every product below writes each pair's
-// result to its own place, so the order changes no value.
+// Groups the pairs of `ids` ([pairs]) into `workspace` (moe_routing_bytes); a pair whose id lies
+// outside [0, experts) is left out (expert parallelism marks another device's pairs -1), and the
+// positions of `sorted` past the kept pairs name pair 0. Within one expert the pairs keep no
+// particular order; every product below writes each pair's result to its own place, so the order
+// changes no value.
 [[nodiscard]] MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts,
                                          void* workspace, cudaStream_t stream);
+// The routing an earlier moe_sort_routes of the same pairs and experts left in `workspace`, without
+// sorting again.
+[[nodiscard]] MoeRouting moe_sorted_routes(void* workspace, int pairs, int experts);
+// The same grouping divided by how many pairs each expert has, for a call whose few-pair experts
+// take the vector products and the others the matrix kernel: `all` is moe_sort_routes's routing,
+// `vector` lists as active only the experts with 1 to `vector_pairs` pairs, and `matrix` lists the
+// column tiles of the experts with more. All three share the bounds and sorted pairs. `workspace`
+// holds moe_split_routing_bytes.
+struct MoeSplitRouting {
+    MoeRouting all, vector, matrix;
+};
+[[nodiscard]] std::size_t moe_split_routing_bytes(int experts, int pairs);
+[[nodiscard]] MoeSplitRouting moe_sort_routes_split(const std::int32_t* ids, int pairs, int experts,
+                                                    int vector_pairs, void* workspace,
+                                                    cudaStream_t stream);
+
+// Expert parallelism: a device's part of a MoE call runs the routed experts [begin, end) it holds.
+// moe_keep_experts copies ids into `out` with -1 for every pair of another device's expert, which
+// moe_sort_routes then leaves out. moe_weighted_rows sums the FP32 rows [pairs][row_values] of a
+// matrix product weighted into the 2^-32 fixed-point sum [tokens][row_values] (token =
+// p / per_token), each contribution rounded as MoeOutput::weighted rounds it; a pair whose `ids`
+// entry is negative is skipped and its row never read. The parts' sums then add as integers
+// (add_fixed_parts: sums += each of `count` parts of n values, up to 8 parts), independent of how
+// the experts are divided.
+void moe_keep_experts(const std::int32_t* ids, int pairs, int begin, int end, std::int32_t* out,
+                      cudaStream_t stream);
+// The same with each kept id less `begin`: ids into tables of the device's experts alone.
+void moe_local_experts(const std::int32_t* ids, int pairs, int begin, int end, std::int32_t* out,
+                       cudaStream_t stream);
+void moe_weighted_rows(const float* rows, const std::int32_t* ids, const float* weights, int tokens,
+                       int per_token, int row_values, unsigned long long* fixed,
+                       cudaStream_t stream);
+void add_fixed_parts(unsigned long long* sums, const unsigned long long* const* parts, int count,
+                     std::int64_t n, cudaStream_t stream);
 
 // One projection of every expert: expert e's `rows` rows of `k` values start at experts[e].
 struct MoeTable {
@@ -178,6 +207,7 @@ struct MoeTable {
     std::int64_t row_bytes     = 0;
     int rows                   = 0;
     int k                      = 0;
+    bool aligned16             = false; // every expert's base pointer is 16-byte aligned
 };
 
 // Where a product over experts puts pair p's row r.
@@ -218,86 +248,12 @@ void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
 //
 // A call can be prepared once instead of in every block: moe_decode_prep lists each slot's pairs
 // (records) and quantizes the tokens' inputs, and the up launches quantize the pairs' middles for
-// the down kernel (and list the second stage's slots, whose ids are final only then).
-struct MoeDecodeRecord {
-    // The slot's expert and the id set it came from (0: ids_a, 1: ids_b), with that expert's
-    // pairs in ascending order and their tokens; n == 0 when the slot is negative in its set or
-    // repeats an earlier slot's expert.
-    std::int32_t expert = -1, n = 0, source = 0, reserved = 0;
-    std::int32_t pairs[8] = {}, columns[8] = {};
-};
-struct MoeDecodePrepArgs {
-    const __nv_bfloat16* m = nullptr; // BF16 [tokens][2560]
-    int tokens             = 0;
-    const std::int32_t* ids = nullptr; // [slots], the first stage's set (ids_a)
-    int slots = 0, per_token = 10;
-    MoeDecodeRecord* records = nullptr; // [slots]
-    // The inputs as `type`'s up kernel reads them: q8_1 values [tokens][2560], (d, sum) and the
-    // integer sum of every 32 values [tokens][80].
-    std::int8_t* qs          = nullptr;
-    half2* ds                = nullptr;
-    int* qsum                = nullptr;
-    unsigned long long* zero = nullptr; // zeroed when given
-    int zero_count           = 0;
-};
+// the down kernel (and list the second stage's slots, whose ids are final only then). Their
+// arguments are in ggml_bridge_args.h.
 void moe_decode_prep(GgmlType type, const MoeDecodePrepArgs& args, cudaStream_t stream);
 // Whether `type`'s decode kernels read transposed activations (MoeDecodeUpArgs::middle_transposed).
 [[nodiscard]] bool moe_decode_transposed(GgmlType type);
 
-struct MoeDecodeUpArgs {
-    const __nv_bfloat16* m = nullptr; // BF16 [tokens][k]
-    int k = 2560, rows = 640;
-    const std::int32_t* ids = nullptr; // [slots]: negative entries skipped; null: all expert 0
-    int slots = 0, per_token = 10;
-    const std::uint8_t* const* gate = nullptr;
-    const std::uint8_t* const* up   = nullptr;
-    std::int64_t row_bytes          = 0;
-    __nv_bfloat16* middle           = nullptr; // [slots][rows]
-    unsigned long long* zero        = nullptr; // zeroed first when given
-    int zero_count                  = 0;
-    // Prepared: the slots' records (instead of scanning ids) and the quantized inputs (instead of m).
-    const MoeDecodeRecord* records = nullptr;
-    const std::int8_t* qs          = nullptr;
-    const half2* ds                = nullptr;
-    const int* qsum                = nullptr;
-    // When given, every block quantizes its 32 middle values of every pair for the down kernel
-    // (transposed when its decoder reads them so) instead of storing them: [slots][640], and
-    // [slots][20] (d, sum) and integer sums. Requires rows to be whole groups of 32.
-    std::int8_t* middle_qs         = nullptr;
-    half2* middle_ds               = nullptr;
-    int* middle_qsum               = nullptr;
-    bool middle_transposed         = false;
-    // Scanning `ids`, a block row also lists its slot in `write_records` as `record_source`: the
-    // first stage (0) every slot, the second (1) the slots it serves.
-    MoeDecodeRecord* write_records = nullptr;
-    int record_source              = 1;
-};
-struct MoeDecodeDownArgs {
-    int rows = 2560; // the down projection's outputs; its k is 640
-    // A slot is served from table_a when ids_a[slot] >= 0, else from table_b when ids_b[slot] >= 0.
-    const std::int32_t* ids_a = nullptr; // null: all expert 0
-    const std::int32_t* ids_b = nullptr;
-    int slots = 0, per_token = 10;
-    const std::uint8_t* const* table_a = nullptr;
-    const std::uint8_t* const* table_b = nullptr;
-    std::int64_t row_bytes             = 0;
-    const __nv_bfloat16* middle        = nullptr; // [slots][640]
-    const float* weights               = nullptr; // [slots]
-    unsigned long long* fixed          = nullptr; // [tokens][rows]
-    int tokens                         = 0;
-    // The call's last launch: y [tokens][rows], external products (as add_products), and a
-    // completion counter that starts at zero and is left at zero.
-    float* y                         = nullptr;
-    unsigned int* counter            = nullptr;
-    const float* products            = nullptr;
-    const std::int32_t* product_pairs = nullptr;
-    const std::int32_t* product_count = nullptr;
-    // Prepared: the slots' records and the quantized middles (MoeDecodeUpArgs::middle_qs).
-    const MoeDecodeRecord* records = nullptr;
-    const std::int8_t* qs          = nullptr;
-    const half2* ds                = nullptr;
-    const int* qsum                = nullptr;
-};
 void moe_decode_up(GgmlType type, const MoeDecodeUpArgs& args, int chunk, cudaStream_t stream);
 void moe_decode_down(GgmlType type, const MoeDecodeDownArgs& args, int chunk, cudaStream_t stream);
 
@@ -311,28 +267,52 @@ void moe_decode_down(GgmlType type, const MoeDecodeDownArgs& args, int chunk, cu
 // step reads into the next row. A type without an integer kernel, or a geometry no tile fits
 // (rows a whole number of row tiles), is not supported and stays on moe_vector_product.
 [[nodiscard]] bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail);
+// Whether a wide call's IQ1_M routed experts take the matrix kernel rather than the vector kernel
+// in groups of eight columns: their gate and up products (`gate_up`) once the call's `pairs`
+// routed rows average more than 16 for each of the `experts`, where moe_matrix_product's column
+// tiles become 32 wide, their down products from 6. With fewer rows most of the matrix kernel's
+// tile columns stay empty, and it gathers and quantizes a row for every pair. In DeepSeek-V4.1's
+// prompt steps on an RTX 4090, gate and up products on 16-wide tiles ran at 0.89 to 1.02 times
+// the vector kernel's speed and at 1.37 times on 32-wide ones, down products at 1.30 times from
+// 7.3 rows. ninfer_gguf_moe_matrix_bench, which times the products alone over uniform routes, puts
+// the matrix kernel further ahead; its down crossovers on an RTX 2080 Ti, 3090, 4090 and 5090 lie
+// at or below 6 rows.
+[[nodiscard]] constexpr bool iq1m_moe_matrix_pays(bool gate_up, std::int64_t pairs,
+                                                  std::int64_t experts) {
+    return gate_up ? pairs > 16 * experts : pairs >= 6 * experts;
+}
 void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
                         int max_active, int pairs, bool tail, const void* activation, float* out,
                         cudaStream_t stream);
 // Column c of the activation is x column routing.sorted[c] / column_group, in the layout of the
 // type's scale/sum schedule (matrix_activation_layout), zero past k up to a whole 256-value step.
+// On a device that runs sm_70 code, which has no integer tensor cores, the activation is instead
+// an FP16 plane with a power-of-two factor per column and the product runs on the FP16 tensor
+// cores over the blocks' values rounded to FP16 (ggml_bridge_sm70.cuh); there it takes any rows
+// that are whole 32-row warps and any k of whole blocks, and needs no `tail`.
 [[nodiscard]] std::size_t moe_matrix_activation_bytes(int k, int pairs);
 void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k,
                                     const MoeRouting& routing, int pairs, int column_group,
                                     void* out, cudaStream_t stream);
+// The same activation from FP32 columns: column c (routing order) holds x column
+// source[routing.sorted[c]] (zeros for a negative entry; the pair's own column without `source`),
+// each value first multiplied by scale[i] when `scale` ([k]) is given. k is a multiple of 32.
+void quantize_moe_matrix_activation_f32(GgmlType type, const float* x, int k,
+                                        const MoeRouting& routing, int pairs,
+                                        const std::int32_t* source, const float* scale, void* out,
+                                        cudaStream_t stream);
 
 // out[i, :] = dequantize(W[row_ids ? row_ids[i] : i, :]) as BF16, rows `out_row_stride` apart.
-// 本仓库 V100 增量：`dense` selects the Q6_K dense per-row layout (QuantLayout::VoltaQ6KDense).
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __nv_bfloat16* out,
-                     std::int64_t out_row_stride, cudaStream_t stream, bool dense = false);
+                     std::int64_t out_row_stride, cudaStream_t stream);
 // The same rows in FP32, where every value is exact.
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, float* out,
-                     std::int64_t out_row_stride, cudaStream_t stream, bool dense = false);
+                     std::int64_t out_row_stride, cudaStream_t stream);
 // The same rows in FP16, the operand type of sm_70's tensor cores (ops/linear/sm70).
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __half* out,
-                     std::int64_t out_row_stride, cudaStream_t stream, bool dense = false);
+                     std::int64_t out_row_stride, cudaStream_t stream);
 
 } // namespace ninfer::ops::gguf

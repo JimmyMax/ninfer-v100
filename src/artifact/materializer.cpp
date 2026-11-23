@@ -394,6 +394,10 @@ const WeightParent& MaterializedArtifact::pinned_parent(ObjectHandle handle) con
     return *objects_[handle.index].pinned;
 }
 
+bool MaterializedArtifact::pinned(ObjectHandle handle) const noexcept {
+    return handle.index < objects_.size() && objects_[handle.index].pinned.has_value();
+}
+
 std::span<const std::byte> MaterializedArtifact::pinned_block() const noexcept {
     if (!pinned_) { return {}; }
     return {static_cast<const std::byte*>(pinned_->data()), pinned_->size()};

@@ -20,6 +20,21 @@ add_library(ninfer_core STATIC
   decode_graph.cpp
   cuda_host_handshake.cu
   expert_delivery.cu
+  expert_tier.cpp
+  cpu_spin_pool.cpp
+  expert_split.cpp
+  expert_parallel.cpp
+  host_pages.cpp
+  device_wait.cu
+  tensor_parallel.cu
+  tensor_split.cpp
+  growable_region.cu
+  mapped_host_copy.cu
+  host_memory.cpp
+  expert_direct.cpp
+  expert_mirror.cpp
+  io_priority.cpp
+  zero_pages.cpp
   evictable_kv_pool.cu
   evictable_weight_pool.cu
   vmm.cu

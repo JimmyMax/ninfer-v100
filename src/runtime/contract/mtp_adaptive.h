@@ -1,7 +1,10 @@
 #pragma once
 
 // Adaptive MTP verification width (--adaptive-mtp), shared by the Qwen3.5 Programs and the
-// Qwen3.8-Flash-Next core. Each request keeps an estimate of how far its drafts survive; a batch
+// Qwen3.8-Flash-Next core, the width of a masked drafter's round in the Qwen3.5 Programs
+// (MaskedWidthController), the per-row extents of a packed verification (MtpPackedPlanner), and
+// whether a lone request's rounds commit tokens faster than plain decode steps (SpeculationGate).
+// Each request keeps an estimate of how far its drafts survive; a batch
 // controller picks the verification width that maximizes expected committed tokens per unit of
 // round cost, moving between widths only after a candidate has won several rounds and a width has
 // held for a few. Round costs are measured per batch size and width as the rounds run; a width not
@@ -406,6 +409,396 @@ private:
     std::uint64_t selection_cohort_key_ = 0;
     std::uint32_t last_transition_from_ = 1;
     std::uint32_t last_transition_to_   = 1;
+};
+
+// A request's acceptance under a masked drafter's two widths, a narrow n and a wide W. With A the
+// drafts a wide round accepts, a narrow round commits min(A, n) + 1 tokens and a wide one adds
+// (A - n) when A >= n, so E[wide] = E[narrow] + P(A >= n) * E[A - n | A >= n]. Every round
+// measures the first two terms; only a wide round measures the tail, whose last value stands
+// while narrow rounds run. Moving averages over about ten rounds.
+class MaskedWidthSignal final {
+public:
+    void observe(std::uint32_t window, std::uint32_t narrow, std::uint32_t accepted) noexcept {
+        const float head = static_cast<float>(std::min(accepted, narrow)) + 1.0F;
+        narrow_tokens_ += kAlpha * (head - narrow_tokens_);
+        full_ += kAlpha * ((accepted >= narrow ? 1.0F : 0.0F) - full_);
+        if (window > narrow && accepted >= narrow) {
+            tail_ += kAlpha * (static_cast<float>(accepted - narrow) - tail_);
+        }
+    }
+
+    // Expected committed tokens of a round at `window` (the narrow width or wider) with `ready`
+    // drafts the request can still take.
+    [[nodiscard]] float expected_tokens(std::uint32_t window, std::uint32_t narrow,
+                                        std::uint32_t ready) const noexcept {
+        const float expected = window > narrow ? narrow_tokens_ + full_ * tail_ : narrow_tokens_;
+        return std::min(expected, static_cast<float>(std::min(window, ready)) + 1.0F);
+    }
+
+    // A neutral start for widths n and W: half the narrow drafts kept, half the rounds full, and
+    // half the drafts past them kept in a full round.
+    void reset(std::uint32_t narrow, std::uint32_t wide) noexcept {
+        narrow_tokens_ = 1.0F + 0.5F * static_cast<float>(narrow);
+        full_          = 0.5F;
+        tail_          = 0.5F * static_cast<float>(wide > narrow ? wide - narrow : 0U);
+    }
+
+private:
+    static constexpr float kAlpha = 0.1F;
+    float narrow_tokens_ = 1.0F;
+    float full_          = 0.0F;
+    float tail_          = 0.0F;
+};
+
+// The width of a masked drafter's round (DFlash, DFlash2 and DSpine in the Qwen3.5 Programs, under
+// --adaptive-mtp): the draft window W or n = W/2, each with its own CUDA Graphs. A masked drafter
+// makes all of a round's drafts in one pass at the round's width, so a narrower round also drafts
+// less. The controller keeps the width with the most expected committed tokens of the round's rows
+// (MaskedWidthSignal) per second of round time at that batch size; a width changes after it has led
+// by kMargin for kSwitchRounds rounds in a row. Round times grow as contexts lengthen, so the width
+// not running is priced from the running width's current time and the ratio of the two widths
+// measured close together: a batch size runs the other width kProbeRounds rounds once the selected
+// width is measured there, and again every kRefreshRounds rounds. A new request starts from the
+// pooled estimate of every request's rounds.
+class MaskedWidthController final {
+public:
+    void reset(std::uint32_t wide_window, std::uint32_t narrow_window) noexcept {
+        wide_              = std::clamp(wide_window, 1U, kAdaptiveMtpMaximumDrafts);
+        narrow_            = std::clamp(narrow_window, 1U, wide_);
+        selected_          = wide_;
+        challenger_rounds_ = 0;
+        probe_rounds_      = 0;
+        transitioned_      = false;
+        batches_           = {};
+        pooled_.reset(narrow_, wide_);
+    }
+
+    [[nodiscard]] std::uint32_t wide() const noexcept { return wide_; }
+    [[nodiscard]] std::uint32_t narrow() const noexcept { return narrow_; }
+
+    // The estimate a new request starts from.
+    [[nodiscard]] const MaskedWidthSignal& pooled() const noexcept { return pooled_; }
+
+    // A round of `window` drafts that one request ran to its full width, `accepted` of them kept.
+    void observe_round(MaskedWidthSignal& signal, std::uint32_t window,
+                       std::uint32_t accepted) noexcept {
+        signal.observe(window, narrow_, accepted);
+        pooled_.observe(window, narrow_, accepted);
+    }
+
+    // `room` counts each row's remaining tokens, the round's committed bonus token included.
+    [[nodiscard]] std::uint32_t select(std::span<const MaskedWidthSignal* const> signals,
+                                       std::span<const std::uint32_t> room) noexcept {
+        transitioned_ = false;
+        if (narrow_ == wide_ || signals.empty() || signals.size() > kAdaptiveMtpMaximumBatch ||
+            signals.size() != room.size()) {
+            return selected_;
+        }
+        const Batch& batch        = batches_[signals.size() - 1U];
+        const std::uint32_t other = selected_ == wide_ ? narrow_ : wide_;
+        if (probe_rounds_ > 0) {
+            --probe_rounds_;
+            return other;
+        }
+        const Width& running = batch.widths[index(selected_)];
+        const Width& idle    = batch.widths[index(other)];
+        if (running.samples >= kMeasuredRounds &&
+            (idle.samples == 0 || batch.rounds - idle.last_round > kRefreshRounds)) {
+            probe_rounds_ = (idle.samples == 0 ? kProbeRounds : kRefreshProbeRounds) - 1U;
+            return other;
+        }
+        if (score(other, signals, room) > (1.0F + kMargin) * score(selected_, signals, room)) {
+            if (++challenger_rounds_ >= kSwitchRounds) {
+                selected_          = other;
+                challenger_rounds_ = 0;
+                transitioned_      = true;
+            }
+        } else {
+            challenger_rounds_ = 0;
+        }
+        return selected_;
+    }
+
+    void observe_execution(std::uint32_t batch_size, std::uint32_t window,
+                           double seconds) noexcept {
+        if (batch_size == 0 || batch_size > kAdaptiveMtpMaximumBatch ||
+            (window != wide_ && window != narrow_) || !(seconds > 0.0)) {
+            return;
+        }
+        Batch& batch       = batches_[batch_size - 1U];
+        Width& width       = batch.widths[index(window)];
+        const Width& other = batch.widths[index(window == wide_ ? narrow_ : wide_)];
+        const auto sample  = static_cast<float>(seconds);
+        ++batch.rounds;
+        // A width that has not run for a while starts its average again.
+        const bool stale = width.samples == 0 || batch.rounds - width.last_round > kFreshRounds;
+        width.seconds    = stale ? sample : width.seconds + kCostAlpha * (sample - width.seconds);
+        if (stale) { width.samples = 0; }
+        if (width.samples != UINT16_MAX) { ++width.samples; }
+        width.last_round = batch.rounds;
+        if (other.samples != 0 && batch.rounds - other.last_round <= kFreshRounds) {
+            batch.wide_over_narrow =
+                batch.widths[1].seconds / std::max(batch.widths[0].seconds, 1e-9F);
+        }
+    }
+
+    // Whether the last select() moved the selected width.
+    [[nodiscard]] bool transitioned() const noexcept { return transitioned_; }
+
+private:
+    struct Width {
+        float seconds          = 0.0F;
+        std::uint16_t samples  = 0;
+        std::uint32_t last_round = 0;
+    };
+    struct Batch {
+        std::array<Width, 2> widths{}; // narrow, wide
+        std::uint32_t rounds   = 0;
+        float wide_over_narrow = 0.0F;  // 0 until both widths ran close together
+    };
+
+    [[nodiscard]] std::size_t index(std::uint32_t window) const noexcept {
+        return window == wide_ ? 1U : 0U;
+    }
+
+    // Seconds of a round at `window`: its own current time, else the other width's scaled by their
+    // ratio; relative units while neither width has run at this batch size.
+    [[nodiscard]] float cost(const Batch& batch, std::uint32_t window) const noexcept {
+        const std::size_t own   = index(window);
+        const Width& mine       = batch.widths[own];
+        const Width& theirs     = batch.widths[1U - own];
+        const float ratio       = batch.wide_over_narrow > 0.0F
+                                      ? batch.wide_over_narrow
+                                      : 1.0F + kRelativeCostPerDraft *
+                                                   static_cast<float>(wide_ - narrow_);
+        const bool mine_current = mine.samples != 0 &&
+                                  batch.rounds - mine.last_round <= kFreshRounds;
+        if (mine_current || theirs.samples == 0) {
+            if (mine.samples != 0) { return mine.seconds; }
+            return own == 1U ? ratio : 1.0F;
+        }
+        return own == 1U ? theirs.seconds * ratio : theirs.seconds / ratio;
+    }
+
+    [[nodiscard]] float score(std::uint32_t window,
+                              std::span<const MaskedWidthSignal* const> signals,
+                              std::span<const std::uint32_t> room) const noexcept {
+        float expected = 0.0F;
+        for (std::size_t row = 0; row < signals.size(); ++row) {
+            const std::uint32_t ready = room[row] > 0 ? room[row] - 1U : 0U;
+            expected += signals[row]->expected_tokens(window, narrow_, ready);
+        }
+        return expected / cost(batches_[signals.size() - 1U], window);
+    }
+
+    static constexpr std::uint32_t kSwitchRounds       = 4;
+    static constexpr std::uint32_t kProbeRounds        = 4;
+    static constexpr std::uint32_t kRefreshProbeRounds = 2;
+    static constexpr std::uint32_t kRefreshRounds      = 96;
+    static constexpr std::uint32_t kFreshRounds        = 8;
+    static constexpr std::uint16_t kMeasuredRounds     = 4;
+    static constexpr float kMargin                     = 0.02F;
+    static constexpr float kCostAlpha                  = 0.125F;
+    // Round time per extra draft relative to the narrow round, before both widths ran: 15 against 7
+    // DSpine drafts took 1.21 times as long for one Qwen3.8-27B request on an RTX 5090, 1.26 for
+    // eight.
+    static constexpr float kRelativeCostPerDraft = 0.0275F;
+
+    std::uint32_t wide_ = 1, narrow_ = 1, selected_ = 1;
+    std::uint32_t challenger_rounds_ = 0, probe_rounds_ = 0;
+    bool transitioned_               = false;
+    std::array<Batch, kAdaptiveMtpMaximumBatch> batches_{};
+    MaskedWidthSignal pooled_;
+};
+
+// Draft extents of a packed verification, where each row verifies only its own anchor and drafts
+// and the round's cost follows the total rows verified. Given each row's ready drafts, the plan
+// keeps the extents that maximize expected committed tokens per unit of that cost: for every total
+// it finds the best split over the rows (a knapsack over each row's expected tokens, whose gains
+// shrink with depth), then takes the total with the best ratio. Costs are measured per total as
+// rounds run; a total not yet measured is priced from the nearest measured totals, or from a cost
+// that grows by a twentieth of one row's per extra row while nothing is measured.
+class MtpPackedPlanner final {
+public:
+    static constexpr std::uint32_t kMaximumRows =
+        kAdaptiveMtpMaximumBatch * (kAdaptiveMtpMaximumDrafts + 1U);
+
+    void observe(std::uint32_t rows, double seconds) noexcept {
+        if (rows == 0 || rows > kMaximumRows || !(seconds > 0.0)) { return; }
+        float& cost           = seconds_[rows - 1U];
+        std::uint16_t& counts = samples_[rows - 1U];
+        const auto sample     = static_cast<float>(seconds);
+        cost                  = counts == 0 ? sample : cost + kAlpha * (sample - cost);
+        if (counts != UINT16_MAX) { ++counts; }
+    }
+
+    [[nodiscard]] float cost(std::uint32_t rows) const noexcept {
+        rows = std::clamp(rows, 1U, kMaximumRows);
+        if (samples_[rows - 1U] >= kMeasuredRounds) { return seconds_[rows - 1U]; }
+        std::uint32_t below = 0;
+        std::uint32_t above = 0;
+        for (std::uint32_t r = rows; r-- > 1U;) {
+            if (samples_[r - 1U] >= kMeasuredRounds) {
+                below = r;
+                break;
+            }
+        }
+        for (std::uint32_t r = rows + 1U; r <= kMaximumRows; ++r) {
+            if (samples_[r - 1U] >= kMeasuredRounds) {
+                above = r;
+                break;
+            }
+        }
+        const auto shape = [](std::uint32_t r) { return 1.0F + kRowShare * float(r - 1U); };
+        if (below != 0 && above != 0) {
+            const float t = float(rows - below) / float(above - below);
+            return seconds_[below - 1U] + t * (seconds_[above - 1U] - seconds_[below - 1U]);
+        }
+        if (below != 0) { return seconds_[below - 1U] * shape(rows) / shape(below); }
+        if (above != 0) { return seconds_[above - 1U] * shape(rows) / shape(above); }
+        return shape(rows);
+    }
+
+    // extents[j] in [0, limits[j]]; a row without a signal keeps its limit (a lookup's proposal).
+    void plan(std::span<const MtpAdaptiveSignal* const> signals,
+              std::span<const std::uint32_t> limits, std::span<std::uint32_t> extents) const noexcept {
+        const std::size_t b = signals.size();
+        if (b == 0 || b > kAdaptiveMtpMaximumBatch || limits.size() != b || extents.size() != b) {
+            return;
+        }
+        constexpr std::uint32_t kDrafts = kAdaptiveMtpMaximumBatch * kAdaptiveMtpMaximumDrafts;
+        constexpr float kNone           = -1.0F;
+        // best[j][d]: the most expected tokens of rows [0, j) verifying d drafts in all.
+        std::array<std::array<float, kDrafts + 1U>, kAdaptiveMtpMaximumBatch + 1U> best{};
+        std::array<std::array<std::uint8_t, kDrafts + 1U>, kAdaptiveMtpMaximumBatch> choice{};
+        for (auto& row : best) { row.fill(kNone); }
+        best[0][0]          = 0.0F;
+        std::uint32_t total = 0;
+        for (std::size_t j = 0; j < b; ++j) {
+            const std::uint32_t limit = std::min(limits[j], kAdaptiveMtpMaximumDrafts);
+            const std::uint32_t first = signals[j] == nullptr ? limit : 0U;
+            for (std::uint32_t d = 0; d <= total; ++d) {
+                if (best[j][d] == kNone) { continue; }
+                for (std::uint32_t e = first; e <= limit; ++e) {
+                    const float gain = signals[j] == nullptr
+                                           ? 1.0F + kLookupSurvival * float(e)
+                                           : signals[j]->expected_tokens(e, limit);
+                    if (best[j][d] + gain > best[j + 1U][d + e]) {
+                        best[j + 1U][d + e] = best[j][d] + gain;
+                        choice[j][d + e]    = static_cast<std::uint8_t>(e);
+                    }
+                }
+            }
+            total += limit;
+        }
+        std::uint32_t chosen = 0;
+        float ratio          = kNone;
+        for (std::uint32_t d = 0; d <= total; ++d) {
+            if (best[b][d] == kNone) { continue; }
+            const float candidate =
+                best[b][d] / std::max(cost(static_cast<std::uint32_t>(b) + d), 1e-9F);
+            if (candidate > ratio * kGain) {
+                ratio  = candidate;
+                chosen = d;
+            }
+        }
+        for (std::size_t j = b; j-- > 0;) {
+            extents[j] = choice[j][chosen];
+            chosen -= extents[j];
+        }
+    }
+
+private:
+    static constexpr float kAlpha                  = 0.125F;
+    static constexpr std::uint16_t kMeasuredRounds = 4;
+    static constexpr float kRowShare               = 0.05F;
+    // A deeper plan replaces a shallower one only for a ratio this much better.
+    static constexpr float kGain = 1.005F;
+    // The share of a lookup's drafts a plan counts on.
+    static constexpr float kLookupSurvival = 0.5F;
+
+    std::array<float, kMaximumRows> seconds_{};
+    std::array<std::uint16_t, kMaximumRows> samples_{};
+};
+
+// Whether a lone request's speculative rounds commit tokens faster than plain decode steps. Both
+// commit the same tokens, so the choice changes only speed. The mode that runs is timed step by
+// step (tokens committed, seconds, with the first steps after a switch left out) in moving sums;
+// every kRunSteps steps the other mode runs a probe (kPlainProbe plain steps or kRoundProbe rounds,
+// the first of them not counted), and the probe's mode runs next when its rate beats the running
+// mode's by kMargin. A plain step only slows down as the context grows, so rounds that still lead
+// the plain rate last measured by kLead skip the plain probe. A new request starts speculating.
+class SpeculationGate final {
+public:
+    void reset() noexcept { *this = SpeculationGate{}; }
+
+    // Whether the next step runs a round (else a plain decode step).
+    [[nodiscard]] bool speculates() const noexcept { return speculating_ != probing_; }
+
+    // A finished step of the mode speculates() named: the tokens it committed and its seconds.
+    void observe(std::uint32_t tokens, double seconds) noexcept {
+        if (!(seconds > 0.0)) { return; }
+        if (!probing_) {
+            if (steps_ >= kWarmSteps) {
+                run_tokens_  = run_tokens_ * (1.0 - kAlpha) + tokens;
+                run_seconds_ = run_seconds_ * (1.0 - kAlpha) + seconds;
+            }
+            if (++steps_ >= kRunSteps && run_seconds_ > 0.0) {
+                if (speculating_ && plain_seconds_ > 0.0 &&
+                    run_tokens_ / run_seconds_ >
+                        plain_tokens_ / plain_seconds_ * (1.0 + kLead)) {
+                    steps_ = kWarmSteps;
+                    return;
+                }
+                probing_       = true;
+                steps_         = 0;
+                probe_tokens_  = 0.0;
+                probe_seconds_ = 0.0;
+            }
+            return;
+        }
+        if (steps_ >= kWarmSteps) {
+            probe_tokens_ += tokens;
+            probe_seconds_ += seconds;
+        }
+        const std::uint32_t probe = speculating_ ? kPlainProbe : kRoundProbe;
+        if (++steps_ < kWarmSteps + probe) { return; }
+        probing_ = false;
+        steps_   = 0;
+        // The plain rate: the probe's while speculating, else the plain run's.
+        plain_tokens_  = speculating_ ? probe_tokens_ : run_tokens_;
+        plain_seconds_ = speculating_ ? probe_seconds_ : run_seconds_;
+        if (probe_tokens_ / probe_seconds_ > run_tokens_ / run_seconds_ * (1.0 + kMargin)) {
+            speculating_ = !speculating_;
+            ++switches_;
+            // The probe measured the mode that now runs, so its first steps count.
+            run_tokens_  = probe_tokens_;
+            run_seconds_ = probe_seconds_;
+            steps_       = kWarmSteps;
+        }
+    }
+
+    [[nodiscard]] std::uint32_t switches() const noexcept { return switches_; }
+
+private:
+    static constexpr std::uint32_t kWarmSteps  = 1;
+    static constexpr std::uint32_t kRunSteps   = 64;
+    static constexpr std::uint32_t kPlainProbe = 4;
+    static constexpr std::uint32_t kRoundProbe = 8;
+    static constexpr double kAlpha             = 1.0 / 16.0;
+    static constexpr double kMargin            = 0.03;
+    static constexpr double kLead              = 0.10;
+
+    bool speculating_      = true;
+    bool probing_          = false;
+    std::uint32_t steps_   = 0;
+    std::uint32_t switches_ = 0;
+    double run_tokens_     = 0.0;
+    double run_seconds_    = 0.0;
+    double probe_tokens_   = 0.0;
+    double probe_seconds_  = 0.0;
+    double plain_tokens_   = 0.0;
+    double plain_seconds_  = 0.0;
 };
 
 } // namespace ninfer::runtime

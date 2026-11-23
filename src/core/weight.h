@@ -45,10 +45,26 @@ enum class QType : std::uint16_t {
     Q2_G64_FP16 = 28,
     // E4M3FN row codes followed by one binary16 multiplier (RowInterleaved only).
     FP8_E4M3FN_ROW_FP16 = 29,
+    // ggml's MXFP4 blocks (GgufBlocks): an E8M0 exponent byte, then 32 E2M1 codes, value j < 16 the
+    // low nibble of byte j, value j + 16 its high nibble.
+    GGUF_MXFP4 = 30,
+    // ggml's NVFP4 blocks (GgufBlocks) of 64 values: four UE4M3 scale bytes, one per 16 values,
+    // then 32 bytes of E2M1 codes.
+    GGUF_NVFP4 = 33,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
-    return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0;
+    return (format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0) ||
+           format == QType::GGUF_MXFP4 || format == QType::GGUF_NVFP4;
+}
+
+// The formats a bias-free linear projection runs: GGUF blocks, BF16, and the native grouped
+// quantizations (the sm70 kernels' row-split and dequantize routes).
+[[nodiscard]] constexpr bool is_linear_format(QType format) {
+    return format == QType::BF16 || is_gguf(format) || format == QType::Q4_G64_FP16 ||
+           format == QType::Q5_G64_FP16 || format == QType::Q6_G64_FP16 ||
+           format == QType::Q8_G32_FP16 || format == QType::T2_G128_FP16 ||
+           format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16;
 }
 
 struct GgufBlockShape {
@@ -72,6 +88,8 @@ struct GgufBlockShape {
     case QType::GGUF_IQ3_S: return {256, 110};
     case QType::GGUF_IQ1_S: return {256, 50};
     case QType::GGUF_IQ1_M: return {256, 56};
+    case QType::GGUF_MXFP4: return {32, 17};
+    case QType::GGUF_NVFP4: return {64, 36};
     case QType::GGUF_IQ4_NL: return {32, 18};
     case QType::GGUF_IQ4_XS: return {256, 136};
     case QType::GGUF_Q4_0:

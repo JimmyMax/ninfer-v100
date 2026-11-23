@@ -2,6 +2,7 @@
 #include "text/structured_output.h"
 
 #include "core/device.h"
+#include "artifact/reader.h"
 #include "core/gpu_clock_floor.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
@@ -13,6 +14,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/model_instance.h"
 #include "runtime/engine/gemma4_core.h"
+#include "runtime/engine/inkling2_core.h"
 #include "runtime/engine/qwen4_exp_core.h"
 #include "runtime/engine/slot_spill_guard.h"
 
@@ -39,11 +41,30 @@ namespace ninfer {
 namespace {
 
 // Gemma 4 and Flash-Next keep context caches of their own, which the checkpoint catalog's options
-// configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program.
-EngineOptions with_family_context_cache(EngineOptions options) {
+// configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program. Inkling
+// 2 drafts with the DSpark drafter its artifact carries while it serves one request at a time; a
+// lone round's width adapts to how far the drafts survive.
+EngineOptions with_family_options(EngineOptions options) {
+    const bool inkling2 = runtime::is_inkling2_artifact(options.artifact_path);
     if (runtime::is_gemma4_artifact(options.artifact_path) ||
-        runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        runtime::is_qwen4_exp_artifact(options.artifact_path) || inkling2) {
         options.context_cache.mode = ContextCacheMode::Legacy;
+    }
+    if (inkling2) {
+        options.hybrid_experts.prefill_buffers = 0;
+        // Device-resident experts take no host/disk misses; the option is rejected there.
+        if (options.expert_residency == ExpertResidency::Device) {
+            options.hybrid_experts.dma_share = 0;
+        }
+    }
+    if (inkling2 && !options.speculative.spec_explicit && options.max_concurrency == 1 &&
+        artifact::Reader(options.artifact_path).directory().components.contains("dspark")) {
+        options.speculative.backend      = SpeculativeBackend::DSpark;
+        options.speculative.draft_tokens = SpeculativeOptions::kAutomaticDSparkTokens;
+        options.speculative.mtp_policy   = MtpDraftPolicy::Adaptive;
+        if (!options.speculative.draft_min_p) {
+            options.speculative.draft_min_p = SpeculativeOptions::kAutomaticDSparkMinP;
+        }
     }
     return options;
 }
@@ -277,13 +298,16 @@ public:
     using Qwen4ExpCore = runtime::Qwen4ExpCore;
     // Gemma 4: its own model family and core, which serves generation and scoring.
     using Gemma4Core = runtime::Gemma4Core;
+    // Inkling 2: its own model family and core, which serves generation and scoring.
+    using Inkling2Core = runtime::Inkling2Core;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>,
-                              std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Gemma4Core>>;
+                              std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Gemma4Core>,
+                              std::unique_ptr<Inkling2Core>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(
-              with_family_context_cache(std::move(engine_options)))),
+              with_family_options(std::move(engine_options)))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         report_gpu_clock_floor(options, clock_floor);
@@ -311,6 +335,19 @@ public:
             StartupPhaseScope finalize_phase(options.startup_observer,
                                              StartupPhase::EngineFinalize);
             core = std::make_unique<Qwen4ExpCore>(*flash, device, options);
+            finalize_phase.complete();
+            return;
+        }
+        if (runtime::is_inkling2_artifact(options.artifact_path)) {
+            auto constructed    = runtime::construct_inkling2(options, device);
+            inkling             = std::move(constructed.instance);
+            load                = std::move(constructed.load);
+            load.cuda_sync_mode = device.sync_mode();
+            model_metadata      = std::move(constructed.model_metadata);
+            sampling_defaults   = inkling->frontend.sampling_defaults();
+            StartupPhaseScope finalize_phase(options.startup_observer,
+                                             StartupPhase::EngineFinalize);
+            core = std::make_unique<Inkling2Core>(*inkling, device, options);
             finalize_phase.complete();
             return;
         }
@@ -463,11 +500,16 @@ public:
 
     // The model's frontend and prompt capacity, whichever family it is.
     [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
-        return gemma ? gemma->frontend : flash ? flash->frontend : active->frontend;
+        return gemma   ? gemma->frontend
+               : inkling ? inkling->frontend
+                         : flash ? flash->frontend
+                                 : active->frontend;
     }
 
     [[nodiscard]] std::uint32_t capacity() const {
-        return gemma ? gemma->capacity : flash ? flash->capacity : active->capacity;
+        return inkling ? inkling->capacity : gemma ? gemma->capacity
+                   : flash ? flash->capacity
+                           : active->capacity;
     }
 
     EngineOptions options;
@@ -477,6 +519,7 @@ public:
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> flash;
     std::unique_ptr<runtime::Gemma4Instance> gemma;
+    std::unique_ptr<runtime::Inkling2Instance> inkling;
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
@@ -664,7 +707,8 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>> ||
                           std::is_same_v<CoreState, std::unique_ptr<Impl::Qwen4ExpCore>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::Gemma4Core>>) {
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::Gemma4Core>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::Inkling2Core>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -798,7 +842,7 @@ std::uint32_t Engine::concurrent_output_budget(const PreparedPrompt& prompt) con
         throw std::logic_error("concurrent_output_budget requires a Generation Engine");
     }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
-    if (impl_->flash || impl_->gemma) {
+    if (impl_->flash || impl_->gemma || impl_->inkling) {
         // One sequence at a time: the whole window past the prompt.
         const std::uint32_t prompt_tokens = prompt.impl_->summary.prompt_tokens;
         return prompt_tokens >= impl_->capacity() ? 0U : impl_->capacity() - prompt_tokens + 1U;

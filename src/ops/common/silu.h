@@ -86,11 +86,23 @@ NINFER_SILU_HD float exp(float y) {
 
 namespace ninfer::ops {
 
-NINFER_SILU_HD float silu(float x) {
+NINFER_SILU_HD float portable_silu(float x) {
 #if defined(__CUDA_ARCH__)
     return __fdiv_rn(x, silu_detail::add(1.0F, silu_detail::exp(-x)));
 #else
     return x / silu_detail::add(1.0F, silu_detail::exp(-x));
+#endif
+}
+
+NINFER_SILU_HD float gelu_tanh(float x) {
+    using silu_detail::add;
+    using silu_detail::mul;
+    const float cube  = mul(mul(mul(0.044715F, x), x), x);
+    const float twice = mul(1.5957691216057308F, add(x, cube));
+#if defined(__CUDA_ARCH__)
+    return __fdiv_rn(x, add(1.0F, silu_detail::exp(-twice)));
+#else
+    return x / add(1.0F, silu_detail::exp(-twice));
 #endif
 }
 

@@ -62,6 +62,10 @@ struct RawTokenLogprob {
     float logprob     = 0.0f;
     std::array<TokenId, kMaximumTokenLogprobs> top_ids{};
     std::array<float, kMaximumTokenLogprobs> top_values{};
+    // The typed readout (ExecutionOptions::readout_tokens) on the round's first token: the first
+    // readout_count values are the named tokens' log probabilities in the request's order.
+    std::uint32_t readout_count = 0;
+    std::array<float, kMaximumReadoutTokens> readout_values{};
 };
 
 struct GeneratedRound {

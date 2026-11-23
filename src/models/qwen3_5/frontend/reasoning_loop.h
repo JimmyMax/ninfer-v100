@@ -8,7 +8,9 @@
 // That is Strata's measure (its #728 recovery), which also fixes the thresholds below; the
 // literature's looping criterion (a 30-gram repeated 20 times) only fires far later.
 // A loop can also be written as a single long word, which no word measure can see: Strata's #1753
-// reads a periodic tail as full coverage, and periodic_tail below does the same.
+// reads a periodic tail as full coverage, and periodic_tail below does the same. A loop that counts
+// ('time1','time2',...) writes a new word every time; counting_tail reads its tail as periodic once
+// the numbers are masked, if every number of the period keeps one step and one of them moves.
 // Ported from Infernix (github.com/wallawalla47/infernix, Apache-2.0).
 
 #include <cstddef>
@@ -26,8 +28,10 @@ inline constexpr std::uint32_t kLoopRepeats     = 3;   // occurrences that make 
 inline constexpr std::size_t kLoopWindowWords = 2000; // the recent words whose coverage is measured
 inline constexpr std::size_t kLoopHistoryWords = 30000; // how far back passages are counted
 inline constexpr double kLoopCoverage          = 0.25;  // coverage at which the guard fires
-inline constexpr std::size_t kLoopTailChars    = 2048;  // reasoning characters read at the end
+inline constexpr std::size_t kLoopTailChars    = 2048;  // reasoning characters a counter is read in
+inline constexpr std::size_t kLoopPeriodChars  = 1024;  // reasoning characters a period is read in
 inline constexpr std::size_t kLoopTailPeriod   = 64;    // a period at most this long repeats
+inline constexpr std::size_t kLoopCounterSteps = 8;     // periods a counter moves through at least
 
 // Appends the words of UTF-8 `bytes` to `words` as 64-bit hashes. A word is a run of letters,
 // digits and '_' (ASCII letters lower-cased); every other non-space character is a word of its own,
@@ -45,10 +49,20 @@ void append_words(std::string_view bytes, std::string& partial, std::vector<std:
 // kLoopTailChars characters whenever that many have been emitted.
 void append_tail(std::string_view bytes, std::string& tail);
 
-// True when the last kLoopTailChars characters of `text` are one period of at most kLoopTailPeriod
-// characters repeated (Strata's #1753). The comparison is byte-exact where Strata folds case, which
-// no loop this catches depends on. False while fewer than kLoopTailChars characters have been
-// emitted.
+// True when the last kLoopPeriodChars characters of `text` are one period of at most
+// kLoopTailPeriod characters repeated (Strata's #1753 reads 2,048 characters). The comparison is
+// byte-exact where Strata folds case, which no loop this catches depends on. False while fewer
+// than kLoopPeriodChars characters have been emitted.
 [[nodiscard]] bool periodic_tail(std::string_view text);
+
+// True when the last kLoopTailChars characters of `text`, with every run of ASCII digits read as
+// one number, are one period of at most kLoopTailPeriod characters repeated, the period holds a
+// number, and from each period to the next every number of the period moves by its own constant
+// step, over at least kLoopCounterSteps periods, and one of these steps is nonzero: a counting loop
+// such as 'time1','time2',... or 'item 1 of 50','item 2 of 50',... A counter beside a number that
+// changes otherwise ('step 7 checks value 4821') is an enumeration and does not count. The runs the
+// tail's ends may cut are left out. False while fewer than kLoopTailChars characters have been
+// emitted.
+[[nodiscard]] bool counting_tail(std::string_view text);
 
 } // namespace ninfer::models::qwen3_5

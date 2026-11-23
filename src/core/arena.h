@@ -162,7 +162,7 @@ private:
 // the registration and every queued transfer; portable registration serves every device rank.
 class HostMemoryRegistration {
 public:
-    HostMemoryRegistration(void* data, std::size_t bytes);
+    HostMemoryRegistration(void* data, std::size_t bytes, bool mapped = false);
     ~HostMemoryRegistration();
     HostMemoryRegistration(const HostMemoryRegistration&) = delete;
     HostMemoryRegistration& operator=(const HostMemoryRegistration&) = delete;

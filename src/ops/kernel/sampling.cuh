@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/ninfer/ops/sampling.h
-// Match: contiguous BF16 logits, physical stride >= token domain, and at most
+// Match: contiguous BF16 or FP32 logits, physical stride >= token domain, and at most
 // sixteen columns on the multi-block route.
 // Algorithm assumptions: 256-thread/2-item partial tiles feed bounded top-20
 // group merges through caller-owned workspace; unsupported finite geometries
@@ -11,9 +11,10 @@
 
 namespace ninfer::ops {
 
+template <typename Logit>
 __launch_bounds__(kSamplerBlock) __global__
-    void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
-                           const SamplingConfig* configs, const std::int32_t* logical_positions,
+    void sample_row_kernel(const Logit* logits, std::int32_t* out, const SamplingConfig* configs,
+                           const std::int32_t* logical_positions, std::int32_t position_offset,
                            std::int32_t purpose, std::int32_t token_domain,
                            std::int32_t physical_rows) {
     const int row            = static_cast<int>(blockIdx.x);
@@ -32,7 +33,7 @@ __launch_bounds__(kSamplerBlock) __global__
                                cfg.token_mask != nullptr;
         if (!penalties) {
             for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = __bfloat162float(logits[base + v]);
+                const float x = sampling_logit(logits[base + v]);
                 if (sampling_better(x, v, bv, bi)) {
                     bv = x;
                     bi = v;
@@ -40,7 +41,7 @@ __launch_bounds__(kSamplerBlock) __global__
             }
         } else {
             for (int v = tid; v < token_domain; v += blockDim.x) {
-                const float x = sampling_adjusted_logit(__bfloat162float(logits[base + v]), v, cfg);
+                const float x = sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg);
                 if (sampling_better(x, v, bv, bi)) {
                     bv = x;
                     bi = v;
@@ -61,7 +62,7 @@ __launch_bounds__(kSamplerBlock) __global__
         if (tid == 0) {
             const int picked = red_idx[0];
             if (!sampling_selected_logit_is_finite(logits, base, picked)) {
-                out[row] = kSamplerNonFiniteToken;
+                out[row] = cfg.non_finite_token;
             } else {
                 out[row] = picked;
                 if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
@@ -94,18 +95,20 @@ __launch_bounds__(kSamplerBlock) __global__
     }
 
     if (tid != 0) { return; }
-    const float u    = sampling_uniform(cfg.seed, logical_positions[row], purpose, 0u);
-    const int picked = cand_idx[sampling_pick_rank(prob, n_support, u)];
+    const int picked =
+        cand_idx[sampling_pick(cfg, prob, cand_idx, n_support,
+                               logical_positions[row] + position_offset, purpose)];
     if (!sampling_selected_logit_is_finite(logits, base, picked)) {
-        out[row] = kSamplerNonFiniteToken;
+        out[row] = cfg.non_finite_token;
         return;
     }
     out[row] = picked;
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
+template <typename Logit>
 __launch_bounds__(kSamplerBlock) __global__
-    void sampling_partial_topk_kernel(const __nv_bfloat16* logits, const SamplingConfig* cfg_ptr,
+    void sampling_partial_topk_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
                                       std::int32_t token_domain, std::int32_t physical_rows,
                                       SamplingWorkspace workspace) {
     const int col            = static_cast<int>(blockIdx.y);
@@ -127,7 +130,7 @@ __launch_bounds__(kSamplerBlock) __global__
     for (int item = 0; item < kSamplerItemsPerThread; ++item) {
         const int v = tile_start + item * blockDim.x + threadIdx.x;
         if (v < token_domain) {
-            const float raw = __bfloat162float(logits[base + v]);
+            const float raw = sampling_logit(logits[base + v]);
             const float x   = penalties ? sampling_adjusted_logit(raw, v, cfg) : raw;
             keys[item]      = sampling_sort_key(x, v);
         } else {
@@ -161,8 +164,8 @@ __launch_bounds__(kSamplerBlock) __global__
 
 __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
-    std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
-    std::int32_t group_count, SamplingWorkspace workspace) {
+    std::int32_t position_offset, std::int32_t purpose, std::int32_t token_domain,
+    std::int32_t partial_blocks, std::int32_t group_count, SamplingWorkspace workspace) {
     const int group          = static_cast<int>(blockIdx.x);
     const int col            = static_cast<int>(blockIdx.y);
     const int tid            = threadIdx.x;
@@ -214,7 +217,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
             // This kernel never sees the logits, so the winner's own ordered value carries the
             // check. An empty key (0ull) decodes to NaN, which is the same rejection.
             if (picked == INT_MAX || !sampling_value_is_finite(sampling_key_float(best))) {
-                out[col] = kSamplerNonFiniteToken;
+                out[col] = cfg.non_finite_token;
             } else {
                 out[col] = picked;
                 if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
@@ -285,14 +288,14 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
 
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, &n_support, cap);
     if (tid == 0) {
-        const float u          = sampling_uniform(cfg.seed, logical_positions[col], purpose, 0u);
-        const int rank         = sampling_pick_rank(prob, n_support, u);
+        const int rank = sampling_pick(cfg, prob, cand_idx, n_support,
+                                       logical_positions[col] + position_offset, purpose);
         const int picked       = cand_idx[rank];
         const float picked_val = cand_val[rank];
         // The candidate's own adjusted value stands in for the logit: this kernel is fed by the
         // partial/group workspace and never receives the logits themselves.
         if (!sampling_value_is_finite(picked_val)) {
-            out[col] = kSamplerNonFiniteToken;
+            out[col] = cfg.non_finite_token;
         } else {
             out[col] = picked;
             if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }

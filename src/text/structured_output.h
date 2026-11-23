@@ -22,7 +22,12 @@ void validate_structured_output(const StructuredOutputOptions& options);
 // structural-tag descriptor (e.g. a model's native tool-call serialization), not a user API.
 struct StructuredOutputEnvelope {
     std::string reasoning_close;
+    // What comes before reasoning_close, in place of any text without it.
+    std::string reasoning_format;
+    // In place of the final response, after reasoning_close.
     std::string alternative_format;
+    // In place of the whole response: reasoning_close and the final response.
+    std::string response_alternative_format;
 };
 
 class GrammarState {

@@ -9,36 +9,48 @@
 // The decoders follow ggml-quants.c's dequantize_row_* exactly, with float slice factors where
 // llama.cpp's vector kernels round integer scales (the 2- and 3-bit i-quants).
 
-#include "ggml_bridge_internal.cuh"
+#include "ggml_bridge_vec_launch.cuh"
 #include "../../common/fixed_point.cuh"
+#include "../../common/device_route_lookup.h"
 
 #include <algorithm>
 #include <type_traits>
 
 namespace ninfer::ops::gguf::detail {
 
-// Types whose vector kernels are also built for the static K of the 27B text matrices (5120,
-// 6144, 10240, 17408) and the 26B Gemma 4 matrices (2816, 4096, 2112, 704). Q6_K is deliberately
-// absent: its scattered 2-byte decode reads make the constexpr-K codegen slower than the runtime
-// form (265 vs 224 us/product for K=5376 T=5 on sm_70).
+// Types whose vector kernels are also built for the static K of the 27B text matrices.
 template <ggml_type type>
 inline constexpr bool kVecStaticK =
     type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS ||
-    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0 ||
-    type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS ||
+    type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ2_XS ||
     type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_Q2_K;
-
-// Q6_K stays out: its scattered 2B scale reads dominate, and constexpr K only bought
-// 1.5% at K=2816 T=3 (vs 13% for Q4_K K=5376) while regressing at K=5376 T=5.
-
-// The routed-expert kernels of the 26B Gemma 4 MoE (gate/up K=2816, down K=704).
-template <ggml_type type>
-inline constexpr bool kMoeStaticK =
-    type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q8_0;
 
 inline constexpr int kVecWarps = 4;
 
 namespace vec {
+
+enum class VectorFamily { Dense, Moe, MoeUp };
+
+template <ggml_type type, VectorFamily Family = VectorFamily::Dense>
+bool cooperative_loads(int width) {
+    if (width < 1 || width > 8) { return false; }
+    if constexpr (Family != VectorFamily::Dense) {
+        if (width != 1 && width != 2 && width != 4 && width != 8) { return false; }
+        if constexpr (Family == VectorFamily::MoeUp) {
+            if (width > 4) { return false; }
+        }
+    }
+    if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) {
+        constexpr bool q4 = type == GGML_TYPE_Q4_K;
+        constexpr std::string_view key = Family == VectorFamily::Dense
+            ? (q4 ? "gguf_vector/q4_k" : "gguf_vector/q6_k")
+            : Family == VectorFamily::Moe
+                ? (q4 ? "gguf_moe_vector/q4_k" : "gguf_moe_vector/q6_k")
+                : (q4 ? "gguf_moe_up/q4_k" : "gguf_moe_up/q6_k");
+        return device_route_schedule(key, width) == "cooperative";
+    }
+    return false;
+}
 
 struct Slice {
     int w[8];
@@ -99,12 +111,18 @@ __device__ __forceinline__ void scale_min_k4(const std::uint8_t* s, int j, int& 
     }
 }
 
-// The product of one slice of a type the CPU also computes (Q2_0, Q8_0, IQ4_NL, IQ4_XS, IQ3_XXS,
-// IQ3_S; IQ2_S spells out its two halves): the slice factor times the activation scale, rounded,
-// times the integer dot, rounded, never fused with the sum it joins, so that gguf_expert_cpu
-// reproduces every bit.
+// The product of one slice of a type the CPU also computes (Q2_0, Q4_0, Q5_0, Q8_0, IQ4_NL,
+// IQ4_XS, IQ3_XXS, IQ3_S, IQ2_XXS; IQ2_S, IQ1_S, IQ1_M, the K-quants with a minimum and Q6_K spell
+// out their forms): the slice factor times the activation scale, rounded, times the integer dot,
+// rounded, never fused with the sum it joins, so that gguf_expert_cpu reproduces every bit.
 __device__ __forceinline__ float cpu_product(float factor, float d, int dot) {
     return __fmul_rn(__fmul_rn(factor, d), float(dot));
+}
+
+// Q4_K and Q5_K: the scaled dot less the minimum times the activation's sum, each step rounded.
+__device__ __forceinline__ float cpu_product_min(float factor, float d, int dot, float minimum,
+                                                 float sum) {
+    return __fsub_rn(cpu_product(factor, d, dot), __fmul_rn(minimum, sum));
 }
 
 // dot() is the contribution of one slice to one column: d and sum are the column's slice scale and
@@ -156,7 +174,7 @@ struct Decoder<GGML_TYPE_Q4_0> {
     }
 
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -188,7 +206,7 @@ struct Decoder<GGML_TYPE_Q5_0> {
     }
 
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -253,13 +271,24 @@ struct transposed<D, std::void_t<decltype(D::kTransposed)>> : std::bool_constant
 
 // A slice and its product in a decoder's transposed form when it has one; `sum` serves the plain
 // form and `qsum` the transposed one.
-template <class D>
+template <class D, bool Cooperative = false>
+__device__ __forceinline__ void decode_words(const std::uint8_t* b, int sub,
+                                             const std::uint32_t* table, Slice& s) {
+    if constexpr (Cooperative && (std::is_same_v<D, Decoder<GGML_TYPE_Q4_K>> ||
+                                  std::is_same_v<D, Decoder<GGML_TYPE_Q6_K>>)) {
+        D::template decode<true>(b, sub, table, s);
+    } else {
+        D::decode(b, sub, table, s);
+    }
+}
+
+template <class D, bool Cooperative = false>
 __device__ __forceinline__ void decode_slice(const std::uint8_t* b, int sub,
                                              const std::uint32_t* table, Slice& s) {
     if constexpr (transposed<D>::value) {
         D::decode_t(b, sub, s);
     } else {
-        D::decode(b, sub, table, s);
+        decode_words<D, Cooperative>(b, sub, table, s);
     }
 }
 template <class D>
@@ -291,6 +320,65 @@ struct Decoder<GGML_TYPE_IQ4_NL> {
     }
 };
 
+// MXFP4: an E8M0 exponent byte e, then value j < 16 the low nibble of byte j + 1 and value j + 16
+// its high nibble, each an E2M1 code's value (kvalues_mxfp4 holds them doubled) times 2^(e - 127).
+// The 17-byte block starts at any byte: five aligned words cover its codes, the last reaching at
+// most three bytes past the block (into the next block or the bound device tail).
+template <>
+struct Decoder<GGML_TYPE_MXFP4> {
+    static constexpr int kBlockElems = 32, kBlockBytes = 17, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
+                                                  Slice& s) {
+        s.f[0]              = ggml_cuda_e8m0_to_fp32(b[0]) * 0.5f;
+        const auto at       = reinterpret_cast<std::uintptr_t>(b + 1);
+        const auto* w       = reinterpret_cast<const std::uint32_t*>(at & ~std::uintptr_t(3));
+        const unsigned skew = unsigned(at & 3) * 8;
+        std::uint32_t word[5];
+#pragma unroll
+        for (int i = 0; i < 5; ++i) { word[i] = w[i]; }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = get_int_from_table_16(int(__funnelshift_r(word[j], word[j + 1], skew)),
+                                                 kvalues_mxfp4);
+            s.w[j]       = v.x;
+            s.w[j + 4]   = v.y;
+        }
+    }
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
+// NVFP4: four UE4M3 scale bytes (one per 16 values) and 32 bytes of E2M1 codes; value j of
+// sub-block s is the low nibble of code byte 8 s + j for j < 8 and the high nibble of code byte
+// 8 s + j - 8 otherwise. A 64-value block is two slices of two sub-blocks each. Blocks of 36 bytes
+// in rows of whole blocks start 4-byte aligned. The product is Q6_K's form over the two halves.
+template <>
+struct Decoder<GGML_TYPE_NVFP4> {
+    static constexpr int kBlockElems = 64, kBlockBytes = 36, kTableWords = 0;
+    __device__ static const std::uint32_t* table() { return nullptr; }
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int u, const std::uint32_t*,
+                                                  Slice& s) {
+        const std::uint32_t d = u32_a4(b);
+        s.f[0]                = ue4m3_half(d >> (16 * u));
+        s.f[1]                = ue4m3_half(d >> (16 * u + 8));
+        // Code word k holds bytes 4k..4k+3 of the slice's 16: low nibbles are values 4k..4k+3 of
+        // its sub-block (k < 2) or of the second (k >= 2, values 16 + 4(k - 2) ...), high nibbles
+        // the same eight positions later.
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int2 v = get_int_from_table_16(int(u32_a4(b + 4 + 16 * u + 4 * k)), kvalues_mxfp4);
+            s.w[4 * (k / 2) + k % 2]     = v.x;
+            s.w[4 * (k / 2) + 2 + k % 2] = v.y;
+        }
+    }
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return __fmul_rn(d, __fadd_rn(__fmul_rn(s.f[0], float(dot4(s.w, a, 0))),
+                                      __fmul_rn(s.f[1], float(dot4(s.w + 4, a + 4, 0)))));
+    }
+};
+
 template <>
 struct Decoder<GGML_TYPE_IQ4_XS> {
     static constexpr int kBlockElems = 256, kBlockBytes = 136, kTableWords = 0;
@@ -319,6 +407,7 @@ template <>
 struct Decoder<GGML_TYPE_Q4_K> {
     static constexpr int kBlockElems = 256, kBlockBytes = 144, kTableWords = 0;
     __device__ static const std::uint32_t* table() { return nullptr; }
+    template <bool Cooperative = false>
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t*, Slice& s) {
         const float2 dm = __half22float2(*reinterpret_cast<const half2*>(b));
@@ -327,15 +416,27 @@ struct Decoder<GGML_TYPE_Q4_K> {
         s.f[0]              = dm.x * float(sc);
         s.f[1]              = dm.y * float(m);
         const uint4* qs     = reinterpret_cast<const uint4*>(b + 16 + 32 * (u / 2));
-        const uint4 a0      = qs[0];
-        const uint4 a1      = qs[1];
+        uint4 a0, a1;
+        if constexpr (Cooperative) {
+            const unsigned mask = 0xFFu << (threadIdx.x & 24);
+            const uint4 own = qs[u & 1];
+            const uint4 peer = make_uint4(__shfl_xor_sync(mask, own.x, 1, 8),
+                                          __shfl_xor_sync(mask, own.y, 1, 8),
+                                          __shfl_xor_sync(mask, own.z, 1, 8),
+                                          __shfl_xor_sync(mask, own.w, 1, 8));
+            a0 = (u & 1) ? peer : own;
+            a1 = (u & 1) ? own : peer;
+        } else {
+            a0 = qs[0];
+            a1 = qs[1];
+        }
         const int shift     = 4 * (u & 1);
         const std::uint32_t v[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
 #pragma unroll
         for (int i = 0; i < 8; ++i) { s.w[i] = int((v[i] >> shift) & 0x0F0F0F0Fu); }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float sum) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))) - s.f[1] * sum;
+        return cpu_product_min(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)), s.f[1], sum);
     }
 };
 
@@ -362,7 +463,7 @@ struct Decoder<GGML_TYPE_Q5_K> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float sum) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))) - s.f[1] * sum;
+        return cpu_product_min(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)), s.f[1], sum);
     }
 };
 
@@ -370,6 +471,7 @@ template <>
 struct Decoder<GGML_TYPE_Q6_K> {
     static constexpr int kBlockElems = 256, kBlockBytes = 210, kTableWords = 0;
     __device__ static const std::uint32_t* table() { return nullptr; }
+    template <bool Cooperative = false>
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t*, Slice& s) {
         const int h = u / 4, q = u % 4;
@@ -379,139 +481,38 @@ struct Decoder<GGML_TYPE_Q6_K> {
         s.f[1]               = d * float(sc[2 * q + 1]);
         const std::uint8_t* ql = b + 64 * h + 32 * (q & 1);
         const std::uint8_t* qh = b + 128 + 32 * h;
+        if constexpr (Cooperative) {
+            const unsigned mask = 0xFu << (threadIdx.x & 28);
 #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const std::uint32_t v = ((u32_a2(ql + 4 * i) >> (4 * (q >> 1))) & 0x0F0F0F0Fu) |
-                                    (((u32_a2(qh + 4 * i) >> (2 * q)) << 4) & 0x30303030u);
-            // v - 32 per byte, v in [0, 64): flip the high bits by whether v is below 32.
-            s.w[i] = int(v ^ 0xE0E0E0E0u ^ ((v & 0x20202020u) * 6u));
+            for (int base = 0; base < 8; base += 4) {
+                const std::uint32_t hi = u32_a2(qh + 4 * (base + q));
+                const std::uint32_t lo0 = u32_a2(ql + 4 * (base + (q >> 1)));
+                const std::uint32_t lo1 = u32_a2(ql + 4 * (base + 2 + (q >> 1)));
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const std::uint32_t high = __shfl_sync(mask, hi, j, 4);
+                    const std::uint32_t low = __shfl_sync(mask, j < 2 ? lo0 : lo1,
+                                                         (q & 1) + 2 * (j & 1), 4);
+                    const std::uint32_t v = ((low >> (4 * (q >> 1))) & 0x0F0F0F0Fu) |
+                                            (((high >> (2 * q)) << 4) & 0x30303030u);
+                    s.w[base + j] = int(v ^ 0xE0E0E0E0u ^ ((v & 0x20202020u) * 6u));
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const std::uint32_t v = ((u32_a2(ql + 4 * i) >> (4 * (q >> 1))) & 0x0F0F0F0Fu) |
+                                        (((u32_a2(qh + 4 * i) >> (2 * q)) << 4) & 0x30303030u);
+                // v - 32 per byte, v in [0, 64): flip the high bits by whether v is below 32.
+                s.w[i] = int(v ^ 0xE0E0E0E0u ^ ((v & 0x20202020u) * 6u));
+            }
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return d * (s.f[0] * float(dot4(s.w, a, 0)) + s.f[1] * float(dot4(s.w + 4, a + 4, 0)));
+        return __fmul_rn(d, __fadd_rn(__fmul_rn(s.f[0], float(dot4(s.w, a, 0))),
+                                      __fmul_rn(s.f[1], float(dot4(s.w + 4, a + 4, 0)))));
     }
 };
-
-// 本仓库 V100 增量（docs/v100/PLAN.md）：Q6_K 密集逐行布局（QuantLayout::VoltaQ6KDense）的解码。
-// 行是 [192*nblk 个 6-bit 码字][k/16 个 int8 切片尺度][2*nblk 个 half d]，元素 e 在位 6e；一个
-// 32 值切片就是 24 B = 3 个 64-bit 字，码字 10 跨 W0/W1、码字 21 跨 W1/W2。Q6_K 是偏置 32 编码
-// （值 = 码字 - 32），符号技巧产出的 s.w 与超块解码逐位相同，点积式不变。
-__device__ __forceinline__ void decode_q6k_dense(const std::uint8_t* row, int s, int k, Slice& sl) {
-    const float d     = half_at(row + 3 * k / 4 + k / 16 + 2 * (s / 8));
-    const auto* sc    = reinterpret_cast<const std::int8_t*>(row + 3 * k / 4 + 2 * s);
-    sl.f[0]           = d * float(sc[0]);
-    sl.f[1]           = d * float(sc[1]);
-    const auto* w     = reinterpret_cast<const std::uint64_t*>(row + 24 * s);
-    const std::uint64_t W0 = w[0], W1 = w[1], W2 = w[2];
-    auto chunk        = [&](int i) -> std::uint64_t {
-        switch (i) {
-        case 0: return W0 & 0x0000000000FFFFFFull;
-        case 1: return (W0 >> 24) & 0x0000000000FFFFFFull;
-        case 2: return ((W0 >> 48) | (W1 << 16)) & 0x0000000000FFFFFFull;
-        case 3: return (W1 >> 8) & 0x0000000000FFFFFFull;
-        case 4: return (W1 >> 32) & 0x0000000000FFFFFFull;
-        case 5: return ((W1 >> 56) | (W2 << 8)) & 0x0000000000FFFFFFull;
-        case 6: return (W2 >> 16) & 0x0000000000FFFFFFull;
-        default: return (W2 >> 40) & 0x0000000000FFFFFFull;
-        }
-    };
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const std::uint64_t C = chunk(i);
-        const std::uint32_t v0 = C & 63u;
-        const std::uint32_t v1 = (C >> 6) & 63u;
-        const std::uint32_t v2 = (C >> 12) & 63u;
-        const std::uint32_t v3 = (C >> 18) & 63u;
-        const std::uint32_t v  = v0 | (v1 << 8) | (v2 << 16) | (v3 << 24);
-        sl.w[i] = int(v ^ 0xE0E0E0E0u ^ ((v & 0x20202020u) * 6u));
-    }
-}
-
-// 本仓库 V100 增量：kernel<Q6_K, T, false, 0> 的密集布局版——lane 直接取 32 值切片 s = lane + 32*it，
-// 行内没有超块偏移。其余（累加、shfl 归约、存储）与超块版相同，保证位级一致。
-template <int T>
-__launch_bounds__(kVecWarps * 32) __global__ void kernel_q6k_dense(VecArgs p) {
-    const int warp   = threadIdx.x >> 5;
-    const int lane   = threadIdx.x & 31;
-    const int k      = p.k;
-    const int slices = k / 32;
-    constexpr int kRows = 2;
-    for (int row0 = (blockIdx.x * kVecWarps + warp) * kRows; row0 < p.rows;
-         row0 += gridDim.x * kVecWarps * kRows) {
-        const std::uint8_t* rowp[kRows];
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-            rowp[r] = p.weight + std::int64_t(min(row0 + r, p.rows - 1)) * p.row_bytes;
-        }
-        float acc[kRows][T];
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-            for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
-        }
-        const auto slice = [&](int it) {
-            const int s = lane + 32 * it;
-            int a[T][8];
-            float d[T];
-#pragma unroll
-            for (int j = 0; j < T; ++j) {
-                const float2 ds = __half22float2(p.ds[std::int64_t(j) * slices + s]);
-                d[j]            = ds.x;
-                const auto* q   = reinterpret_cast<const int4*>(p.qs + std::int64_t(j) * k + 32 * s);
-                const int4 v0 = q[0], v1 = q[1];
-                a[j][0] = v0.x; a[j][1] = v0.y; a[j][2] = v0.z; a[j][3] = v0.w;
-                a[j][4] = v1.x; a[j][5] = v1.y; a[j][6] = v1.z; a[j][7] = v1.w;
-            }
-#pragma unroll
-            for (int r = 0; r < kRows; ++r) {
-                Slice sl;
-                decode_q6k_dense(rowp[r], s, k, sl);
-#pragma unroll
-                for (int j = 0; j < T; ++j) {
-                    acc[r][j] +=
-                        d[j] * (sl.f[0] * float(dot4(sl.w, a[j], 0)) +
-                                sl.f[1] * float(dot4(sl.w + 4, a[j] + 4, 0)));
-                }
-            }
-        };
-        for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
-#pragma unroll
-        for (int r = 0; r < kRows; ++r) {
-#pragma unroll
-            for (int j = 0; j < T; ++j) {
-#pragma unroll
-                for (int o = 16; o > 0; o >>= 1) {
-                    acc[r][j] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][j], o);
-                }
-            }
-        }
-        if (lane == 0) {
-#pragma unroll
-            for (int r = 0; r < kRows; ++r) {
-                if (row0 + r < p.rows) {
-#pragma unroll
-                    for (int j = 0; j < T; ++j) { vec_store(p.out, row0 + r, j, acc[r][j]); }
-                }
-            }
-        }
-    }
-}
-
-template <int T>
-void launch_q6k_dense(const VecArgs& args, cudaStream_t stream) {
-    static const int resident = [] {
-        int blocks = 0;
-        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel_q6k_dense<T>,
-                                                            kVecWarps * 32, 0),
-              "vector occupancy");
-        return std::max(blocks, 1);
-    }();
-    const int per_block = kVecWarps * 2;
-    const int groups    = (args.rows + per_block - 1) / per_block;
-    const int blocks    = std::min(groups, resident * device_facts().sm_count);
-    kernel_q6k_dense<T><<<blocks, kVecWarps * 32, 0, stream>>>(args);
-    check(cudaGetLastError(), "vector product launch");
-}
 
 template <>
 struct Decoder<GGML_TYPE_Q2_K> {
@@ -574,10 +575,11 @@ struct Decoder<GGML_TYPE_Q3_K> {
             s.h[i]                 = int(__funnelshift_r(hb, hb, hshift) & 0x04040404u);
         }
     }
+    // Q6_K's form, each step rounded, as gguf_expert_cpu computes it.
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
         const int lo = dot4(s.h, a, dot4(s.w, a, 0)) - 4 * sum4(a);
         const int hi = dot4(s.h + 4, a + 4, dot4(s.w + 4, a + 4, 0)) - 4 * sum4(a + 4);
-        return d * (s.f[0] * float(lo) + s.f[1] * float(hi));
+        return __fmul_rn(d, __fadd_rn(__fmul_rn(s.f[0], float(lo)), __fmul_rn(s.f[1], float(hi))));
     }
 };
 
@@ -602,7 +604,7 @@ struct Decoder<GGML_TYPE_IQ2_XXS> {
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+        return cpu_product(s.f[0], d, dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
     }
 };
 
@@ -691,20 +693,14 @@ template <>
 struct Decoder<GGML_TYPE_IQ3_S> {
     static constexpr int kBlockElems = 256, kBlockBytes = 110, kTableWords = 512;
     __device__ static const std::uint32_t* table() { return iq3s_grid; }
-    // EXPERIMENT-9: IQ3_S 向量加载重构（bit-exact）
-    // 原始：每 lane 5 次分散事务（2×u32 + 1B + 4B + 1B）跨 104B
-    // 优化：用两个 4B 加载合并 qs（8B），用 uint4 提取 qh（来自 b+64 窗口）
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t* grid, Slice& s) {
-        // EXPERIMENT-9: IQ3_S 优化尝试——保持原始 u32_a2 方式（2B 对齐安全）
-        // 原实现已经是合理的：5 次事务跨 104B 是格式布局的固有限制
-        // 向量化需要块基址 16B 对齐，但 110B 块大小破坏了这个假设
         const std::uint32_t q0 = u32_a2(b + 2 + 8 * u);
         const std::uint32_t q1 = u32_a2(b + 6 + 8 * u);
         const std::uint32_t qh = b[66 + u];
         const std::uint32_t sg = u32_a2(b + 74 + 4 * u);
         const int sc           = (b[106 + u / 2] >> (4 * (u & 1))) & 0xF;
-        s.f[0] = half_at(b) * float(1 + 2 * sc);
+        s.f[0]                 = half_at(b) * float(1 + 2 * sc);
 #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const std::uint32_t idx = (((e < 4 ? q0 : q1) >> (8 * (e & 3))) & 0xFF) | ((qh << (8 - e)) & 0x100);
@@ -733,8 +729,10 @@ struct Decoder<GGML_TYPE_IQ1_S> {
             s.w[2 * l + 1]        = int((g >> 4) & 0x0F0F0F0Fu);
         }
     }
+    // Spelled out as the CPU's product computes it (gguf_expert_cpu).
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float sum) {
-        return s.f[0] * (d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))) + s.f[1] * sum);
+        return __fmul_rn(s.f[0], __fmaf_rn(d, float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0))),
+                                           __fmul_rn(s.f[1], sum)));
     }
 };
 
@@ -742,6 +740,10 @@ template <>
 struct Decoder<GGML_TYPE_IQ1_M> {
     static constexpr int kBlockElems = 256, kBlockBytes = 56, kTableWords = 2048;
     __device__ static const std::uint32_t* table() { return iq1s_grid_gpu; }
+    // A value is d (2 s + 1) (g + delta) with g in -1..1 and delta +-1/8 per eight values. Eight
+    // times g + delta is the integer 8 c - 7 (delta 1/8) or 8 c - 9 (delta -1/8) for the grid's
+    // code c = g + 1, so the words hold those integers and the factors d (2 s + 1) / 8, both exact:
+    // each half's dot is ggml's exactly, and the product is IQ2_S's.
     __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
                                                   const std::uint32_t* grid, Slice& s) {
         const auto* sc = reinterpret_cast<const std::uint16_t*>(b + 48);
@@ -749,29 +751,28 @@ struct Decoder<GGML_TYPE_IQ1_M> {
         scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000);
         const float d          = __half2float(scale.f16);
         const int tmp          = sc[u / 2] >> (6 * (u % 2));
-        s.f[0]                 = d * float(2 * (tmp & 7) + 1);
-        s.f[1]                 = d * float(2 * ((tmp >> 3) & 7) + 1);
+        s.f[0]                 = d * float(2 * (tmp & 7) + 1) * 0.125f;
+        s.f[1]                 = d * float(2 * ((tmp >> 3) & 7) + 1) * 0.125f;
         const std::uint32_t qs = u32_a4(b + 4 * u);
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const std::uint32_t qhl = b[32 + 2 * u + l / 2] >> (4 * (l % 2));
-            const std::uint32_t g   = grid[((qs >> (8 * l)) & 0xFF) | ((qhl & 7) << 8)];
-            s.w[2 * l]              = int(g & 0x0F0F0F0Fu);
-            s.w[2 * l + 1]          = int((g >> 4) & 0x0F0F0F0Fu);
-            s.f[2 + l] = -1.0f + IQ1M_DELTA - float(qhl & 0x08) * (2.0f * IQ1M_DELTA / 0x08);
+            const std::uint32_t qhl    = b[32 + 2 * u + l / 2] >> (4 * (l % 2));
+            const std::uint32_t g      = grid[((qs >> (8 * l)) & 0xFF) | ((qhl & 7) << 8)];
+            const std::uint32_t offset = (qhl & 0x08) ? 0x09090909u : 0x07070707u;
+            s.w[2 * l]                 = int(__vsub4((g & 0x0F0F0F0Fu) << 3, offset));
+            s.w[2 * l + 1]             = int(__vsub4(((g >> 4) & 0x0F0F0F0Fu) << 3, offset));
         }
     }
     __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
-        const float lo = float(dot4(s.w, a, 0)) + s.f[2] * float(sum2(a)) + s.f[3] * float(sum2(a + 2));
-        const float hi =
-            float(dot4(s.w + 4, a + 4, 0)) + s.f[4] * float(sum2(a + 4)) + s.f[5] * float(sum2(a + 6));
-        return d * (s.f[0] * lo + s.f[1] * hi);
+        // Spelled out as the CPU's product computes it (gguf_expert_cpu).
+        return __fmul_rn(d, __fmaf_rn(s.f[0], float(dot4(s.w, a, 0)),
+                                      __fmul_rn(s.f[1], float(dot4(s.w + 4, a + 4, 0)))));
     }
 };
 
 // KS: the static K the slice loop unrolls over, or 0 for the runtime K. Fused: the weight is one
 // [gate; up] parent and each output row is silu(gate row) * up row.
-template <ggml_type type, int T, bool Fused, int KS>
+template <ggml_type type, int T, bool Fused, int KS, bool Cooperative = false>
 __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
@@ -826,23 +827,16 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
                 Slice sl;
-                D::decode(rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes, sub, table, sl);
+                const auto* block = rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes;
+                decode_words<D, Cooperative>(block, sub, table, sl);
 #pragma unroll
                 for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
             }
         };
-        // A single loop over the slice index. With the static K, `slices` is a compile-time
-        // constant and the compiler picks the unrolling. On sm_70 the measured winners:
-        // T=1 fully unrolled at K=5376 (96 us vs 97 runtime; the unrolled form regressed the 26B
-        // K=2816/4096 shapes, so static K at T=1 is dispatched for 5376 only), wider T one small
-        // loop body (Q4_K K=5376 T=5: 110 us vs 125 runtime). Everything else keeps the runtime
-        // loop.
-        static_assert(KS == 0 || KS % 32 == 0);
-        if constexpr (KS != 0 && T == 1) {
+        if constexpr (KS != 0) {
+            static_assert(KS % 1024 == 0);
 #pragma unroll
-            for (int it = 0; it < slices / 32 + 1; ++it) {
-                if (lane + 32 * it < slices) { slice(it); }
-            }
+            for (int it = 0; it < KS / 1024; ++it) { slice(it); }
         } else {
             for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
         }
@@ -873,11 +867,11 @@ __launch_bounds__(kVecWarps * 32) __global__ void kernel(VecArgs p) {
     }
 }
 
-template <ggml_type type, int T, bool Fused, int KS>
+template <ggml_type type, int T, bool Fused, int KS, bool Cooperative = false>
 void launch(const VecArgs& args, cudaStream_t stream) {
     static const int resident = [] {
         int blocks = 0;
-        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel<type, T, Fused, KS>,
+        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel<type, T, Fused, KS, Cooperative>,
                                                             kVecWarps * 32, 0),
               "vector occupancy");
         return std::max(blocks, 1);
@@ -885,56 +879,46 @@ void launch(const VecArgs& args, cudaStream_t stream) {
     const int per_block = kVecWarps * (Fused ? 1 : 2);
     const int groups    = (args.rows + per_block - 1) / per_block;
     const int blocks    = std::min(groups, resident * device_facts().sm_count);
-    kernel<type, T, Fused, KS><<<blocks, kVecWarps * 32, 0, stream>>>(args);
+    kernel<type, T, Fused, KS, Cooperative><<<blocks, kVecWarps * 32, 0, stream>>>(args);
     check(cudaGetLastError(), "vector product launch");
 }
 
-template <ggml_type type, int T, bool Fused>
+template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 void launch_k(const VecArgs& args, cudaStream_t stream) {
-    if constexpr (kVecStaticK<type> && T == 1) {
-        // Only K=5376 measured a win for the unrolled T=1 form (96 vs 97 us, Q4_K sm_70);
-        // K=2816/4096 regressed, so they stay on the runtime loop.
-        if (args.k == 5376) { return launch<type, T, Fused, 5376>(args, stream); }
-    } else if constexpr (kVecStaticK<type>) {
+    if constexpr (kVecStaticK<type>) {
         switch (args.k) {
-        case 704:   return launch<type, T, Fused, 704>(args, stream);
-        case 1024:  return launch<type, T, Fused, 1024>(args, stream);
-        case 2112:  return launch<type, T, Fused, 2112>(args, stream);
-        case 2816:  return launch<type, T, Fused, 2816>(args, stream);
-        case 4096:  return launch<type, T, Fused, 4096>(args, stream);
-        case 5120:  return launch<type, T, Fused, 5120>(args, stream);
-        case 5376:  return launch<type, T, Fused, 5376>(args, stream);
-        case 5632:  return launch<type, T, Fused, 5632>(args, stream);
-        case 6144:  return launch<type, T, Fused, 6144>(args, stream);
-        case 8192:  return launch<type, T, Fused, 8192>(args, stream);
-        case 10240: return launch<type, T, Fused, 10240>(args, stream);
-        case 17408: return launch<type, T, Fused, 17408>(args, stream);
+        case 5120: return launch<type, T, Fused, 5120, Cooperative>(args, stream);
+        case 6144: return launch<type, T, Fused, 6144, Cooperative>(args, stream);
+        case 10240: return launch<type, T, Fused, 10240, Cooperative>(args, stream);
+        case 17408: return launch<type, T, Fused, 17408, Cooperative>(args, stream);
         default: break;
         }
     }
-    launch<type, T, Fused, 0>(args, stream);
+    launch<type, T, Fused, 0, Cooperative>(args, stream);
 }
 
-template <ggml_type type, bool Fused>
+template <ggml_type type, bool Fused, bool Cooperative = false>
 void launch_columns(const VecArgs& args, int columns, cudaStream_t stream) {
     switch (columns) {
-    case 1: return launch_k<type, 1, Fused>(args, stream);
-    case 2: return launch_k<type, 2, Fused>(args, stream);
-    case 3: return launch_k<type, 3, Fused>(args, stream);
-    case 4: return launch_k<type, 4, Fused>(args, stream);
-    case 5: return launch_k<type, 5, Fused>(args, stream);
-    case 6: return launch_k<type, 6, Fused>(args, stream);
-    case 7: return launch_k<type, 7, Fused>(args, stream);
-    case 8: return launch_k<type, 8, Fused>(args, stream);
+    case 1: return launch_k<type, 1, Fused, Cooperative>(args, stream);
+    case 2: return launch_k<type, 2, Fused, Cooperative>(args, stream);
+    case 3: return launch_k<type, 3, Fused, Cooperative>(args, stream);
+    case 4: return launch_k<type, 4, Fused, Cooperative>(args, stream);
+    case 5: return launch_k<type, 5, Fused, Cooperative>(args, stream);
+    case 6: return launch_k<type, 6, Fused, Cooperative>(args, stream);
+    case 7: return launch_k<type, 7, Fused, Cooperative>(args, stream);
+    case 8: return launch_k<type, 8, Fused, Cooperative>(args, stream);
     default: break;
     }
     throw std::invalid_argument("gguf vector product: columns must be 1..8");
 }
 
-// The MoE form: block (x, y) takes rows of the y-th active expert for every pair routed to it, T of
-// them per pass over the rows. A pair's activation column is pair / column_group. Fused: the first
-// table holds the gate rows and the second the up rows, and each output row is silu(gate) * up.
-template <ggml_type type, int T, bool Fused, int KS = 0>
+// The MoE form: block (x, y) takes rows of the y-th active expert for every pair routed to it, up
+// to T of them per pass over the rows; a pass over fewer skips the missing columns, and every
+// column's arithmetic is the same at any T. A pair's activation column is pair / column_group.
+// Fused: the first table holds the gate rows and the second the up rows, and each output row is
+// silu(gate) * up.
+template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
     using D                 = Decoder<type>;
     constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
@@ -955,7 +939,7 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
     const std::uint8_t* second     = Fused ? p.second[expert] : nullptr;
     const int warp                 = threadIdx.x >> 5;
     const int lane                 = threadIdx.x & 31;
-    const int k                    = KS != 0 ? KS : p.k;
+    const int k                    = p.k;
     const int slices               = k / 32;
     const int step                 = Fused ? 1 : kRows;
     const std::int64_t lane_offset = std::int64_t(lane / kPerBlock) * D::kBlockBytes;
@@ -988,12 +972,13 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
 #pragma unroll
                 for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
             }
-            const auto slice = [&](int it) {
+            for (int it = 0; lane + 32 * it < slices; ++it) {
                 const int s = lane + 32 * it;
                 int a[T][8];
                 float d[T], sum[T];
 #pragma unroll
                 for (int j = 0; j < T; ++j) {
+                    if (j >= n) { break; }
                     const float2 ds = __half22float2(p.ds[std::int64_t(column[j]) * slices + s]);
                     d[j]            = ds.x;
                     sum[j]          = ds.y;
@@ -1012,28 +997,20 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
 #pragma unroll
                 for (int r = 0; r < kRows; ++r) {
                     Slice sl;
-                    D::decode(rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes, sub,
-                              table, sl);
+                    decode_words<D, Cooperative>(
+                        rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes, sub, table, sl);
 #pragma unroll
-                    for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
+                    for (int j = 0; j < T; ++j) {
+                        if (j >= n) { break; }
+                        acc[r][j] += D::dot(sl, a[j], d[j], sum[j]);
+                    }
                 }
-            };
-            // Same loop forms as the vector kernel: the static K makes `slices` a compile-time
-            // constant (precomputed activation base addresses); T=1 fully unrolls, the rest take
-            // one small loop body.
-            static_assert(KS == 0 || KS % 32 == 0);
-            if constexpr (KS != 0 && T == 1) {
-#pragma unroll
-                for (int it = 0; it < slices / 32 + 1; ++it) {
-                    if (lane + 32 * it < slices) { slice(it); }
-                }
-            } else {
-                for (int it = 0; lane + 32 * it < slices; ++it) { slice(it); }
             }
 #pragma unroll
             for (int r = 0; r < kRows; ++r) {
 #pragma unroll
                 for (int j = 0; j < T; ++j) {
+                    if (j >= n) { break; }
 #pragma unroll
                     for (int o = 16; o > 0; o >>= 1) {
                         acc[r][j] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][j], o);
@@ -1073,39 +1050,29 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
     }
 }
 
-template <ggml_type type, int T, bool Fused, int KS = 0>
+template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 void moe_launch_chunk(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
     const int per_block = kVecWarps * (Fused ? 1 : 2);
     const int groups    = (args.rows + per_block - 1) / per_block;
-    moe_kernel<type, T, Fused, KS><<<dim3(groups, max_active, 1), kVecWarps * 32, 0, stream>>>(args);
+    moe_kernel<type, T, Fused, Cooperative><<<dim3(groups, max_active, 1), kVecWarps * 32, 0, stream>>>(args);
     check(cudaGetLastError(), "moe product launch");
 }
 
-template <ggml_type type, bool Fused, int KS = 0>
+template <ggml_type type, bool Fused, bool Cooperative = false>
 void moe_launch_fused(const MoeVecArgs& args, int max_active, int chunk, cudaStream_t stream) {
     switch (chunk) {
     case 1:
-        return moe_launch_chunk<type, 1, Fused, KS>(args, max_active, stream);
+        return moe_launch_chunk<type, 1, Fused, Cooperative>(args, max_active, stream);
     case 2:
-        return moe_launch_chunk<type, 2, Fused, KS>(args, max_active, stream);
+        return moe_launch_chunk<type, 2, Fused, Cooperative>(args, max_active, stream);
     case 4:
-        return moe_launch_chunk<type, 4, Fused, KS>(args, max_active, stream);
+        return moe_launch_chunk<type, 4, Fused, Cooperative>(args, max_active, stream);
     case 8:
-        return moe_launch_chunk<type, 8, Fused, KS>(args, max_active, stream);
+        return moe_launch_chunk<type, 8, Fused, Cooperative>(args, max_active, stream);
     default:
         break;
     }
     throw std::invalid_argument("gguf moe product: chunk must be 1, 2, 4 or 8");
-}
-
-template <ggml_type type, int KS>
-void moe_launch_k(const MoeVecArgs& args, int max_active, int chunk, bool fused,
-                  cudaStream_t stream) {
-    if (fused) {
-        moe_launch_fused<type, true, KS>(args, max_active, chunk, stream);
-    } else {
-        moe_launch_fused<type, false, KS>(args, max_active, chunk, stream);
-    }
 }
 
 // --- The MoE of one decode or verification call in few launches --------------------------------
@@ -1259,7 +1226,7 @@ inline constexpr int kUpRows   = kUpWarps * kUpPasses;
 // order, so every row's sums are moe_kernel's. With prepared middles the block then quantizes
 // its 32 middle values of every pair itself (one warp per pair, quantize_vector_kernel's
 // arithmetic), else it stores the middles.
-template <ggml_type type, int T>
+template <ggml_type type, int T, bool Cooperative = false>
 __launch_bounds__(kUpWarps * 32, 1) __global__ void moe_decode_up_kernel(MoeDecodeUpArgs p) {
     using D                   = Decoder<type>;
     constexpr int kTable      = D::kTableWords > 0 ? D::kTableWords : 4;
@@ -1378,8 +1345,8 @@ __launch_bounds__(kUpWarps * 32, 1) __global__ void moe_decode_up_kernel(MoeDeco
                 const std::int64_t at = std::int64_t(row) * p.row_bytes +
                                         std::int64_t(s / kPerBlock) * D::kBlockBytes;
                 Slice gate_slice, up_slice;
-                decode_slice<D>(first + at, s % kPerBlock, table, gate_slice);
-                decode_slice<D>(second + at, s % kPerBlock, table, up_slice);
+                decode_slice<D, Cooperative>(first + at, s % kPerBlock, table, gate_slice);
+                decode_slice<D, Cooperative>(second + at, s % kPerBlock, table, up_slice);
 #pragma unroll
                 for (int j = 0; j < T; ++j) {
                     const float g = dot_slice<D>(gate_slice, a[j], d[j], sum[j], qs_sum[j]);
@@ -1743,7 +1710,7 @@ __launch_bounds__(kDownWarps * 32) __global__ void moe_decode_down_rows_kernel(M
     }
 }
 
-template <ggml_type type, int T>
+template <ggml_type type, int T, bool Cooperative = false>
 void moe_decode_up_chunk(const MoeDecodeUpArgs& args, cudaStream_t stream) {
     if (args.middle_qs != nullptr && args.rows % kUpRows != 0) {
         throw std::invalid_argument("gguf moe decode: quantized middles need whole groups");
@@ -1754,7 +1721,7 @@ void moe_decode_up_chunk(const MoeDecodeUpArgs& args, cudaStream_t stream) {
         args.qs != nullptr ? 0
                            : std::size_t(columns) * kDecodeK +
                                  std::size_t(columns) * (kDecodeK / QK8_1) * (sizeof(half2) + sizeof(int));
-    moe_decode_up_kernel<type, T>
+    moe_decode_up_kernel<type, T, Cooperative>
         <<<dim3(groups, args.slots, 1), kUpWarps * 32, shared_bytes, stream>>>(args);
     check(cudaGetLastError(), "moe decode up launch");
 }
@@ -1817,11 +1784,19 @@ void moe_decode_up_launch(const MoeDecodeUpArgs& args, int chunk, cudaStream_t s
     }
     // Eight columns at once spill the unrolled loads out of registers: wider calls take four at
     // a time.
-    switch (chunk) {
-    case 1: return vec::moe_decode_up_chunk<type, 1>(args, stream);
-    case 2: return vec::moe_decode_up_chunk<type, 2>(args, stream);
-    default: return vec::moe_decode_up_chunk<type, 4>(args, stream);
+    const auto launch = [&]<bool Cooperative>() {
+        switch (chunk) {
+        case 1: return vec::moe_decode_up_chunk<type, 1, Cooperative>(args, stream);
+        case 2: return vec::moe_decode_up_chunk<type, 2, Cooperative>(args, stream);
+        default: return vec::moe_decode_up_chunk<type, 4, Cooperative>(args, stream);
+        }
+    };
+    if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) {
+        if (vec::cooperative_loads<type, vec::VectorFamily::MoeUp>(chunk == 1 || chunk == 2 ? chunk : 4)) {
+            return launch.template operator()<true>();
+        }
     }
+    launch.template operator()<false>();
 }
 
 template <ggml_type type>
@@ -1858,17 +1833,17 @@ void moe_launch(const MoeVecArgs& args, int max_active, int chunk, bool fused,
         max_active <= 0 || max_active > 65535) {
         throw std::invalid_argument("gguf moe product: unsupported geometry");
     }
-    if constexpr (kMoeStaticK<type>) {
-        switch (args.k) {
-        case 704:
-            return vec::moe_launch_k<type, 704>(args, max_active, chunk, fused, stream);
-        case 2816:
-            return vec::moe_launch_k<type, 2816>(args, max_active, chunk, fused, stream);
-        default:
-            break;
+    const auto launch = [&]<bool Cooperative>() {
+        if (fused) {
+            vec::moe_launch_fused<type, true, Cooperative>(args, max_active, chunk, stream);
+        } else {
+            vec::moe_launch_fused<type, false, Cooperative>(args, max_active, chunk, stream);
         }
+    };
+    if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) {
+        if (vec::cooperative_loads<type, vec::VectorFamily::Moe>(chunk)) { return launch.template operator()<true>(); }
     }
-    vec::moe_launch_k<type, 0>(args, max_active, chunk, fused, stream);
+    launch.template operator()<false>();
 }
 
 template <ggml_type type>
@@ -1878,37 +1853,17 @@ void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t strea
         args.row_bytes < std::int64_t(args.k / D::kBlockElems) * D::kBlockBytes || args.rows <= 0) {
         throw std::invalid_argument("gguf vector product: unsupported geometry");
     }
-    if (fused) {
-        vec::launch_columns<type, true>(args, columns, stream);
-    } else {
-        vec::launch_columns<type, false>(args, columns, stream);
+    const auto launch = [&]<bool Cooperative>() {
+        if (fused) {
+            vec::launch_columns<type, true, Cooperative>(args, columns, stream);
+        } else {
+            vec::launch_columns<type, false, Cooperative>(args, columns, stream);
+        }
+    };
+    if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q6_K) {
+        if (vec::cooperative_loads<type>(columns)) { return launch.template operator()<true>(); }
     }
-}
-
-// 本仓库 V100 增量：Q6_K 密集布局（QuantLayout::VoltaQ6KDense）的向量路线。几何条件比超块版多一条
-// k % 1024 == 0（行字节 210*k/256 必须是 8 的倍数，64-bit 码字读取才对齐）。融合 [gate; up] 的
-// Q6_K 父矩阵不会进入密集布局（storage_trades 只选非融合角色），所以这里没有 Fused 形态。
-template <ggml_type type>
-void vec_launch_dense(const VecArgs& args, int columns, cudaStream_t stream) {
-    static_assert(type == GGML_TYPE_Q6_K);
-    using D = vec::Decoder<type>;
-    if (args.k % D::kBlockElems != 0 || args.row_bytes % D::kBlockBytes != 0 ||
-        args.row_bytes < std::int64_t(args.k / D::kBlockElems) * D::kBlockBytes ||
-        args.k % 1024 != 0 || args.rows <= 0) {
-        throw std::invalid_argument("gguf dense vector product: unsupported geometry");
-    }
-    switch (columns) {
-    case 1: return vec::launch_q6k_dense<1>(args, stream);
-    case 2: return vec::launch_q6k_dense<2>(args, stream);
-    case 3: return vec::launch_q6k_dense<3>(args, stream);
-    case 4: return vec::launch_q6k_dense<4>(args, stream);
-    case 5: return vec::launch_q6k_dense<5>(args, stream);
-    case 6: return vec::launch_q6k_dense<6>(args, stream);
-    case 7: return vec::launch_q6k_dense<7>(args, stream);
-    case 8: return vec::launch_q6k_dense<8>(args, stream);
-    default: break;
-    }
-    throw std::invalid_argument("gguf dense vector product: columns must be 1..8");
+    launch.template operator()<false>();
 }
 
 namespace vec {
@@ -1921,7 +1876,7 @@ __device__ __forceinline__ float slice_value(const Slice& s, int e, int j) {
     if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
         return s.f[0] * c - s.f[1];
     } else if constexpr (type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ2_XS ||
-                         type == GGML_TYPE_IQ2_S) {
+                         type == GGML_TYPE_IQ2_S || type == GGML_TYPE_NVFP4) {
         return (e < 4 ? s.f[0] : s.f[1]) * c;
     } else if constexpr (type == GGML_TYPE_Q2_K) {
         return e < 4 ? s.f[0] * c - s.f[2] : s.f[1] * c - s.f[3];
@@ -1996,34 +1951,6 @@ __launch_bounds__(256) __global__
     }
 }
 
-// 本仓库 V100 增量：Q6_K 密集布局的 slice dequantize（sm70 预填充与 embedding gather 的快路径）。
-template <typename dst_t>
-__launch_bounds__(256) __global__ void slice_dequantize_q6k_dense_kernel(
-    const std::uint8_t* __restrict__ weight, std::int64_t row_bytes,
-    const std::int32_t* __restrict__ row_ids, int rows, int k, dst_t* __restrict__ out,
-    std::int64_t out_row_stride) {
-    const int slices         = k / 32;
-    const std::int64_t total = std::int64_t(rows) * slices;
-    for (std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
-         i += std::int64_t(gridDim.x) * blockDim.x) {
-        const int row         = int(i / slices);
-        const int slice       = int(i % slices);
-        const std::int64_t at = row_ids != nullptr ? row_ids[row] : row;
-        Slice s;
-        decode_q6k_dense(weight + at * row_bytes, slice, k, s);
-        dst_t* y = out + std::int64_t(row) * out_row_stride + 32 * std::int64_t(slice);
-#pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            float v[8];
-#pragma unroll
-            for (int t = 0; t < 8; ++t) {
-                v[t] = slice_value<GGML_TYPE_Q6_K>(s, 2 * q + t / 4, t % 4);
-            }
-            store8(y + 8 * q, v);
-        }
-    }
-}
-
 } // namespace vec
 
 template <ggml_type type, typename dst_t>
@@ -2049,47 +1976,13 @@ void slice_dequantize(const void* weight, std::int64_t row_bytes, int k, const s
     check(cudaGetLastError(), "slice dequantize launch");
 }
 
-// 本仓库 V100 增量：Q6_K 密集布局的 slice dequantize。几何条件同 slice_dequantize 加 k % 1024 == 0。
-template <typename dst_t>
-void slice_dequantize_q6k_dense(const void* weight, std::int64_t row_bytes, int k,
-                                const std::int32_t* row_ids, int rows, dst_t* out,
-                                std::int64_t out_row_stride, cudaStream_t stream) {
-    if (k % vec::Decoder<GGML_TYPE_Q6_K>::kBlockElems != 0 || k % 1024 != 0 || rows <= 0 ||
-        out_row_stride % 8 != 0 || reinterpret_cast<std::uintptr_t>(out) % 16 != 0) {
-        throw std::invalid_argument("gguf dense slice dequantize: unsupported geometry");
-    }
-    static const int resident = [] {
-        int blocks = 0;
-        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                  &blocks, vec::slice_dequantize_q6k_dense_kernel<dst_t>, 256, 0),
-              "slice dequantize occupancy");
-        return std::max(blocks, 1);
-    }();
-    const std::int64_t threads = std::int64_t(rows) * (k / 32);
-    const int blocks = int(std::min<std::int64_t>((threads + 255) / 256,
-                                                  std::int64_t(resident) * device_facts().sm_count));
-    vec::slice_dequantize_q6k_dense_kernel<dst_t><<<blocks, 256, 0, stream>>>(
-        static_cast<const std::uint8_t*>(weight), row_bytes, row_ids, rows, k, out, out_row_stride);
-    check(cudaGetLastError(), "dense slice dequantize launch");
-}
-
 } // namespace ninfer::ops::gguf::detail
+
+#include "ggml_bridge_sm70.cuh"
 
 #define NINFER_GGUF_SLICE_DEQUANTIZE_INSTANCE(TYPE, DST)                                           \
     template void ninfer::ops::gguf::detail::slice_dequantize<TYPE, DST>(                          \
         const void*, std::int64_t, int, const std::int32_t*, int, DST*, std::int64_t, cudaStream_t)
-
-// 本仓库 V100 增量：Q6_K 密集布局实例（vec 路线 + 三个 dst 的 slice dequantize）。
-#define NINFER_GGUF_SLICE_DEQUANTIZE_Q6K_DENSE_INSTANCE(DST)                                        \
-    template void ninfer::ops::gguf::detail::slice_dequantize_q6k_dense<DST>(                       \
-        const void*, std::int64_t, int, const std::int32_t*, int, DST*, std::int64_t, cudaStream_t)
-
-#define NINFER_GGUF_Q6K_DENSE_INSTANCE                                                              \
-    template void ninfer::ops::gguf::detail::vec_launch_dense<GGML_TYPE_Q6_K>(                     \
-        const ninfer::ops::gguf::detail::VecArgs&, int, cudaStream_t);                             \
-    NINFER_GGUF_SLICE_DEQUANTIZE_Q6K_DENSE_INSTANCE(half);                                         \
-    NINFER_GGUF_SLICE_DEQUANTIZE_Q6K_DENSE_INSTANCE(__nv_bfloat16);                                 \
-    NINFER_GGUF_SLICE_DEQUANTIZE_Q6K_DENSE_INSTANCE(float)
 
 #define NINFER_GGUF_VECTOR_INSTANCE(TYPE)                                                          \
     template void ninfer::ops::gguf::detail::vec_launch<TYPE>(                                     \

@@ -248,6 +248,123 @@ const std::array<std::uint16_t, 256>& normalization_lut() {
     return values;
 }
 
+// DeepSeek-V4.1's values (x / 255 - 0.5) / 0.5 in FP32, as image_processor.py computes them.
+const std::array<std::uint16_t, 256>& deepseek_lut() {
+    static const std::array<std::uint16_t, 256> values = [] {
+        std::array<std::uint16_t, 256> out{};
+        for (std::size_t value = 0; value < out.size(); ++value) {
+            out[value] = to_bf16((static_cast<float>(value) / 255.0f - 0.5f) / 0.5f);
+        }
+        return out;
+    }();
+    return values;
+}
+
+// Inkling 2's values (x - 127.5) / 127.5 in FP32, the release's fused rescale and normalization
+// as llama.cpp computes it; its padding is the raw value -1.
+const std::array<std::uint16_t, 256>& inkling_lut() {
+    static const std::array<std::uint16_t, 256> values = [] {
+        std::array<std::uint16_t, 256> out{};
+        for (std::size_t value = 0; value < out.size(); ++value) {
+            out[value] = to_bf16((static_cast<float>(value) - 127.5f) / 127.5f);
+        }
+        return out;
+    }();
+    return values;
+}
+
+std::uint16_t inkling_pad_value() { return to_bf16((-1.0f - 127.5f) / 127.5f); }
+
+// PIL's bicubic filter (a = -0.5, support 2) and its fixed-point coefficients of one axis: per
+// output sample its first input sample, their count and `ksize` coefficients (Resample.c).
+constexpr int kPilPrecision = 22;
+
+double pil_bicubic(double x) {
+    constexpr double a = -0.5;
+    if (x < 0.0) { x = -x; }
+    if (x < 1.0) { return ((a + 2.0) * x - (a + 3.0)) * x * x + 1; }
+    if (x < 2.0) { return (((x - 5) * x + 8) * x - 4) * a; }
+    return 0.0;
+}
+
+struct PilAxis {
+    int ksize = 0;
+    std::vector<int> first, count;
+    std::vector<std::int32_t> weights; // [out][ksize]
+};
+
+PilAxis pil_axis(int in_size, int out_size) {
+    const float in0 = 0.0f, in1 = static_cast<float>(in_size);
+    const double scale       = static_cast<double>(in1 - in0) / out_size;
+    const double filterscale = scale < 1.0 ? 1.0 : scale;
+    const double support     = 2.0 * filterscale;
+    PilAxis axis;
+    axis.ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
+    axis.first.resize(static_cast<std::size_t>(out_size));
+    axis.count.resize(static_cast<std::size_t>(out_size));
+    axis.weights.assign(static_cast<std::size_t>(out_size) * axis.ksize, 0);
+    std::vector<double> k(static_cast<std::size_t>(axis.ksize));
+    const double inv = 1.0 / filterscale;
+    for (int xx = 0; xx < out_size; ++xx) {
+        const double center = in0 + (xx + 0.5) * scale;
+        double ww           = 0.0;
+        int xmin            = static_cast<int>(center - support + 0.5);
+        if (xmin < 0) { xmin = 0; }
+        int xmax = static_cast<int>(center + support + 0.5);
+        if (xmax > in_size) { xmax = in_size; }
+        xmax -= xmin;
+        for (int x = 0; x < xmax; ++x) {
+            const double w = pil_bicubic((x + xmin - center + 0.5) * inv);
+            k[static_cast<std::size_t>(x)] = w;
+            ww += w;
+        }
+        if (ww != 0.0) {
+            for (int x = 0; x < xmax; ++x) { k[static_cast<std::size_t>(x)] /= ww; }
+        }
+        for (int x = 0; x < axis.ksize; ++x) {
+            const double w = x < xmax ? k[static_cast<std::size_t>(x)] : 0.0;
+            axis.weights[static_cast<std::size_t>(xx) * axis.ksize + x] = static_cast<std::int32_t>(
+                w < 0 ? -0.5 + w * (1 << kPilPrecision) : 0.5 + w * (1 << kPilPrecision));
+        }
+        axis.first[static_cast<std::size_t>(xx)] = xmin;
+        axis.count[static_cast<std::size_t>(xx)] = xmax;
+    }
+    return axis;
+}
+
+std::uint8_t pil_clip(std::int32_t sum) {
+    return static_cast<std::uint8_t>(std::clamp(sum >> kPilPrecision, 0, 255));
+}
+
+// One pass: along x (each row of `rows`) or along y (each column), from in_size samples to the
+// axis' out_size, RGB.
+std::vector<std::uint8_t> pil_pass(std::span<const std::uint8_t> rgb, int width, int height,
+                                   int out_size, bool horizontal) {
+    const int in_size = horizontal ? width : height;
+    const PilAxis axis = pil_axis(in_size, out_size);
+    const int out_w = horizontal ? out_size : width, out_h = horizontal ? height : out_size;
+    std::vector<std::uint8_t> out(static_cast<std::size_t>(out_w) * out_h * 3);
+    for (int y = 0; y < out_h; ++y) {
+        for (int x = 0; x < out_w; ++x) {
+            const int o = horizontal ? x : y;
+            const std::int32_t* k = axis.weights.data() + static_cast<std::size_t>(o) * axis.ksize;
+            const int first = axis.first[static_cast<std::size_t>(o)];
+            const int count = axis.count[static_cast<std::size_t>(o)];
+            for (int c = 0; c < 3; ++c) {
+                std::int32_t sum = 1 << (kPilPrecision - 1);
+                for (int i = 0; i < count; ++i) {
+                    const std::size_t at =
+                        horizontal ? (static_cast<std::size_t>(y) * width + first + i) * 3 + c
+                                   : (static_cast<std::size_t>(first + i) * width + x) * 3 + c;
+                    sum += static_cast<std::int32_t>(rgb[at]) * k[i];
+                }
+                out[(static_cast<std::size_t>(y) * out_w + x) * 3 + c] = pil_clip(sum);
+            }
+        }
+    }
+    return out;
+}
+
 void append_patch(const std::vector<const media::decode::Image*>& frames, int grid_y, int grid_x,
                   std::span<std::uint16_t> out, std::size_t& cursor) {
     if (cursor > out.size() || out.size() - cursor < kPatchFeatures) {
@@ -426,6 +543,172 @@ Size gemma_size(int height, int width, std::uint64_t max_patches, int patch, int
                              "Gemma media resize exceeds its patch budget");
     }
     return {h, w};
+}
+
+// A DeepSeek-V4.1 image's span budget: the bound, a quarter of it at low detail.
+std::uint32_t deepseek_part_budget(const ChatPart& part, const DeepSeekMediaOptions& d) {
+    return part.media.image_detail == ImageDetail::Low ? std::max(d.max_tokens / 4, 5U)
+                                                       : d.max_tokens;
+}
+
+// An Inkling 2 image's cell budget: the bound, a quarter of it at low detail.
+std::uint32_t inkling_part_budget(const ChatPart& part, const InklingMediaOptions& k) {
+    return part.media.image_detail == ImageDetail::Low ? std::max(k.max_tokens / 4, 1U)
+                                                       : k.max_tokens;
+}
+
+int ceil_div(int a, int b) { return (a + b - 1) / b; }
+
+// The prompt positions of one media run: Gemma's pooled tokens, DeepSeek's span, Inkling's cells,
+// Qwen's merged tokens.
+std::size_t media_run_tokens(const VisionItem& item, const ProcessorOptions& options) {
+    if (options.inkling) {
+        const int m = options.inkling->merge;
+        return static_cast<std::size_t>(item.grid.h / m) * (item.grid.w / m);
+    }
+    if (options.deepseek) {
+        const int m = options.deepseek->merge;
+        return DeepSeekImagePlan{0, 0, ceil_div(item.grid.h, m), ceil_div(item.grid.w, m)}
+            .span_tokens();
+    }
+    const int pooling = options.gemma ? options.gemma->pooling : kMerge;
+    return static_cast<std::size_t>(item.grid.h / pooling) * (item.grid.w / pooling);
+}
+
+MediaPads media_pads(const ProcessorOptions& options) {
+    return options.inkling    ? kInklingMediaPads
+           : options.deepseek ? kDeepSeekMediaPads
+           : options.gemma    ? kGemmaMediaPads
+                              : kQwenMediaPads;
+}
+
+void refuse_image_only_video(std::span<ChatPart* const> parts, const ProcessorOptions& options) {
+    if (!options.deepseek && !options.inkling) { return; }
+    for (const ChatPart* part : parts) {
+        if (part->kind != ChatPartKind::Image) {
+            throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                                 options.inkling ? "Inkling 2 reads images, not video"
+                                                 : "DeepSeek-V4.1 reads images, not video");
+        }
+    }
+}
+
+// Inkling 2's patches of `rgb` [height][width][3] under `plan` into `destination`: resized first
+// when the plan says so, then per patch of the row-major grid its channel, row and column values,
+// those past the image the padding.
+void write_inkling_patches(std::span<const std::uint8_t> rgb, int width, int height,
+                           const InklingImagePlan& plan, const InklingMediaOptions& k,
+                           std::uint16_t* destination, const PreparationControl* control) {
+    std::vector<std::uint8_t> resized;
+    if (plan.width != width || plan.height != height) {
+        resized = pil_bicubic_resize(rgb, width, height, plan.width, plan.height);
+        rgb     = resized;
+    }
+    const auto& lut           = inkling_lut();
+    const std::uint16_t pad   = inkling_pad_value();
+    const int p               = k.patch;
+    for (int gy = 0; gy < plan.grid_h; ++gy) {
+        if (control != nullptr) { check_preparation_control(*control); }
+        for (int gx = 0; gx < plan.grid_w; ++gx) {
+            for (int c = 0; c < 3; ++c) {
+                for (int py = 0; py < p; ++py) {
+                    const int y = gy * p + py;
+                    for (int px = 0; px < p; ++px) {
+                        const int x    = gx * p + px;
+                        *destination++ = y < plan.height && x < plan.width
+                                             ? lut[rgb[(std::size_t(y) * plan.width + x) * 3 + c]]
+                                             : pad;
+                    }
+                }
+            }
+        }
+    }
+}
+
+Prepared prepare_inkling_image(std::span<const std::uint8_t> bytes, std::uint32_t budget,
+                               const ProcessorOptions& options, const media::decode::Policy& policy,
+                               MediaPreprocessCache& cache, ConcurrentMediaBudget& request_budget,
+                               const PreparationControl& control) {
+    const InklingMediaOptions& k     = *options.inkling;
+    const media::decode::Image image = media::decode::decode_image(bytes, policy);
+    const InklingImagePlan plan      = inkling_image_plan(image.width, image.height, k, budget);
+    Prepared out;
+    out.item.modality = Modality::Image;
+    out.item.grid     = {1, plan.grid_h, plan.grid_w};
+    PreprocessStats item_stats;
+    add_budget(item_stats, out.item, options);
+    enforce_media_item_resource_limits(item_stats);
+    request_budget.claim(out.item);
+    check_preparation_control(control);
+    const std::size_t elements =
+        static_cast<std::size_t>(plan.grid_h) * plan.grid_w * 3 * k.patch * k.patch;
+    out.payload = cache.allocate_payload(elements, control);
+    write_inkling_patches(image.rgb, image.width, image.height, plan, k,
+                          out.payload->mutable_span().data(), &control);
+    return out;
+}
+
+VisionItem inspect_inkling_item(const ChatPart& part, const ProcessorOptions& options,
+                                const media::decode::Policy& policy) {
+    const InklingMediaOptions& k         = *options.inkling;
+    const media::decode::ImageInfo image = media::decode::inspect_image(part.media.bytes, policy);
+    const InklingImagePlan plan =
+        inkling_image_plan(image.width, image.height, k, inkling_part_budget(part, k));
+    VisionItem item;
+    item.modality = Modality::Image;
+    item.grid     = {1, plan.grid_h, plan.grid_w};
+    return item;
+}
+
+Prepared prepare_deepseek_image(std::span<const std::uint8_t> bytes, std::uint32_t budget,
+                                const ProcessorOptions& options, const media::decode::Policy& policy,
+                                MediaPreprocessCache& cache, ConcurrentMediaBudget& request_budget,
+                                const PreparationControl& control) {
+    const DeepSeekMediaOptions& d = *options.deepseek;
+    const media::decode::Image image = media::decode::decode_image(bytes, policy);
+    const DeepSeekImagePlan plan = deepseek_image_plan(image.width, image.height, d, budget);
+    const int gh = plan.height / d.patch, gw = plan.width / d.patch;
+    Prepared out;
+    out.item.modality = Modality::Image;
+    out.item.grid     = {1, gh, gw};
+    PreprocessStats item_stats;
+    add_budget(item_stats, out.item, options);
+    enforce_media_item_resource_limits(item_stats);
+    request_budget.claim(out.item);
+    check_preparation_control(control);
+    const std::vector<std::uint8_t> rgb =
+        deepseek_pad(image.rgb, image.width, image.height, plan.width, plan.height);
+    const std::size_t features = std::size_t(3) * d.patch * d.patch;
+    const std::size_t elements = static_cast<std::size_t>(gh) * gw * features;
+    out.payload                = cache.allocate_payload(elements, control);
+    const auto& lut            = deepseek_lut();
+    std::uint16_t* destination = out.payload->mutable_span().data();
+    for (int y = 0; y < gh; ++y) {
+        check_preparation_control(control);
+        for (int x = 0; x < gw; ++x) {
+            for (int c = 0; c < 3; ++c) {
+                for (int py = 0; py < d.patch; ++py) {
+                    const std::uint8_t* source =
+                        rgb.data() +
+                        (static_cast<std::size_t>(y * d.patch + py) * plan.width + x * d.patch) * 3 + c;
+                    for (int px = 0; px < d.patch; ++px) { *destination++ = lut[source[px * 3]]; }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+VisionItem inspect_deepseek_item(const ChatPart& part, const ProcessorOptions& options,
+                                 const media::decode::Policy& policy) {
+    const DeepSeekMediaOptions& d        = *options.deepseek;
+    const media::decode::ImageInfo image = media::decode::inspect_image(part.media.bytes, policy);
+    const DeepSeekImagePlan plan =
+        deepseek_image_plan(image.width, image.height, d, deepseek_part_budget(part, d));
+    VisionItem item;
+    item.modality = Modality::Image;
+    item.grid     = {1, plan.height / d.patch, plan.width / d.patch};
+    return item;
 }
 
 // The soft-token budget of one media part: a video frame's, or an image's by its detail (low the
@@ -642,6 +925,20 @@ ProcessorOptions part_options(const ChatPart& part, const ProcessorOptions& opti
 // whose Vision tokens differ from the same bytes seen at full detail.
 Sha256Digest part_digest(const ChatPart& part, const Sha256Digest& bytes_digest,
                          const ProcessorOptions& options) {
+    if (options.inkling) {
+        // Inkling 2's cells depend on the budget the part is seen at.
+        std::string keyed = "ninfer inkling budget " +
+                            std::to_string(inkling_part_budget(part, *options.inkling)) + "\n";
+        keyed.append(reinterpret_cast<const char*>(bytes_digest.data()), bytes_digest.size());
+        return sha256(std::string_view(keyed));
+    }
+    if (options.deepseek) {
+        // DeepSeek-V4.1's span depends on the budget the part is seen at.
+        std::string keyed = "ninfer deepseek budget " +
+                            std::to_string(deepseek_part_budget(part, *options.deepseek)) + "\n";
+        keyed.append(reinterpret_cast<const char*>(bytes_digest.data()), bytes_digest.size());
+        return sha256(std::string_view(keyed));
+    }
     if (options.gemma) {
         // Gemma 4's soft tokens depend on the budget the part is seen at.
         std::string keyed =
@@ -664,6 +961,29 @@ void enforce_image_resize_policy(const ChatPart& part, const ProcessorOptions& o
         return;
     }
     const media::decode::ImageInfo image = media::decode::inspect_image(part.media.bytes, policy);
+    if (options.inkling) {
+        const InklingMediaOptions& k = *options.inkling;
+        const InklingImagePlan plan  = inkling_image_plan(
+            image.width, image.height, k, std::numeric_limits<std::uint32_t>::max());
+        if (plan.cells(k.merge) > inkling_part_budget(part, k)) {
+            throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                                 "image exceeds its Vision budget and oversized_image is set to "
+                                 "'error'");
+        }
+        return;
+    }
+    if (options.deepseek) {
+        const DeepSeekMediaOptions& d = *options.deepseek;
+        const std::uint32_t budget    = deepseek_part_budget(part, d);
+        if (deepseek_image_plan(image.width, image.height, d,
+                                std::numeric_limits<std::uint32_t>::max())
+                .span_tokens() > budget) {
+            throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                                 "image exceeds its Vision budget and oversized_image is set to "
+                                 "'error'");
+        }
+        return;
+    }
     if (options.gemma) {
         const GemmaMediaOptions& g = *options.gemma;
         const double budget_px     = static_cast<double>(gemma_max_patches(
@@ -767,6 +1087,13 @@ void append_gemma_placeholder(std::string& out, const VisionItem& item, std::siz
     }
 }
 
+void append_deepseek_placeholder(std::string& out, const VisionItem& item, std::size_t item_index,
+                                 const ProcessorOptions& options,
+                                 std::vector<MediaTokenRunByteSpec>& runs) {
+    append_media_token_run(out, kDeepSeekMediaPads.image, media_run_tokens(item, options),
+                           Modality::Image, item_index, 0, runs);
+}
+
 struct PlaceholderExpansion {
     std::size_t source_begin = 0;
     std::size_t source_end   = 0;
@@ -794,7 +1121,7 @@ std::size_t map_expanded_boundary(std::size_t boundary, std::size_t source_size,
 
 RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items,
                                  const ProcessorOptions& options) {
-    const MediaPads pads = options.gemma ? kGemmaMediaPads : kQwenMediaPads;
+    const MediaPads pads = media_pads(options);
     if (!rendered.media_token_runs.empty()) {
         throw std::logic_error("rendered chat media placeholders were already expanded");
     }
@@ -820,7 +1147,13 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
             throw std::logic_error("rendered media placeholder metadata does not match its text");
         }
         expanded.append(source, source_cursor, placeholder.bytes.begin - source_cursor);
-        if (options.gemma) {
+        if (options.inkling) {
+            append_media_token_run(expanded, kInklingMediaPads.image,
+                                   media_run_tokens(item, options), Modality::Image, index, 0,
+                                   rendered.media_token_runs);
+        } else if (options.deepseek) {
+            append_deepseek_placeholder(expanded, item, index, options, rendered.media_token_runs);
+        } else if (options.gemma) {
             append_gemma_placeholder(expanded, item, index, options.gemma->pooling,
                                      rendered.media_token_runs);
         } else {
@@ -868,7 +1201,8 @@ void add_budget(PreprocessStats& stats, const VisionItem& item, const ProcessorO
         options.gemma ? std::uint64_t(options.gemma->pooling) * options.gemma->pooling
                       : std::uint64_t(kMerge * kMerge);
     stats.raw_patches += patches;
-    stats.vision_tokens += patches / per_token;
+    stats.vision_tokens += options.deepseek || options.inkling ? media_run_tokens(item, options)
+                                                               : patches / per_token;
     stats.attention_pairs += checked_mul(static_cast<std::uint64_t>(item.grid.t),
                                          checked_mul(spatial, spatial, "vision attention pairs"),
                                          "vision attention pairs");
@@ -974,7 +1308,8 @@ void assign_positions(ProcessedInput& output,
 // Gemma 4's positions are the token indices on every axis; media runs set the token types and the
 // items' spans.
 void assign_gemma_positions(ProcessedInput& output,
-                            std::span<const EncodedChat::MediaTokenRun> media_runs, int pooling) {
+                            std::span<const EncodedChat::MediaTokenRun> media_runs,
+                            const ProcessorOptions& options) {
     const std::size_t length = output.input_ids.size();
     output.positions.assign(length * 3, 0);
     output.token_types.assign(length, 0);
@@ -1003,8 +1338,7 @@ void assign_gemma_positions(ProcessedInput& output,
             throw std::logic_error("encoded media token run exceeds its temporal grid");
         }
         ++next_frame[run.item_index];
-        const std::size_t expected =
-            static_cast<std::size_t>(item.grid.h / pooling) * (item.grid.w / pooling);
+        const std::size_t expected = media_run_tokens(item, options);
         if (run.tokens.count != expected) {
             throw std::invalid_argument("vision placeholder run does not match media grid");
         }
@@ -1050,6 +1384,136 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
     }
     return std::span<const std::int32_t>(positions).subspan(
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
+}
+
+DeepSeekImagePlan deepseek_image_plan(int width, int height, const DeepSeekMediaOptions& options,
+                                      std::uint32_t budget) {
+    if (width <= 0 || height <= 0 || budget < 4) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia, "DeepSeek-V4.1 image plan");
+    }
+    // plan_image_grid, safe_resize and solve_resize_ratio in Python's float arithmetic.
+    const int p = options.patch, r = options.merge;
+    double w = width, h = height;
+    if (w * h < double(options.min_pixels)) {
+        const double ratio = std::pow(double(options.min_pixels) / (w * h), 0.5);
+        w                  = std::trunc(w * ratio);
+        h                  = std::trunc(h * ratio);
+    }
+    const auto grid = [&](int bh, int bw) {
+        return DeepSeekImagePlan{bh, bw, ceil_div(bh / p, r), ceil_div(bw / p, r)};
+    };
+    DeepSeekImagePlan plan = grid(int(std::ceil(h / p)) * p, int(std::ceil(w / p)) * p);
+    if (plan.span_tokens() > budget) {
+        const double aspect = h / w;
+        const double max_w  = std::sqrt((double(budget) - 2) / aspect + 0.25) - 0.5;
+        const double max_h  = max_w * aspect;
+        const int cell      = p * r;
+        if (max_w < 1.0) {
+            plan = grid(int((budget - 2) / 2) * cell, cell);
+        } else if (max_h < 1.0) {
+            plan = grid(cell, int(budget - 3) * cell);
+        } else {
+            const double beta = std::min(double(std::int64_t(std::floor(max_w)) * cell) / w,
+                                         double(std::int64_t(std::floor(max_h)) * cell) / h);
+            plan = grid(int(std::floor(h * beta / p)) * p, int(std::floor(w * beta / p)) * p);
+        }
+        if (plan.span_tokens() > budget || plan.height <= 0 || plan.width <= 0) {
+            throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                                 "DeepSeek-V4.1 image does not fit its token budget");
+        }
+    }
+    return plan;
+}
+
+InklingImagePlan inkling_image_plan(int width, int height, const InklingMediaOptions& options,
+                                    std::uint32_t budget) {
+    if (width <= 0 || height <= 0 || budget == 0) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia, "Inkling 2 image plan");
+    }
+    const int m = options.merge, align = options.patch * m;
+    InklingImagePlan plan{width, height, ceil_div(width, align) * m, ceil_div(height, align) * m};
+    if (plan.cells(m) <= budget) { return plan; }
+    // llama.cpp's calc_size_preserved_ratio at this alignment and budget, in its FP32 arithmetic:
+    // the sides rounded to whole cells, and past the budget each scaled down by the same factor to
+    // whole cells below it.
+    const auto round_cells = [&](int side) {
+        return std::max(align, int(std::round(float(side) / float(align))) * align);
+    };
+    const auto floor_cells = [&](float side) {
+        return std::max(align, int(std::floor(side / float(align))) * align);
+    };
+    const std::int64_t max_pixels = std::int64_t(budget) * align * align;
+    int w = round_cells(width), h = round_cells(height);
+    if (std::int64_t(w) * h > max_pixels) {
+        const float beta = std::sqrt(float(height) * float(width) / float(max_pixels));
+        h                = floor_cells(float(height) / beta);
+        w                = floor_cells(float(width) / beta);
+    }
+    plan = {w, h, w / options.patch, h / options.patch};
+    if (plan.cells(m) > budget) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                             "Inkling 2 image does not fit its token budget");
+    }
+    return plan;
+}
+
+std::vector<std::uint16_t> inkling_patches(std::span<const std::uint8_t> rgb, int width,
+                                           int height, const InklingImagePlan& plan,
+                                           const InklingMediaOptions& options) {
+    if (rgb.size() != std::size_t(width) * height * 3) {
+        throw std::invalid_argument("inkling_patches: invalid sizes");
+    }
+    std::vector<std::uint16_t> out(std::size_t(plan.grid_h) * plan.grid_w * 3 * options.patch *
+                                   options.patch);
+    write_inkling_patches(rgb, width, height, plan, options, out.data(), nullptr);
+    return out;
+}
+
+std::vector<std::uint8_t> pil_bicubic_resize(std::span<const std::uint8_t> rgb, int width,
+                                             int height, int out_width, int out_height) {
+    if (rgb.size() != std::size_t(width) * height * 3 || out_width <= 0 || out_height <= 0) {
+        throw std::invalid_argument("pil_bicubic_resize: invalid sizes");
+    }
+    const bool horizontal = out_width != width, vertical = out_height != height;
+    // Resample.c runs the vertical pass first only when the height shrinks more than twice as
+    // much as the width; each pass rounds to 8 bits.
+    const bool horizontal_first =
+        !((height - out_height) > 0 && (height - out_height) > (width - out_width) * 2);
+    std::vector<std::uint8_t> out(rgb.begin(), rgb.end());
+    if (horizontal && horizontal_first) { out = pil_pass(out, width, height, out_width, true); }
+    if (vertical) {
+        out = pil_pass(out, horizontal && horizontal_first ? out_width : width, height, out_height,
+                       false);
+    }
+    if (horizontal && !horizontal_first) { out = pil_pass(out, width, out_height, out_width, true); }
+    return out;
+}
+
+std::vector<std::uint8_t> deepseek_pad(std::span<const std::uint8_t> rgb, int width, int height,
+                                       int out_width, int out_height) {
+    // ImageOps.contain: the size within (out_width, out_height) of the image's aspect, Python's
+    // round() halves to even.
+    int w = out_width, h = out_height;
+    const double image_ratio = double(width) / height, box_ratio = double(out_width) / out_height;
+    if (image_ratio != box_ratio) {
+        if (image_ratio > box_ratio) {
+            h = int(std::nearbyint(double(height) / width * out_width));
+        } else {
+            w = int(std::nearbyint(double(width) / height * out_height));
+        }
+    }
+    std::vector<std::uint8_t> resized =
+        std::min(w, h) == 0 ? std::vector<std::uint8_t>{}
+                            : pil_bicubic_resize(rgb, width, height, w, h);
+    if (w == out_width && h == out_height) { return resized; }
+    std::vector<std::uint8_t> out(std::size_t(out_width) * out_height * 3, 127);
+    const int x0 = w != out_width ? int(std::nearbyint((out_width - w) * 0.5)) : 0;
+    const int y0 = w != out_width ? 0 : int(std::nearbyint((out_height - h) * 0.5));
+    for (int y = 0; y < h; ++y) {
+        std::copy_n(resized.begin() + std::ptrdiff_t(y) * w * 3, std::size_t(w) * 3,
+                    out.begin() + (std::ptrdiff_t(y + y0) * out_width + x0) * 3);
+    }
+    return out;
 }
 
 std::uint32_t gemma_budget_at_most(std::uint64_t bound) {
@@ -1190,6 +1654,14 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
         throw std::invalid_argument("processor budgets must be positive");
     }
     if (!media_cache_) { throw std::invalid_argument("processor media cache must not be null"); }
+    if (options_.inkling) {
+        (void)media_token_id(tokenizer_, kInklingMediaPads.image);
+        return;
+    }
+    if (options_.deepseek) {
+        (void)media_token_id(tokenizer_, kDeepSeekMediaPads.image);
+        return;
+    }
     if (options_.gemma) {
         for (const std::string_view token :
              {kGemmaMediaPads.image, kGemmaMediaPads.video, kGemmaBoi, kGemmaEoi}) {
@@ -1206,6 +1678,7 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
                                     const PreparationControl& control) const {
     check_preparation_control(control);
     const std::vector<ChatPart*> parts = media_parts(messages);
+    refuse_image_only_video(parts, options_);
     (void)validate_media_inputs(parts, options_);
     RenderedChat rendered = chat_template_.render(messages, std::move(render_options), control);
     MediaPreparationPermit request_permit = media_cache_->acquire_request(control);
@@ -1225,7 +1698,9 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
             check_preparation_control(control);
             const ProcessorOptions options = part_options(*part, options_);
             enforce_image_resize_policy(*part, options, policy);
-            VisionItem item = options_.gemma ? inspect_gemma_item(*part, options_, policy)
+            VisionItem item = options_.inkling    ? inspect_inkling_item(*part, options_, policy)
+                              : options_.deepseek ? inspect_deepseek_item(*part, options_, policy)
+                              : options_.gemma  ? inspect_gemma_item(*part, options_, policy)
                               : part->kind == ChatPartKind::Image
                                   ? inspect_image_item(part->media.bytes, options, policy)
                                   : inspect_video_item(part->media.bytes, options, policy);
@@ -1240,7 +1715,7 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
     rendered = expand_placeholders(std::move(rendered), items, options_);
     const std::size_t count =
         encode_rendered_chat(tokenizer_, rendered, std::numeric_limits<std::size_t>::max(),
-                             options_.gemma ? kGemmaMediaPads : kQwenMediaPads)
+                             media_pads(options_))
             .input_ids.size();
     check_preparation_control(control, "tokenization");
     return count;
@@ -1267,6 +1742,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                                   std::size_t maximum_prompt_tokens) const {
     check_preparation_control(control);
     const std::vector<ChatPart*> parts = media_parts(messages);
+    refuse_image_only_video(parts, options_);
     const std::size_t media_bytes      = validate_media_inputs(parts, options_);
     RenderedChat rendered = chat_template_.render(messages, std::move(render_options), control);
     const std::size_t encode_limit =
@@ -1341,7 +1817,15 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
                 [this, part, kind, digest, options = part_options(*part, options_), &policy,
                  &request_budget, &worker_control]() {
                     Prepared built;
-                    if (options.gemma) {
+                    if (options.inkling) {
+                        built = prepare_inkling_image(
+                            part->media.bytes, inkling_part_budget(*part, *options.inkling),
+                            options, policy, *media_cache_, request_budget, worker_control);
+                    } else if (options.deepseek) {
+                        built = prepare_deepseek_image(
+                            part->media.bytes, deepseek_part_budget(*part, *options.deepseek),
+                            options, policy, *media_cache_, request_budget, worker_control);
+                    } else if (options.gemma) {
                         const std::uint32_t budget = gemma_part_budget(*part, *options.gemma);
                         built = kind == ChatPartKind::Image
                                     ? prepare_gemma_image(part->media.bytes, budget, options,
@@ -1370,8 +1854,10 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     MediaCacheRequestStats cache_stats;
     std::size_t patch_cursor = 0;
     const std::size_t patch_features =
-        options_.gemma ? std::size_t(3) * options_.gemma->patch * options_.gemma->patch
-                       : std::size_t(kPatchFeatures);
+        options_.inkling    ? std::size_t(3) * options_.inkling->patch * options_.inkling->patch
+        : options_.deepseek ? std::size_t(3) * options_.deepseek->patch * options_.deepseek->patch
+        : options_.gemma  ? std::size_t(3) * options_.gemma->patch * options_.gemma->patch
+                          : std::size_t(kPatchFeatures);
     for (PendingMedia& pending : pending_items) {
         PreparedMedia media;
         try {
@@ -1431,7 +1917,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     rendered                    = expand_placeholders(std::move(rendered), items, options_);
     const auto tokenize_started = Clock::now();
     EncodedChat encoded         = encode_rendered_chat(
-        tokenizer_, rendered, encode_limit, options_.gemma ? kGemmaMediaPads : kQwenMediaPads);
+        tokenizer_, rendered, encode_limit, media_pads(options_));
     stats.tokenize_seconds +=
         std::chrono::duration<double>(Clock::now() - tokenize_started).count();
     check_preparation_control(control, "tokenization");
@@ -1457,8 +1943,8 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     stats.media_preprocess_seconds      = media_preprocess_seconds;
     stats.media_preprocess_work_seconds = cache_stats.build_seconds;
     output.vision_items                 = std::move(items);
-    if (options_.gemma) {
-        assign_gemma_positions(output, encoded.media_token_runs, options_.gemma->pooling);
+    if (options_.gemma || options_.deepseek || options_.inkling) {
+        assign_gemma_positions(output, encoded.media_token_runs, options_);
     } else {
         assign_positions(output, encoded.media_token_runs);
     }

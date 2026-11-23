@@ -1971,8 +1971,9 @@ struct Qwen4ExpCore::Impl {
             for (std::size_t j = 0; j < b; ++j) {
                 std::vector<TokenId>& ledger = slots[batch[j]->slot].fed;
                 ledger.push_back(anchors[j]);
+                std::size_t lookup_lag = 0;
                 const std::uint32_t found = runtime::lookup_draft(
-                    ledger, lookup_ngram, steps, all_drafts.data() + j * drafts);
+                    ledger, lookup_ngram, steps, all_drafts.data() + j * drafts, lookup_lag);
                 ledger.pop_back();
                 if (found != 0) {
                     looked_up[j]     = 1;

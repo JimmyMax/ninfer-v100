@@ -26,6 +26,8 @@ constexpr std::array kFormats = {
     std::pair{QType::GGUF_Q4_K, std::string_view{"gguf_q4_k"}},
     std::pair{QType::GGUF_Q5_K, std::string_view{"gguf_q5_k"}},
     std::pair{QType::GGUF_Q6_K, std::string_view{"gguf_q6_k"}},
+    std::pair{QType::GGUF_MXFP4, std::string_view{"gguf_mxfp4"}},
+    std::pair{QType::GGUF_NVFP4, std::string_view{"gguf_nvfp4"}},
     std::pair{QType::GGUF_IQ2_XXS, std::string_view{"gguf_iq2_xxs"}},
     std::pair{QType::GGUF_IQ2_XS, std::string_view{"gguf_iq2_xs"}},
     std::pair{QType::GGUF_IQ2_S, std::string_view{"gguf_iq2_s"}},

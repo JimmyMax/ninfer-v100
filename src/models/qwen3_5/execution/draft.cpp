@@ -323,7 +323,7 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads),
                      dimension(config.attention.num_key_value_heads)},
-                    dimension(config.sliding_window.value_or(0)),
+                    dimension(config.sliding_window.value_or(0)), ops::SlidingWindowMask::Symmetric,
                     static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                     state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
                     envelopes.local, work, attention, stream);
@@ -482,6 +482,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                          dimension(config.attention.num_attention_heads),
                          dimension(config.attention.num_key_value_heads)},
                         dimension(config.sliding_window.value_or(0)),
+                        ops::SlidingWindowMask::Symmetric,
                         static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
                         dflash_state(state).local_layer(config.compact_layer_index(layer)),
                         envelopes.local, state.execution.work, attention_batch,
