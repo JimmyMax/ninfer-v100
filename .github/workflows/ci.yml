@@ -1,6 +1,7 @@
 # Continuous integration, all of it without a GPU: GitHub-hosted runners have none, so the CUDA
 # builds compile every target and run the test suite with each GPU test skipping itself (exit 77).
-# A green run of this workflow on main is what publishes the container image (docker.yml).
+# Runs on pull requests only; pushing to main publishes nothing. Release artifacts (sm_70
+# tarballs, runtime image, GitHub release) build in release.yml on v* tags.
 #
 #   * docs/config-calculator.test.mjs -- pins the published calculator's arithmetic against the
 #     engine's own figures.
