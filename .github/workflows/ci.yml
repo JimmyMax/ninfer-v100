@@ -35,11 +35,10 @@
 name: CI
 
 on:
+  # Pull requests only: a plain push to main publishes nothing (releases build on tags, see
+  # release.yml), so it needs no CI run.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
-  push:
-    # ci/** runs the whole workflow on a branch without a pull request; only main publishes.
-    branches: [main, 'ci/**']
 
 # A newer push to a branch or pull request cancels the run still going for the older one; a merged
 # or closed pull request's runs are cancelled by cancel-superseded.yml.
