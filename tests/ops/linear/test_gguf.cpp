@@ -1,14 +1,19 @@
 // GGUF block matrices through the public linear, linear_add and linear_swiglu Ops and the embedding
 // gather, against an FP64 product of the exactly dequantized weights. The products quantize the
 // activation to q8_1 as llama.cpp does, so they are held to that arithmetic's error, not to A16's.
+// Q4_K and Q6_K run once with each vector load schedule a device profile can name.
 
 #include "core/arena.h"
+#include "core/device_buffer.h"
+#include "core/host_pages.h"
+#include "core/qtype.h"
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/common/device_route.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
 
@@ -22,8 +27,11 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -48,6 +56,7 @@ std::vector<TypeCase> cases() {
         {QType::GGUF_IQ1_M, "iq1_m", {}},      {QType::GGUF_IQ4_NL, "iq4_nl", {0}},
         {QType::GGUF_IQ4_XS, "iq4_xs", {0}},   {QType::GGUF_Q4_0, "q4_0", {0}},
         {QType::GGUF_Q5_0, "q5_0", {0}},       {QType::GGUF_Q2_0, "q2_0", {0}},
+        {QType::GGUF_MXFP4, "mxfp4", {}},      {QType::GGUF_NVFP4, "nvfp4", {}},
     };
 }
 
@@ -59,17 +68,47 @@ float half_value(const std::uint8_t* p) {
 
 // An independent host decode of the formats simple enough to state here, each value d * (code -
 // offset): Q4_0 (low nibbles first, then high), Q5_0 (Q4_0 plus bit j of qh as bit 4 of value j)
-// and Q2_0 (two bits per value, low bits first). Empty for every other type.
+// and Q2_0 (two bits per value, low bits first); and MXFP4, the E2M1 value of each nibble (sign,
+// two exponent bits, one mantissa bit; low nibbles first) times 2^(e - 127); and NVFP4, the E2M1
+// value of each nibble (value j of sub-block s the low nibble of code byte 8 s + j, j < 8, else the
+// high nibble of code byte 8 s + j - 8) times its sub-block's UE4M3 scale. Empty for every other
+// type.
 std::vector<float> host_decode(QType qtype, const std::vector<std::uint8_t>& bytes) {
     std::vector<float> out;
     const auto block = gguf_block_shape(qtype);
-    if (qtype != QType::GGUF_Q4_0 && qtype != QType::GGUF_Q5_0 && qtype != QType::GGUF_Q2_0) {
+    if (qtype != QType::GGUF_Q4_0 && qtype != QType::GGUF_Q5_0 && qtype != QType::GGUF_Q2_0 &&
+        qtype != QType::GGUF_MXFP4 && qtype != QType::GGUF_NVFP4) {
         return out;
     }
+    const auto e2m1 = [](int code) {
+        const int exponent = (code >> 1) & 3, mantissa = code & 1;
+        const double magnitude =
+            exponent == 0 ? 0.5 * mantissa : std::ldexp(1.0 + 0.5 * mantissa, exponent - 1);
+        return code & 8 ? -magnitude : magnitude;
+    };
     const std::size_t blocks = bytes.size() / block.bytes;
     out.reserve(blocks * block.elements);
     for (std::size_t i = 0; i < blocks; ++i) {
         const std::uint8_t* b = bytes.data() + i * block.bytes;
+        if (qtype == QType::GGUF_MXFP4) {
+            const double scale = std::ldexp(1.0, int(b[0]) - 127);
+            for (int j = 0; j < block.elements; ++j) {
+                const int code = j < 16 ? (b[1 + j] & 0xF) : (b[1 + j - 16] >> 4);
+                out.push_back(float(e2m1(code) * scale));
+            }
+            continue;
+        }
+        if (qtype == QType::GGUF_NVFP4) {
+            for (int j = 0; j < block.elements; ++j) {
+                const int s = j / 16, v = j % 16;
+                const int exponent = (b[s] >> 3) & 15, mantissa = b[s] & 7;
+                const double scale = exponent == 0 ? std::ldexp(double(mantissa), -9)
+                                                   : std::ldexp(1.0 + mantissa / 8.0, exponent - 7);
+                const int byte = b[4 + 8 * s + v % 8];
+                out.push_back(float(e2m1(v < 8 ? byte & 0xF : byte >> 4) * scale));
+            }
+            continue;
+        }
         const float d         = half_value(b);
         for (int j = 0; j < block.elements; ++j) {
             int code = 0;
@@ -106,7 +145,8 @@ std::uint16_t half_bits(float value) {
 }
 
 // Random blocks with every binary16 multiplier finite; IQ1_M spreads its multiplier over the top
-// nibbles of its four scale words.
+// nibbles of its four scale words, MXFP4's exponent byte takes scales 2^-12 .. 2^-7 and NVFP4's
+// UE4M3 scale bytes 2^-9 .. 2^-4 (subnormals included).
 std::vector<std::uint8_t> random_blocks(const TypeCase& c, std::int32_t rows, std::int32_t k,
                                         std::mt19937& rng) {
     const auto block = gguf_block_shape(c.qtype);
@@ -127,6 +167,10 @@ std::vector<std::uint8_t> random_blocks(const TypeCase& c, std::int32_t rows, st
             for (int j = 0; j < 4; ++j) {
                 sc[j] = static_cast<std::uint16_t>((sc[j] & 0x0fff) | (((d >> (4 * j)) & 0xf) << 12));
             }
+        }
+        if (c.qtype == QType::GGUF_MXFP4) { base[0] = static_cast<std::uint8_t>(115 + byte(rng) % 6); }
+        if (c.qtype == QType::GGUF_NVFP4) {
+            for (int s = 0; s < 4; ++s) { base[s] = static_cast<std::uint8_t>(1 + byte(rng) % 31); }
         }
     }
     return bytes;
@@ -176,8 +220,8 @@ Error compare(const std::vector<float>& got, const std::vector<double>& want) {
 int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
     constexpr std::int32_t kRows = 256;
     const std::int32_t kK        = k;
-    const std::int32_t widths[]  = {1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130};
-    const std::int32_t max_t     = 130;
+    const std::int32_t widths[]  = {1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130, 257};
+    const std::int32_t max_t     = 257;
     std::mt19937 rng(seed);
     int failures = 0;
 
@@ -279,6 +323,24 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
         const auto plain = product(0, t, false);
         failures += run_check("linear T=" + std::to_string(t), to_float(host), plain);
 
+        // An FP32 out is the same accumulation unrounded: rounding it gives the BF16 out exactly.
+        DeviceBuffer wide_device(std::size_t(kRows) * t * sizeof(float));
+        Tensor wide(wide_device.p, DType::FP32, {kRows, t});
+        ops::linear(x, gate, wide, ops::LinearPolicy::A16Only, workspace, nullptr);
+        check(cudaDeviceSynchronize(), "fp32 linear");
+        std::vector<float> wide_host(std::size_t(kRows) * t);
+        wide_device.copy_to_host(wide_host.data(), wide_host.size() * sizeof(float));
+        failures += run_check("fp32 linear T=" + std::to_string(t), wide_host, plain);
+        for (std::size_t i = 0; i < wide_host.size(); ++i) {
+            if (__bfloat162float(__float2bfloat16(wide_host[i])) != __bfloat162float(host[i])) {
+                std::cerr << "FAIL " << c.name << " fp32 linear T=" << t << " element " << i
+                          << " rounds to " << __bfloat162float(__float2bfloat16(wide_host[i]))
+                          << ", the BF16 out holds " << __bfloat162float(host[i]) << '\n';
+                ++failures;
+                break;
+            }
+        }
+
         ops::linear(x, gathered, out, ops::LinearPolicy::A16Only, workspace, nullptr);
         check(cudaDeviceSynchronize(), "gathered linear");
         out_device.copy_to_host(host.data(), host.size() * sizeof(__nv_bfloat16));
@@ -344,6 +406,176 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
     return failures;
 }
 
+// One launch over several products (vector_products): three weights of `first`, 71 and 25 rows (no
+// whole number of a warp's rows) times two activations, against the same products launched one by
+// one, bit for bit. 9,000 rows ask for more blocks than the device holds at once, which the
+// products then share; K = 5120 is a static K of the 27B text matrices for some types.
+int run_jobs(const TypeCase& c, std::uint32_t seed, std::int32_t kK, std::int32_t first) {
+    if (kK % gguf_block_shape(c.qtype).elements != 0) { return 0; }
+    const std::int32_t rows[] = {first, 71, 25};
+    const std::int32_t total  = rows[0] + rows[1] + rows[2];
+    std::mt19937 rng(seed);
+    const auto host_blocks = random_blocks(c, total, kK, rng);
+    DeviceBuffer blocks(host_blocks.size());
+    blocks.copy_from_host(host_blocks.data(), host_blocks.size());
+    const auto block             = gguf_block_shape(c.qtype);
+    const std::int64_t row_bytes = std::int64_t(kK / block.elements) * block.bytes;
+    const auto type              = ops::detail::gguf_type(c.qtype);
+    constexpr std::int32_t kMaxT = 8;
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<__nv_bfloat16> x_host(std::size_t(kK) * kMaxT * 2);
+    for (auto& v : x_host) { v = __float2bfloat16(normal(rng)); }
+    DeviceBuffer x_device(x_host.size() * sizeof(__nv_bfloat16));
+    x_device.copy_from_host(x_host.data(), x_host.size() * sizeof(__nv_bfloat16));
+    int failures = 0;
+    for (const std::int32_t t : {1, 2, 3, 5, 8}) {
+        const std::size_t bytes = ops::gguf::vector_activation_bytes(kK, t);
+        DeviceBuffer acts(2 * bytes);
+        for (int a = 0; a < 2; ++a) {
+            ops::gguf::quantize_vector_activation(
+                static_cast<const __nv_bfloat16*>(x_device.p) + std::size_t(a) * kK * kMaxT, kK, t,
+                nullptr, static_cast<std::uint8_t*>(acts.p) + a * bytes, nullptr);
+        }
+        DeviceBuffer one(std::size_t(total) * t * sizeof(float)), all(one.bytes);
+        std::vector<ops::gguf::VectorJob> jobs;
+        for (int j = 0, row = 0; j < 3; row += rows[j], ++j) {
+            ops::gguf::VectorJob job;
+            job.weight            = static_cast<const std::uint8_t*>(blocks.p) + row * row_bytes;
+            job.rows              = rows[j];
+            job.activation        = static_cast<const std::uint8_t*>(acts.p) + (j == 1) * bytes;
+            job.out.f32           = static_cast<float*>(one.p) + std::size_t(row) * t;
+            job.out.column_stride = rows[j];
+            ops::gguf::vector_product(type, job.weight, row_bytes, job.rows, kK, job.activation, t,
+                                      job.out, nullptr);
+            job.out.f32 = static_cast<float*>(all.p) + std::size_t(row) * t;
+            jobs.push_back(job);
+        }
+        ops::gguf::vector_products(type, row_bytes, kK, jobs, t, nullptr);
+        check(cudaDeviceSynchronize(), "vector products");
+        std::vector<float> want(std::size_t(total) * t), got(want.size());
+        one.copy_to_host(want.data(), want.size() * sizeof(float));
+        all.copy_to_host(got.data(), got.size() * sizeof(float));
+        if (std::memcmp(want.data(), got.data(), want.size() * sizeof(float)) != 0) {
+            std::cerr << "FAIL " << c.name << " vector_products K=" << kK << " rows " << first
+                      << " T=" << t << " differs from one launch per product\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+// The token-table gather reading its table in place from page-locked host memory mapped into the
+// device (`--embedding-residency host`), at the Qwen3.8-27B width: the rows must be bit for bit the
+// ones the same gather reads from a device copy, which are the exact weights rounded to BF16, in a
+// direct launch and in a replayed CUDA graph. `vocabulary` rows tile a random 4096-row block.
+int run_mapped_table(const TypeCase& c, std::uint32_t seed, std::int32_t vocabulary) {
+    constexpr std::int32_t kK       = 5120;
+    constexpr std::int32_t kDistinct = 4096;
+    std::mt19937 rng(seed);
+    int failures = 0;
+
+    const auto distinct           = random_blocks(c, kDistinct, kK, rng);
+    const auto block              = gguf_block_shape(c.qtype);
+    const std::int64_t row_bytes  = std::int64_t(kK / block.elements) * block.bytes;
+    const std::size_t table_bytes = std::size_t(vocabulary) * row_bytes;
+    HostPages host(table_bytes);
+    for (std::size_t offset = 0; offset < table_bytes; offset += distinct.size()) {
+        std::memcpy(host.data() + offset, distinct.data(),
+                    std::min(distinct.size(), table_bytes - offset));
+    }
+    host.pin(true);
+    void* alias = nullptr;
+    check(cudaHostGetDevicePointer(&alias, host.data(), 0), "map the host table");
+    DeviceBuffer device_table(table_bytes);
+    device_table.copy_from_host(host.data(), table_bytes);
+    const Weight mapped   = gguf_weight(c.qtype, alias, vocabulary, kK);
+    const Weight resident = gguf_weight(c.qtype, device_table.p, vocabulary, kK);
+
+    constexpr std::int32_t kMaxT = 2048;
+    DeviceBuffer ids_device(kMaxT * sizeof(std::int32_t));
+    DeviceBuffer from_host(std::size_t(kK) * kMaxT * sizeof(__nv_bfloat16));
+    DeviceBuffer from_device(from_host.bytes);
+    DeviceBuffer exact_device(std::size_t(kK) * kMaxT * sizeof(float));
+    std::vector<__nv_bfloat16> got(std::size_t(kK) * kMaxT);
+    std::vector<__nv_bfloat16> want(got.size());
+    std::vector<float> exact(got.size());
+    std::uniform_int_distribution<std::int32_t> row(0, vocabulary - 1);
+    const auto draw_ids = [&](std::int32_t t) {
+        std::vector<std::int32_t> ids(t);
+        for (auto& id : ids) { id = row(rng); }
+        // The table's first and last rows, and a repeat.
+        ids[0] = vocabulary - 1;
+        if (t > 1) { ids[1] = 0; }
+        if (t > 2) { ids[2] = ids[0]; }
+        ids_device.copy_from_host(ids.data(), ids.size() * sizeof(std::int32_t));
+        return ids;
+    };
+    const auto compare_rows = [&](const std::string& label, std::int32_t t) {
+        const std::size_t count = std::size_t(kK) * t;
+        from_host.copy_to_host(got.data(), count * sizeof(__nv_bfloat16));
+        from_device.copy_to_host(want.data(), count * sizeof(__nv_bfloat16));
+        exact_device.copy_to_host(exact.data(), count * sizeof(float));
+        if (std::memcmp(got.data(), want.data(), count * sizeof(__nv_bfloat16)) != 0) {
+            std::cerr << "FAIL " << c.name << ' ' << label << ": host-table rows differ from the "
+                      << "device table's\n";
+            ++failures;
+            return;
+        }
+        for (std::size_t i = 0; i < count; ++i) {
+            if (__bfloat162float(got[i]) != __bfloat162float(__float2bfloat16(exact[i]))) {
+                std::cerr << "FAIL " << c.name << ' ' << label << ": element " << i
+                          << " is not the exact weight rounded to BF16\n";
+                ++failures;
+                return;
+            }
+        }
+    };
+    const auto launch = [&](const Weight& table, DeviceBuffer& out, std::int32_t t,
+                            cudaStream_t stream) {
+        Tensor ids(ids_device.p, DType::I32, {t});
+        Tensor rows(out.p, DType::BF16, {kK, t});
+        ops::embedding(ids, table, rows, stream);
+    };
+    const auto oracle = [&](std::int32_t t) {
+        ops::gguf::dequantize_rows(ops::detail::gguf_type(c.qtype), device_table.p, row_bytes, kK,
+                                   static_cast<const std::int32_t*>(ids_device.p), t,
+                                   static_cast<float*>(exact_device.p), kK, nullptr);
+    };
+
+    for (const std::int32_t t : {1, 7, 128, kMaxT}) {
+        (void)draw_ids(t);
+        launch(mapped, from_host, t, nullptr);
+        launch(resident, from_device, t, nullptr);
+        oracle(t);
+        check(cudaDeviceSynchronize(), "mapped embedding");
+        compare_rows("T=" + std::to_string(t), t);
+    }
+
+    // A decode graph captures the gather once and replays it with new ids each round.
+    constexpr std::int32_t kGraphT = 8;
+    cudaStream_t stream = nullptr;
+    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    cudaGraph_t graph    = nullptr;
+    cudaGraphExec_t exec  = nullptr;
+    check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin capture");
+    launch(mapped, from_host, kGraphT, stream);
+    check(cudaStreamEndCapture(stream, &graph), "end capture");
+    check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    for (int round = 0; round < 3; ++round) {
+        (void)draw_ids(kGraphT);
+        check(cudaGraphLaunch(exec, stream), "replay");
+        check(cudaStreamSynchronize(stream), "replay");
+        launch(resident, from_device, kGraphT, nullptr);
+        oracle(kGraphT);
+        check(cudaDeviceSynchronize(), "graph reference");
+        compare_rows("graph round " + std::to_string(round), kGraphT);
+    }
+    check(cudaGraphExecDestroy(exec), "destroy graph");
+    check(cudaGraphDestroy(graph), "destroy graph");
+    check(cudaStreamDestroy(stream), "destroy stream");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -356,13 +588,74 @@ int main() {
         int failures      = 0;
         std::uint32_t seed = 9001;
         for (const auto& c : cases()) {
-            for (const std::int32_t k : {1536, 2560, 2816, 2112, 704}) {
+            const bool cooperative = c.qtype == QType::GGUF_Q4_K || c.qtype == QType::GGUF_Q6_K;
+            for (const std::string_view schedule :
+                 cooperative ? std::vector<std::string_view>{"scalar", "cooperative"}
+                             : std::vector<std::string_view>{""}) {
+                std::optional<ops::DeviceRouteForce> force;
+                if (!schedule.empty()) {
+                    force.emplace("gguf_vector/" + std::string(c.name), std::string(schedule));
+                }
+                for (const std::int32_t k : {1536, 2560, 2816, 2112, 704}) {
+                    if (k % gguf_block_shape(c.qtype).elements != 0) { continue; }
+                    const int f = run_type(c, seed++, k);
+                    std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
+                              << (schedule.empty() ? "" : " ") << schedule << '\n';
+                    failures += f;
+                }
+            }
+        }
+        for (const auto& c : cases()) {
+            for (const auto [k, first] : {std::pair{2304, 201}, std::pair{2304, 9000},
+                                          std::pair{5120, 201}}) {
                 if (k % gguf_block_shape(c.qtype).elements != 0) { continue; }
-                const int f = run_type(c, seed++, k);
-                std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
-                          << '\n';
+                const int f = run_jobs(c, seed++, k, first);
+                std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " vector_products K="
+                          << k << " rows " << first << "\n";
                 failures += f;
             }
+        }
+        // The latent widths of Edge0's routed experts: gate and up K = 1792 (145B) or 1280 (120B) in
+        // NVFP4 or Q3_K, down K = 640 in NVFP4 or IQ4_NL.
+        for (const auto& c : cases()) {
+            if (c.qtype != QType::GGUF_NVFP4 && c.qtype != QType::GGUF_Q3_K &&
+                c.qtype != QType::GGUF_IQ4_NL) {
+                continue;
+            }
+            for (const std::int32_t k : {1792, 1280, 640}) {
+                const bool down = k == 640;
+                if ((c.qtype == QType::GGUF_Q3_K && down) || (c.qtype == QType::GGUF_IQ4_NL && !down)) {
+                    continue;
+                }
+                const int f = run_type(c, seed++, k);
+                std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k << '\n';
+                failures += f;
+            }
+        }
+        for (const std::string_view schedule : {"", "async"}) {
+            ops::DeviceRouteForce force("gguf_matrix/q4_k", std::string(schedule));
+            for (const auto& c : cases()) {
+                if (c.qtype != QType::GGUF_Q4_K) { continue; }
+                for (const std::int32_t k : {2560, 5120}) {
+                    const int f = run_type(c, seed++, k);
+                    std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
+                              << " matrix " << (schedule.empty() ? "compiled" : schedule) << '\n';
+                    failures += f;
+                }
+            }
+        }
+        // The local Qwen3.8-27B artifact's IQ2_S table at its full vocabulary; the other formats
+        // a 27B GGUF conversion may store its table in, over a smaller one.
+        for (const auto& c : cases()) {
+            const bool iq2_s = c.qtype == QType::GGUF_IQ2_S;
+            if (!iq2_s && c.qtype != QType::GGUF_Q8_0 && c.qtype != QType::GGUF_Q4_K &&
+                c.qtype != QType::GGUF_Q6_K && c.qtype != QType::GGUF_IQ3_S) {
+                continue;
+            }
+            const int f = run_mapped_table(c, seed++, iq2_s ? 248320 : 8192);
+            std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name
+                      << " embedding from mapped host memory\n";
+            failures += f;
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " GGUF Linear\n";
         return failures == 0 ? 0 : 1;

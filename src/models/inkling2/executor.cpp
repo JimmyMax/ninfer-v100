@@ -6,6 +6,7 @@
 #include "core/expert_parallel.h"
 #include "core/growable_region.h"
 #include "core/mapped_host_copy.h"
+#include "core/pdl_scope.h"
 #include "core/pinned_memory.h"
 #include "core/qtype.h"
 #include "core/tensor_parallel.h"
@@ -19,7 +20,9 @@
 #include "models/inkling2/vision.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_policy.h"
+#include "ninfer/ops/moe_expert_prefetch.h"
 #include "ninfer/ops/weight_input.h"
+#include "ops/common/device_tier.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/sm70/sm70_dequantize.h"
@@ -263,6 +266,17 @@ struct Executor::Impl {
     std::uint64_t history_bytes = 0;
     std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
+    // A one-row decode call's read-ahead of each visit's likely experts into L2
+    // (ops/moe_expert_prefetch.h): while visit v's experts run, visit v + 1's router guesses from
+    // v's MoE input on guess_stream; visit v + 1 reads the guessed experts there once its
+    // projections are done, beside its attention. guess_budget experts a visit (0: off), only in
+    // the layers whose guessed experts fit it (guess_layer). Calls of several rows read none: two
+    // guesses a row or fewer slowed DSpark decode on an RTX 4090 by about 3%.
+    int guess_budget = 0;
+    std::vector<char> guess_layer;
+    cudaStream_t guess_stream = nullptr;
+    cudaEvent_t guess_fork = nullptr, guess_done = nullptr;
+    DeviceBuffer guess_logits, guess_ids;
 
     struct ExpertPeer {
         cudaStream_t stream = nullptr;
@@ -483,15 +497,20 @@ struct Executor::Impl {
             kv_bytes += 2 * staging;
         }
         // A full visit's decode or verification row splits its keys so that one row's blocks
-        // number about 32 per multiprocessor, at most 512 (the combine's capacity); the kernel
-        // uses fewer while the keys are short (active_splits). Every row of every call splits
-        // alike, so a verification row computes what a decode step at its position computes. On
-        // an RTX 3090 after 120K tokens 32 (328 splits) decoded at 67.1 tok/s, 16 at 66.7, 64
-        // (512) at 67.0 but 1.2% slower after 32K, and 128 splits at 65.5; 2 a multiprocessor
-        // decoded 4-40% slower.
-        const int sms         = device.multiprocessor_count();
+        // number about two per multiprocessor on tensor cores, at most 512 (the combine's
+        // capacity); the kernel uses fewer while the keys are short (active_splits). Every row of
+        // every call splits alike, so a verification row computes what a decode step at its
+        // position computes. On an RTX 3090 (82 multiprocessors, 8 KV heads) the tensor-core
+        // kernel read 114,754 MXFP8 keys in 294 us with 20 splits, 297 with 30, 328 with 21 (some
+        // multiprocessors three blocks), 349 with 41 and 434 with 10; four verification rows took
+        // 689 us with 20, 688 with 10 and 694 with 30; after 32,070 keys 20 splits took 94 us and
+        // 41 took 110. Volta's SIMT kernel keeps about 32 blocks a multiprocessor.
+        const int sms = device.multiprocessor_count();
+        const int kv_divisor = std::max(1, kv_heads);
         decode_splits_full =
-            std::clamp((32 * sms + kv_heads - 1) / std::max(1, kv_heads), 1, 512);
+            ops::kBuildVolta && ops::device_tier(device.rank(0).device) == ops::DeviceTier::Volta
+                ? std::clamp((32 * sms + kv_divisor - 1) / kv_divisor, 1, 512)
+                : std::clamp(2 * sms / kv_divisor, 1, 512);
         decode_splits_sliding = 16;
         const std::size_t rows = std::max<std::size_t>(options.prefill_chunk, sequences);
         d_tokens    = DeviceBuffer(rows * 4);
@@ -545,6 +564,36 @@ struct Executor::Impl {
         if (options.dspine) { make_spine(); }
         allocate_expert_peers();
         if (!model.expert_banks().empty()) { plan_delivery(); }
+        plan_guess();
+    }
+
+    void plan_guess() {
+        if (model.expert_residency() != ExpertResidency::Device || model.expert_parallel() ||
+            bf16_rows) {
+            return;
+        }
+        const int width         = int(config.moe_intermediate_size);
+        const auto expert_bytes = [&](const LayerPlan& p) {
+            return std::size_t(2 * width) * std::size_t(p.gate_up_row_bytes) +
+                   std::size_t(hidden) * std::size_t(p.down_row_bytes);
+        };
+        std::size_t smallest = 0;
+        for (const LayerPlan& p : layers) {
+            const std::size_t b = expert_bytes(p);
+            smallest            = smallest == 0 ? b : std::min(smallest, b);
+        }
+        const int device_id = device.rank(0).device;
+        guess_budget        = ops::moe_prefetch_budget(device_id, smallest);
+        if (guess_budget == 0) { return; }
+        guess_layer.assign(layers.size(), 0);
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            guess_layer[l] = ops::moe_prefetch_budget(device_id, expert_bytes(layers[l])) > 0;
+        }
+        CUDA_CHECK(cudaStreamCreateWithFlags(&guess_stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&guess_fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&guess_done, cudaEventDisableTiming));
+        guess_logits = DeviceBuffer(std::size_t(config.num_experts) * 4);
+        guess_ids    = DeviceBuffer(visits.size() * std::size_t(guess_budget) * 4);
     }
 
     LayerPlan plan_layer(std::uint32_t i) {
@@ -1421,6 +1470,12 @@ struct Executor::Impl {
 
     ~Impl() {
         if (delivery || growing) { ninfer::wait_for_stream(stream); }
+        if (guess_stream != nullptr) {
+            ninfer::wait_for_stream(guess_stream);
+            cudaStreamDestroy(guess_stream);
+            cudaEventDestroy(guess_fork);
+            cudaEventDestroy(guess_done);
+        }
         for (std::size_t r = 1; r < expert_peers.size(); ++r) {
             if (expert_peers[r].stream == nullptr) { continue; }
             RankBinding bind(device, r);
@@ -1638,6 +1693,18 @@ struct Executor::Impl {
                            config.up_cap, middle, on);
     }
 
+    // The same middles as the down product's vector activation `act` (vector_activation_bytes of
+    // width x pairs).
+    void situ_q8(const float* gu, int pairs, const float* pair_scale, void* act,
+                 cudaStream_t on) const {
+        const int width = int(config.moe_intermediate_size);
+        auto* base      = static_cast<std::byte*>(act);
+        const std::size_t scales = gguf::vector_activation_scales_offset(width, pairs);
+        kernels::situ_q8(gu, 2 * std::int64_t(width), pairs, width, pair_scale, config.gate_cap,
+                         config.up_cap, reinterpret_cast<std::int8_t*>(base),
+                         reinterpret_cast<half2*>(base + scales), on);
+    }
+
     // A BF16 layer's routed experts over the pairs of `routing`: FP32 [gate; up] rows `gu`, their
     // SiTU middles, then each pair's FP32 product row in `rows` ([pairs][hidden]).
     void bf16_experts(const void* const* tables, const gguf::MoeRouting& routing, int max_active,
@@ -1695,8 +1762,7 @@ struct Executor::Impl {
             rows.f32 = gu;
             gguf::moe_vector_product(p.gate_up_type, gate_up, routing, max_active, k, k, act, t,
                                      rows, chunk, on);
-            situ(gu, pairs, pair_scale, middle, on);
-            gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, on);
+            situ_q8(gu, pairs, pair_scale, act2, on);
             gguf::MoeOutput out;
             out.weighted = fixed;
             out.weights  = weights;
@@ -1898,6 +1964,33 @@ struct Executor::Impl {
                     column_stride, row);
     }
 
+    // product() for a layer's projections of one call: with q8_1 inputs those of one block type
+    // and row size share a launch (ops::detail::gguf_vector_project).
+    struct Projection {
+        const Weight* w;
+        const void* xq;
+        const __nv_bfloat16* x;
+        float* out;
+        int column_stride;
+        int row;
+    };
+    void products(std::span<const Projection> list, int t) {
+        if (std::any_of(list.begin(), list.end(), [](const Projection& p) { return p.xq == nullptr; })) {
+            for (const Projection& p : list) {
+                product(*p.w, p.xq, p.x, t, p.out, p.column_stride, p.row);
+            }
+            return;
+        }
+        std::vector<ops::detail::GgufVectorProduct> queued(list.size());
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            queued[i].weight            = list[i].w;
+            queued[i].activation        = list[i].xq;
+            queued[i].out.f32           = list[i].out + list[i].row;
+            queued[i].out.column_stride = list[i].column_stride;
+        }
+        ops::detail::gguf_vector_project(queued, t, stream);
+    }
+
     static constexpr std::size_t kStagingRegions = 4;
 
     // Tokens, positions, and when given sequences and branch starts, to the device.
@@ -1963,6 +2056,8 @@ struct Executor::Impl {
         int spark_rows    = 0;
         // A call of at most kernels::kSplitRows rows: the split depth mixes' scratch.
         float* split = nullptr;
+        bool guess   = false; // a decode call that reads its visits' guessed experts ahead
+        bool guessed = false; // the guess stream has work of this call to join
     };
 
     [[nodiscard]] const void* input_q(const Call& c, int i) const {
@@ -2264,11 +2359,14 @@ struct Executor::Impl {
         auto* qgr = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * lp.query_rows * 4).data);
         auto* kv  = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 4).data);
         auto* sinks = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * 4).data);
+        std::vector<Projection> qkv;
         for (std::size_t i = 0, row = 0; i < lp.query.size(); row += lp.query[i].n, ++i) {
-            product(lp.query[i], input_q(c, 0), bf16_in(0), t, qgr, lp.query_rows, int(row));
+            qkv.push_back({&lp.query[i], input_q(c, 0), bf16_in(0), qgr, lp.query_rows, int(row)});
         }
-        product(lp.key, input_q(c, ki), bf16_in(ki), t, kv, 2 * kvd, 0);
-        product(lp.value, input_q(c, vi), bf16_in(vi), t, kv, 2 * kvd, kvd);
+        qkv.push_back({&lp.key, input_q(c, ki), bf16_in(ki), kv, 2 * kvd, 0});
+        qkv.push_back({&lp.value, input_q(c, vi), bf16_in(vi), kv, 2 * kvd, kvd});
+        products(qkv, t);
+        if (guesses(c, v)) { read_ahead(c, v); }
         kernels::gemm_f32(query_heads, t, hidden, lp.sinks, f32_in(0), sinks, stream);
         float* taps = nullptr;
         const int tap_columns = 2 * kv_heads * kTaps;
@@ -2281,30 +2379,27 @@ struct Executor::Impl {
         }
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
-        {
-            kernels::QueryArgs qa;
-            qa.qgr             = qgr;
-            qa.stride          = lp.query_rows;
-            qa.relative_column = 2 * q_floats;
-            qa.tokens          = t;
-            qa.heads           = query_heads;
-            qa.query_clip      = lp.query_clip;
-            qa.relative_clip   = lp.relative_clip;
-            qa.qk_clip         = config.qk_clip;
-            qa.rel_clip        = config.relative_clip;
-            qa.log_scale       = lp.full;
-            qa.alpha           = config.log_scale_alpha;
-            qa.floor           = float(config.log_scale_floor);
-            qa.positions       = c.rows.positions;
-            qa.q_out           = q;
-            qa.r_out           = r;
-            kernels::query_post(qa, stream);
-        }
-        // K and V into the cache: a prompt chunk's sliding visit attends over the staging ring
-        // (the window before the chunk comes over from the sequence's ring, the chunk's keys land
-        // there, and the window that ends the chunk's kept rows goes back). A full visit of an
-        // mxfp8 run has kv_post encode its rows into its planes; one of rk8v4 or rk4v4 stages
-        // them as F16 (one slot per row) for kv_store to encode.
+        kernels::QueryArgs qa;
+        qa.qgr             = qgr;
+        qa.stride          = lp.query_rows;
+        qa.relative_column = 2 * q_floats;
+        qa.tokens          = t;
+        qa.heads           = query_heads;
+        qa.query_clip      = lp.query_clip;
+        qa.relative_clip   = lp.relative_clip;
+        qa.qk_clip         = config.qk_clip;
+        qa.rel_clip        = config.relative_clip;
+        qa.log_scale       = lp.full;
+        qa.alpha           = config.log_scale_alpha;
+        qa.floor           = float(config.log_scale_floor);
+        qa.positions       = c.rows.positions;
+        qa.q_out           = q;
+        qa.r_out           = r;
+        // K and V into the cache, in the launch that also writes Q: a prompt chunk's sliding visit
+        // attends over the staging ring (the window before the chunk comes over from the
+        // sequence's ring, the chunk's keys land there, and the window that ends the chunk's kept
+        // rows goes back). A full visit of an mxfp8 run encodes its rows into its planes there;
+        // one of rk8v4 or rk4v4 stages them as F16 (one slot per row) for kv_store to encode.
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
         const std::int64_t seq_offset   = std::int64_t(c.sequence) * vp.seq_stride;
         const bool staging   = c.chunk && !vp.full;
@@ -2379,7 +2474,7 @@ struct Executor::Impl {
             ka.head_stride = vp.head_stride;
             ka.ring        = vp.ring;
         }
-        kernels::kv_post(ka, stream);
+        kernels::attention_inputs(qa, ka, stream);
         if (quantized && kvfmt.staged()) {
             for (const auto& [src, plane] :
                  {std::pair{ka.k_cache, k_view}, std::pair{ka.v_cache, v_view}}) {
@@ -2499,6 +2594,7 @@ struct Executor::Impl {
         ra.cur     = s.buffers[s.cur];
         ra.hidden  = hidden;
         ra.mix.split = c.split;
+        if (v + 1 < visits.size() && guesses(c, v + 1)) { guess(c, v + 1); }
         experts(lp, c, ra);
         const bool last = v + 1 == visits.size();
         if (last) {
@@ -2512,6 +2608,49 @@ struct Executor::Impl {
             const auto [begin, end] = kept_history(c);
             kernels::keep_products(ra, begin, end, stream);
         }
+    }
+
+    // Whether visit v of call c reads its guessed experts ahead.
+    [[nodiscard]] bool guesses(const Call& c, std::size_t v) const {
+        return c.guess && v > 0 && guess_layer[visits[v].layer] != 0;
+    }
+
+    // Visit v's router on the MoE input of the visit before (c.ffn_f32, which the main stream does
+    // not rewrite before read_ahead(v) waits for this): its guess_budget best experts.
+    void guess(Call& c, std::size_t v) {
+        const LayerPlan& lp = layers[visits[v].layer];
+        const int e         = int(config.num_experts);
+        CUDA_CHECK(cudaEventRecord(guess_fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(guess_stream, guess_fork, 0));
+        auto* logits = static_cast<float*>(guess_logits.p);
+        kernels::gemm_f32(e, 1, hidden, lp.router, c.ffn_f32, logits, guess_stream);
+        ops::moe_guess_experts(logits, lp.router_bias, 1, e, guess_budget,
+                               static_cast<std::int32_t*>(guess_ids.p) + v * guess_budget,
+                               guess_stream);
+        CUDA_CHECK(cudaEventRecord(guess_done, guess_stream));
+        c.guessed = true;
+    }
+
+    // Visit v's guessed experts into L2 on the guess stream, beside the main stream's attention;
+    // the main stream may then rewrite the MoE input the guess read.
+    void read_ahead(Call& c, std::size_t v) {
+        const LayerPlan& lp = layers[visits[v].layer];
+        const int e         = int(config.num_experts);
+        const int width     = int(config.moe_intermediate_size);
+        CUDA_CHECK(cudaEventRecord(guess_fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(guess_stream, guess_fork, 0));
+        const auto* const* tables = static_cast<const void* const*>(lp.tables.p);
+        ops::ExpertPrefetch pf;
+        pf.tables[0]   = tables + 2 * e;
+        pf.bytes[0]    = std::int64_t(2 * width) * lp.gate_up_row_bytes;
+        pf.tables[1]   = tables + 3 * e;
+        pf.bytes[1]    = std::int64_t(hidden) * lp.down_row_bytes;
+        pf.projections = 2;
+        pf.experts     = e;
+        pf.ids         = static_cast<const std::int32_t*>(guess_ids.p) + v * guess_budget;
+        pf.count       = guess_budget;
+        ops::moe_expert_prefetch(pf, guess_stream);
+        CUDA_CHECK(cudaStreamWaitEvent(stream, guess_done, 0));
     }
 
     // The routed experts of layer `p` for the call's MoE input; their product lands where the
@@ -2553,9 +2692,17 @@ struct Executor::Impl {
                                               const_cast<std::int32_t*>(routing.tiles),
                                               routing.tile_capacity};
         }
-        kernels::route(route, stream);
+        // The vector route's fixed-point sums start from zero in the route launch.
         const bool vector = c.q8;
-        const void* act   = vector ? c.ffn_q.base : nullptr;
+        unsigned long long* fixed = nullptr;
+        if (vector && !model.expert_parallel()) {
+            fixed = static_cast<unsigned long long*>(
+                workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
+            route.zero       = fixed;
+            route.zero_count = std::int64_t(t) * hidden;
+        }
+        kernels::route(route, stream);
+        const void* act = vector ? c.ffn_q.base : nullptr;
         if (model.expert_parallel()) {
             experts_parallel(p, c.ffn_bf16, act, ids, weights, pair_scale, t, ra);
             return;
@@ -2578,16 +2725,11 @@ struct Executor::Impl {
         const gguf::MoeTable down{tables + 3 * e, p.down_row_bytes, hidden, width,
                                   p.down_aligned16};
         const int max_active = std::min(pairs, e);
-        auto* middle = static_cast<__nv_bfloat16*>(
-            workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
         auto* gu = static_cast<float*>(
             workspace->alloc_bytes(std::size_t(pairs) * 2 * width * 4).data);
         if (vector) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
-            void* act2  = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
-            auto* fixed = static_cast<unsigned long long*>(
-                workspace->alloc_bytes(std::size_t(t) * hidden * 8).data);
-            CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, stream));
+            void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             gguf::MoeOutput rows;
             rows.f32 = gu;
             gguf::MoeOutput out;
@@ -2596,8 +2738,7 @@ struct Executor::Impl {
             const auto compute = [&](const gguf::MoeRouting& part) {
                 gguf::moe_vector_product(p.gate_up_type, gate_up, part, max_active, k, k, act, t,
                                          rows, chunk, stream);
-                situ(gu, pairs, pair_scale, middle, stream);
-                gguf::quantize_vector_activation(middle, width, pairs, nullptr, act2, stream);
+                situ_q8(gu, pairs, pair_scale, act2, stream);
                 gguf::moe_vector_product(p.down_type, down, part, max_active, 1, k, act2, pairs,
                                          out, chunk, stream);
             };
@@ -2625,6 +2766,8 @@ struct Executor::Impl {
             ra.fixed = fixed;
             return;
         }
+        auto* middle = static_cast<__nv_bfloat16*>(
+            workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
         if (delivery) { delivery->await(stream); }
         if (p.bf16) {
             auto* rows = static_cast<float*>(
@@ -2839,6 +2982,7 @@ struct Executor::Impl {
                 workspace->alloc_bytes(kernels::mix_split_floats(t, hidden) * 4).data);
         }
         embed(c, images);
+        c.guess = guess_budget > 0 && t == 1 && !c.chunk && c.q8;
         for (std::size_t v = 0; v < visits.size(); ++v) {
             visit(c, v);
             store_tap(v, c.states.buffers[c.states.cur], tap_first, tap_rows);
@@ -2848,6 +2992,11 @@ struct Executor::Impl {
                                            std::size_t(c.plane) * 4, cudaMemcpyDeviceToDevice,
                                            stream));
             }
+        }
+        if (c.guessed) {
+            // The last read-ahead joins the main stream (a captured graph ends joined).
+            CUDA_CHECK(cudaEventRecord(guess_done, guess_stream));
+            CUDA_CHECK(cudaStreamWaitEvent(stream, guess_done, 0));
         }
         if (spark) { spark_inject(c); }
     }
@@ -2897,7 +3046,12 @@ struct Executor::Impl {
             return;
         }
         if (!entry.executable.ready()) {
-            entry.definition.capture(stream, [&] { body(); });
+            // Its kernels release their dependents early (pdl::arch_enter_glue), so the captured
+            // launches become programmatic dependents on an sm_90+ device.
+            entry.definition.capture(stream, [&] {
+                const pdl::ArchScope dependents;
+                body();
+            });
             entry.executable.instantiate(entry.definition);
         }
         entry.executable.launch(stream);
