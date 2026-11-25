@@ -85,9 +85,11 @@ struct VectorOutput {
 
 // out[r, c] <- epilogue(sum_k W[r, k] x[k, c]) for rows [0, rows) and columns [0, columns),
 // columns <= kMaxVectorColumns. `weight` points at row 0; rows are `row_bytes` apart.
+// 本仓库 V100 增量：`dense` selects the Q6_K dense per-row layout (QuantLayout::VoltaQ6KDense);
+// only Q6_K has one (ggml_bridge_vec_q6k_dense.cuh).
 void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, const VectorOutput& out,
-                    cudaStream_t stream);
+                    cudaStream_t stream, bool dense = false);
 
 // One of vector_products' products: `rows` rows of `weight` times `activation` into `out`.
 struct VectorJob {
@@ -165,7 +167,7 @@ void gather_columns(const __nv_bfloat16* x, int k, int columns, const std::int32
 void dequantized_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                          const __nv_bfloat16* x, int columns, float* out,
                          std::int64_t out_column_stride, void* scratch, std::size_t scratch_bytes,
-                         cudaStream_t stream);
+                         cudaStream_t stream, bool dense = false);
 
 // --- Mixture of experts -------------------------------------------------------------------------
 // A product over the experts a router selected: pair p (token p / per_token, its slot p %
@@ -320,14 +322,14 @@ void quantize_moe_matrix_activation_f32(GgmlType type, const float* x, int k,
 // out[i, :] = dequantize(W[row_ids ? row_ids[i] : i, :]) as BF16, rows `out_row_stride` apart.
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __nv_bfloat16* out,
-                     std::int64_t out_row_stride, cudaStream_t stream);
+                     std::int64_t out_row_stride, cudaStream_t stream, bool dense = false);
 // The same rows in FP32, where every value is exact.
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, float* out,
-                     std::int64_t out_row_stride, cudaStream_t stream);
+                     std::int64_t out_row_stride, cudaStream_t stream, bool dense = false);
 // The same rows in FP16, the operand type of sm_70's tensor cores (ops/linear/sm70).
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __half* out,
-                     std::int64_t out_row_stride, cudaStream_t stream);
+                     std::int64_t out_row_stride, cudaStream_t stream, bool dense = false);
 
 } // namespace ninfer::ops::gguf

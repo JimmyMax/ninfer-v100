@@ -4,6 +4,8 @@
 #include "ggml_bridge.h"
 #include "ggml_bridge_mmq_launch.cuh"
 #include "ggml_bridge_vec_launch.cuh"
+// 本仓库 V100 增量：Q6_K 密集布局（QuantLayout::VoltaQ6KDense）的 kernel 与 launcher。
+#include "ggml_bridge_vec_q6k_dense.cuh"
 #include "q8_1_value.cuh"
 
 #include "../../common/device_tier.h"
@@ -502,7 +504,7 @@ template <ggml_type type, int threads, typename dst_t>
 __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int64_t row_bytes,
                                        const std::int32_t* __restrict__ row_ids,
                                        dst_t* __restrict__ out, std::int64_t out_row_stride,
-                                       int k) {
+                                       int k, bool dense) {
     const int row          = blockIdx.y;
     const std::int64_t src = row_ids != nullptr ? row_ids[row] : row;
     const void* x          = weight + src * row_bytes;
@@ -550,7 +552,34 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
     } else if constexpr (type == GGML_TYPE_Q5_K) {
         dequantize_q5_K(x, blockIdx.x, y, threadIdx.x);
     } else if constexpr (type == GGML_TYPE_Q6_K) {
-        dequantize_q6_K(x, blockIdx.x, y, threadIdx.x);
+        if (dense) {
+            // 本仓库 V100 增量：密集布局的逐元素解码（fallback 路径；快路径是 slice 内核）。
+            const std::int64_t scale_off = std::int64_t(3) * k / 4;
+            const std::int64_t d_off     = scale_off + k / 16;
+            for (int i = threadIdx.x; i < count; i += threads) {
+                const int e      = int(blockIdx.x) * QK_K + i;
+                const std::uint8_t* rowp = reinterpret_cast<const std::uint8_t*>(x);
+                const float d   = __half2float(*reinterpret_cast<const half*>(rowp + d_off + 2 * (e >> 8)));
+                const auto* sc  = reinterpret_cast<const std::int8_t*>(rowp + scale_off + 2 * (e >> 5));
+                const auto* w   = reinterpret_cast<const std::uint64_t*>(rowp + 24 * (e >> 5));
+                const std::uint64_t W0 = w[0], W1 = w[1], W2 = w[2];
+                std::uint64_t C;
+                switch (e & 28) {
+                case 0:  C = W0 & 0x0000000000FFFFFFull; break;
+                case 4:  C = (W0 >> 24) & 0x0000000000FFFFFFull; break;
+                case 8:  C = ((W0 >> 48) | (W1 << 16)) & 0x0000000000FFFFFFull; break;
+                case 12: C = (W1 >> 8) & 0x0000000000FFFFFFull; break;
+                case 16: C = (W1 >> 32) & 0x0000000000FFFFFFull; break;
+                case 20: C = ((W1 >> 56) | (W2 << 8)) & 0x0000000000FFFFFFull; break;
+                case 24: C = (W2 >> 16) & 0x0000000000FFFFFFull; break;
+                default: C = (W2 >> 40) & 0x0000000000FFFFFFull; break;
+                }
+                const int v = int((C >> ((e & 3) * 6)) & 63ull);
+                y[i] = ggml_cuda_cast<dst_t>(d * float(e & 16 ? sc[1] : sc[0]) * float(v - 32));
+            }
+        } else {
+            dequantize_q6_K(x, blockIdx.x, y, threadIdx.x);
+        }
     } else if constexpr (type == GGML_TYPE_IQ2_XXS) {
         dequantize_iq2_xxs(x, blockIdx.x, y, threadIdx.x);
     } else if constexpr (type == GGML_TYPE_IQ2_XS) {
@@ -600,7 +629,7 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
 template <ggml_type type, int threads, typename dst_t>
 void launch_dequantize(const void* weight, std::int64_t row_bytes, int k,
                        const std::int32_t* row_ids, int rows, dst_t* out,
-                       std::int64_t out_row_stride, cudaStream_t stream) {
+                       std::int64_t out_row_stride, cudaStream_t stream, bool dense = false) {
     if (k <= 0 || k % (kSmallBlocks<type> ? ggml_cuda_type_traits<type>::qk : QK_K) != 0 ||
         rows <= 0) {
         throw std::invalid_argument("gguf dequantize: K must be whole blocks of the type");
@@ -608,22 +637,36 @@ void launch_dequantize(const void* weight, std::int64_t row_bytes, int k,
     // The slice decoders write whole 16-byte groups; this kernel stays for the rest.
     if constexpr (kSliceDequantize<type>) {
         if (out_row_stride % 8 == 0 && reinterpret_cast<std::uintptr_t>(out) % 16 == 0) {
+            if (dense) {
+                // 本仓库 V100 增量：密集布局只有 Q6_K，走专门的 slice 内核。
+                if constexpr (type == GGML_TYPE_Q6_K) {
+                    if (k % 1024 != 0) {
+                        throw std::invalid_argument(
+                            "gguf dense dequantize: K must keep the row 8-byte aligned");
+                    }
+                    slice_dequantize_q6k_dense<dst_t>(weight, row_bytes, k, row_ids, rows, out,
+                                                      out_row_stride, stream);
+                    return;
+                } else {
+                    throw std::invalid_argument("gguf dense dequantize: Q6_K only");
+                }
+            }
             slice_dequantize<type>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
             return;
         }
     }
     dequantize_rows_kernel<type, threads, dst_t>
         <<<dim3((k + QK_K - 1) / QK_K, rows, 1), threads, 0, stream>>>(
-            static_cast<const char*>(weight), row_bytes, row_ids, out, out_row_stride, k);
+            static_cast<const char*>(weight), row_bytes, row_ids, out, out_row_stride, k, dense);
     check(cudaGetLastError(), "dequantize launch");
 }
 
 template <typename dst_t>
 void dispatch_dequantize(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                          const std::int32_t* row_ids, int rows, dst_t* out,
-                         std::int64_t out_row_stride, cudaStream_t stream) {
+                         std::int64_t out_row_stride, cudaStream_t stream, bool dense) {
     switch (type) {
-    case GgmlType::Q8_0: return launch_dequantize<GGML_TYPE_Q8_0, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
+    case GgmlType::Q8_0: return launch_dequantize<GGML_TYPE_Q8_0, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
     case GgmlType::Q4_0:
         return launch_dequantize<GGML_TYPE_Q4_0, 64>(weight, row_bytes, k, row_ids, rows, out,
                                                      out_row_stride, stream);
@@ -633,22 +676,22 @@ void dispatch_dequantize(GgmlType type, const void* weight, std::int64_t row_byt
     case GgmlType::Q2_0:
         return launch_dequantize<GGML_TYPE_Q2_0, 64>(weight, row_bytes, k, row_ids, rows, out,
                                                      out_row_stride, stream);
-    case GgmlType::Q2_K: return launch_dequantize<GGML_TYPE_Q2_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::Q3_K: return launch_dequantize<GGML_TYPE_Q3_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::Q4_K: return launch_dequantize<GGML_TYPE_Q4_K, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::Q5_K: return launch_dequantize<GGML_TYPE_Q5_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::Q6_K: return launch_dequantize<GGML_TYPE_Q6_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::IQ2_XXS: return launch_dequantize<GGML_TYPE_IQ2_XXS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::IQ2_XS: return launch_dequantize<GGML_TYPE_IQ2_XS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::IQ2_S: return launch_dequantize<GGML_TYPE_IQ2_S, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::IQ3_XXS: return launch_dequantize<GGML_TYPE_IQ3_XXS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::IQ3_S: return launch_dequantize<GGML_TYPE_IQ3_S, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::IQ1_S: return launch_dequantize<GGML_TYPE_IQ1_S, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::IQ1_M: return launch_dequantize<GGML_TYPE_IQ1_M, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::IQ4_NL: return launch_dequantize<GGML_TYPE_IQ4_NL, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::IQ4_XS: return launch_dequantize<GGML_TYPE_IQ4_XS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::MXFP4: return launch_dequantize<GGML_TYPE_MXFP4, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
-    case GgmlType::NVFP4: return launch_dequantize<GGML_TYPE_NVFP4, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
+    case GgmlType::Q2_K: return launch_dequantize<GGML_TYPE_Q2_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::Q3_K: return launch_dequantize<GGML_TYPE_Q3_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::Q4_K: return launch_dequantize<GGML_TYPE_Q4_K, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::Q5_K: return launch_dequantize<GGML_TYPE_Q5_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::Q6_K: return launch_dequantize<GGML_TYPE_Q6_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::IQ2_XXS: return launch_dequantize<GGML_TYPE_IQ2_XXS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::IQ2_XS: return launch_dequantize<GGML_TYPE_IQ2_XS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::IQ2_S: return launch_dequantize<GGML_TYPE_IQ2_S, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::IQ3_XXS: return launch_dequantize<GGML_TYPE_IQ3_XXS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::IQ3_S: return launch_dequantize<GGML_TYPE_IQ3_S, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::IQ1_S: return launch_dequantize<GGML_TYPE_IQ1_S, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::IQ1_M: return launch_dequantize<GGML_TYPE_IQ1_M, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::IQ4_NL: return launch_dequantize<GGML_TYPE_IQ4_NL, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::IQ4_XS: return launch_dequantize<GGML_TYPE_IQ4_XS, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::MXFP4: return launch_dequantize<GGML_TYPE_MXFP4, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
+    case GgmlType::NVFP4: return launch_dequantize<GGML_TYPE_NVFP4, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream, dense);
     }
     throw std::invalid_argument("gguf dequantize: unsupported block type");
 }
@@ -741,7 +784,18 @@ detail::VecStore vector_store(const VectorOutput& out) {
 
 void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, const VectorOutput& out,
-                    cudaStream_t stream) {
+                    cudaStream_t stream, bool dense) {
+    if (dense) {
+        // 本仓库 V100 增量：密集布局只有 Q6_K；融合 [gate; up] 父矩阵不会进入密集布局（见
+        // storage_trades），所以这里没有融合形态。
+        if (type != GgmlType::Q6_K) {
+            throw std::invalid_argument("gguf dense vector product: Q6_K only");
+        }
+        detail::vec_launch_dense<GGML_TYPE_Q6_K>(
+            detail::vector_args(weight, row_bytes, rows, k, activation, columns, vector_store(out)),
+            columns, stream);
+        return;
+    }
     detail::VecJobs jobs{};
     jobs.job[0] =
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, vector_store(out));
@@ -1516,7 +1570,7 @@ int dequantized_rows_per_pass(int k, std::size_t scratch_bytes) {
 void dequantized_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                          const __nv_bfloat16* x, int columns, float* out,
                          std::int64_t out_column_stride, void* scratch, std::size_t scratch_bytes,
-                         cudaStream_t stream) {
+                         cudaStream_t stream, bool dense) {
     const int pass = dequantized_rows_per_pass(k, scratch_bytes);
     if (pass <= 0) { throw std::invalid_argument("gguf dequantized product: scratch too small"); }
     cublasHandle_t blas = detail::blas_handle();
@@ -1529,7 +1583,7 @@ void dequantized_product(GgmlType type, const void* weight, std::int64_t row_byt
     for (int first = 0; first < rows; first += pass) {
         const int count = std::min(pass, rows - first);
         dequantize_rows(type, static_cast<const char*>(weight) + first * row_bytes, row_bytes, k,
-                        nullptr, count, rows_bf16, k, stream);
+                        nullptr, count, rows_bf16, k, stream, dense);
         const cublasStatus_t status = cublasGemmEx(
             blas, CUBLAS_OP_T, CUBLAS_OP_N, count, columns, k, &alpha, rows_bf16, CUDA_R_16BF, k,
             x, CUDA_R_16BF, k, &beta, out + first, CUDA_R_32F,
@@ -1542,23 +1596,23 @@ void dequantized_product(GgmlType type, const void* weight, std::int64_t row_byt
 
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __nv_bfloat16* out,
-                     std::int64_t out_row_stride, cudaStream_t stream) {
+                     std::int64_t out_row_stride, cudaStream_t stream, bool dense) {
     detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
-                                stream);
+                                stream, dense);
 }
 
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, float* out,
-                     std::int64_t out_row_stride, cudaStream_t stream) {
+                     std::int64_t out_row_stride, cudaStream_t stream, bool dense) {
     detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
-                                stream);
+                                stream, dense);
 }
 
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __half* out,
-                     std::int64_t out_row_stride, cudaStream_t stream) {
+                     std::int64_t out_row_stride, cudaStream_t stream, bool dense) {
     detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
-                                stream);
+                                stream, dense);
 }
 
 } // namespace ninfer::ops::gguf
