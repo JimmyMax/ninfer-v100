@@ -29,7 +29,8 @@ No regression on V100.
 | 5 | Huihui-Qwen3.8-27B-Q4_K_M | OLD 1.7.2 | Paris ✓ | 39.2 tok/s |
 | 5 | same | PRE (no perf) | Paris ✓ | 37.4 tok/s |
 | 5 | same | NEW merged | Paris ✓ | 37.4 tok/s |
-| 6 | orcarouter-Qwen3.8-27B-nvfp4-NInfer | OLD and NEW | **v2 artifact** (magic `NINFER\x00\x02`); v3 engine mis-reads it, garbage on both | — |
+| 6 | orcarouter-Qwen3.8-27B-nvfp4-NInfer (**v2**) | NEW, `--nvfp4-native` | Paris ✓ | 33.7 tok/s |
+| 6 | same | without the flag | garbage — same root cause as #8 | — |
 | 7 | Gemma4-26B-A4B-QAT-MTP | OLD 1.7.2 | degenerate repeat on both | 197 tok/s |
 | 7 | same | NEW merged | degenerate repeat on both | 186 tok/s |
 | 8 | Qwen3.8-27B-W4A4-MTP-DFlash2 | OLD 1.7.2, correct flags | Paris ✓ | 71.8/63.8/70.6 tok/s (acc 40.5/33.5/39.3%) |
@@ -42,15 +43,15 @@ No regression on V100.
 2. **A pre-existing fork↔1.7.2 gap of about -5% on Qwen dense** (39.2 → 37.4 tok/s on the 4080S)
    and Gemma4 (197 → 186). It exists in PRE, i.e. it comes from the wavecut-master base the fork
    tracks, not from this port. Worth a separate look if the 4080S Qwen production speed matters.
-3. **Artifact 6 is a v2 file** (`NINFER\x00\x02` magic, 2026-09-01): the v3 engine loads its
-   weight bytes under the wrong layout and emits garbage — on the 1.7.2 release binary too, so
-   this is format obsolescence, not a regression. The engine arguably should refuse non-v3 magic
-   instead of loading; noted as a hardening candidate, out of scope here. **Artifact 8's earlier
-   garbage was my flag error**: it carries `text/mtp/dflash2/vision` components and must run with
-   `--nvfp4-native --spec dflash2 --draft-tokens 5 --ngram-draft-tokens 0` (per
-   `docker-compose.nvfp-4080.yml`); with `--spec mtp --lm-head-draft` the draft/target mismatch
-   corrupts output. With the correct flags OLD and NEW agree within dflash2's natural ±10%
-   acceptance spread (33.5-40.5% vs 34.7-37.8%).
+3. **Artifacts 6 and 8 needed `--nvfp4-native`.** Both are NVFP4-weight / A4-activation Qwen
+   artifacts (`v2_directory.cpp` binds nvfp4 with `AllowA4`); the A4 route needs the e2m1
+   LUT decode that `--nvfp4-native` selects (see `docker-compose.nvfp-4080.yml`). Without it the
+   activation path misfires and output is garbage on every binary — my earlier sweeps used no
+   such flag (#6) and the wrong spec backend (#8). With the flag: #6 (a genuine **v2** file,
+   read through the fork's v2-direct-read path) gives clean text at 33.7 tok/s, and #8 matches
+   the 1.7.2 release within dflash2's natural spread. The port does not regress either path.
+   Remaining gap: Qwen dense GGUF and Gemma4 sit ~5% below the 1.7.2 release on the 4080S in
+   PRE too — a wavecut-base delta worth a separate look, not this port's.
 4. Gemma4's repetition appears on both binaries with a raw completion prompt (no chat template);
    behavioral parity, not a regression.
 
