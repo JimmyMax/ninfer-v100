@@ -22,6 +22,29 @@ Baseline: pre-port plain decode measured 15.3 ms/token (65 tok/s) via phase timi
 Inkling artifacts land at 62.9-63.3 tok/s including prefill and first-token cost — within noise.
 No regression on V100.
 
+### V100 full artifact sweep (2026-11-26, NEW sm_70 binary)
+
+Every artifact family on the card, same harness as the 4080S sweep
+(`/tmp/ninfer-serve-70-FINAL`, 8k ctx, concurrency 1, W4A4/swift with `--nvfp4-native`,
+Flash-Next with `--expert-residency host`):
+
+| Artifact | Type | Spec | Probe | Decode |
+|---|---|---|---|---|
+| Gemma4-31B | dense | MTP4 | Paris ✓ | 47.8 |
+| Gemma4-26B-A4B | MoE | MTP2 | Paris ✓ | 161.9 |
+| GSQ IQ3_S | Qwen MoE | plain | Paris ✓ | 42.4 |
+| Huihui Q4_K_M | Qwen MoE | MTP4 | Paris ✓ | 54.3 |
+| Inkling-2 Mini | Inkling MoE NVFP4 | DSpark | ✓ | 70.0 |
+| W4A4 DFlash2 | Qwen W4A4 | MTP4 | Paris ✓ | 65.0 |
+| swift nvfp4 DFlash2 | Qwen NVFP4 | MTP4 | Paris ✓ | 67.1 |
+| Ternary-Bonsai (plain, no MTP in artifact) | Qwen PTQ1_0 | plain | Paris ✓ | 69.8 |
+| Ternary-Bonsai **+ MTP** (re-converted, 2026-11-26) | Qwen PTQ1_0 | MTP4 | Paris ✓ | **82.6** (29% accepted) |
+| Flash-Next IQ3_S | Flash-Next | MTP4 + host RAM | Paris ✓ | 33.6 |
+
+9/9 pass, no regression on sm_70. The MTP companion was converted from the official
+`-mtp.gguf` (MTP block as `blk.64.*`, Q4_0; the PTQ1_0 text layers come from the plain GGUF) —
+see the note under Findings for the converter fix that made `--source mtp=` work from GGUF.
+
 ## RTX 4080 SUPER (sm_89)
 
 | # | Artifact | Binary | Correct | Decode |
@@ -54,6 +77,53 @@ No regression on V100.
    PRE too — a wavecut-base delta worth a separate look, not this port's.
 4. Gemma4's repetition appears on both binaries with a raw completion prompt (no chat template);
    behavioral parity, not a regression.
+5. **`--source mtp=` from a GGUF needed two fixes.** The standard `gguf` package does not know
+   PTQ1_0 (ggml type 143) — `GGUFReader` crashed on the official `-mtp.gguf`, which mixes the
+   PTQ1_0 text layers with the Q4_0 MTP block (`blk.64.*`). Added `PQ2_0 = 142` / `PTQ1_0 = 143`
+   to the local gguf install's `GGMLQuantizationType` and `GGML_QUANT_SIZES` (block 128, type 28 /
+   34 bytes), and taught `_open_named_source` to wrap the `mtp` GGUF source in `HFAliasSource`
+   with `qwen35_mtp_name_map(64)` so the HF-style MTP names resolve against the `blk.64.*`
+   tensors. The re-converted `Ternary-Bonsai-2.5-27B-Uncensored-PTQ1_0-mtp.ninfer` (7.1 GiB,
+   790 objects) loads and decodes at 82.6 tok/s with MTP 4 drafts on the V100, up from 69.8
+   without the MTP component.
+
+### 4080S production A/B (2026-11-26, post-gate-fix)
+
+Same production container and flags (`docker-compose.gglm-4080.yml`: 200k ctx,
+`--lm-head-draft`, concurrency 2, MTP4), only the binary swapped:
+
+| Binary | Decode | MTP accept | TTFT | Prefill |
+|---|---|---|---|---|
+| OLD 1.7.2 (shipped) | 70.5 tok/s | 33.8% | 168 ms | 1.23k tok/s |
+| NEW inkling2 (sm_89) | **78.7 tok/s** | **40.0%** | 159 ms | 1.29k tok/s |
+
+Four consecutive NEW runs: 78.7 tok/s each, 40.0% accept — stable. The perf port
+gains **+11.6% decode** on the 4080S under production settings (the earlier
+37.4 = 37.4 "neutral" reading was a 8k-ctx / no-`--lm-head-draft` test container;
+the production configuration exposes the port's gain). Both pass the Paris probe.
+Deployed: `ninfer:1.8.0-inkling2-sm89`, `/opt/ninfer/ninfer-serve.sm89`.
+
+### 4080S full artifact sweep (2026-11-26, NEW sm_89 binary)
+
+Same 8k-ctx / concurrency-1 test harness as the V100 sweep (`/tmp/ninfer-serve-89-FINAL`
+from the inkling2 branch, W4A4/swift with `--nvfp4-native`, Flash-Next with
+`--expert-residency host`):
+
+| Artifact | Type | Spec | Probe | Decode |
+|---|---|---|---|---|
+| Gemma4-31B | dense | MTP4 | Paris ✓ | 71.7 |
+| Gemma4-26B-A4B | MoE | MTP2 | Paris ✓ | 262.1 |
+| GSQ IQ3_S | Qwen MoE | plain | Paris ✓ | 52.3 |
+| Huihui Q4_K_M (production A/B) | Qwen MoE | MTP4 | Paris ✓ | 78.7 |
+| Inkling-2 Mini | Inkling MoE NVFP4 | DSpark | ✓ | 125.5 |
+| W4A4 DFlash2 | Qwen W4A4 | MTP4 | Paris ✓ | 60.3 |
+| swift nvfp4 DFlash2 | Qwen NVFP4 | MTP4 | Paris ✓ | 63.3 |
+| Ternary-Bonsai (plain, no MTP in artifact) | Qwen PTQ | plain | Paris ✓ | 82.3 |
+| Flash-Next IQ3_S | Flash-Next | MTP4 + host RAM | Paris ✓ | 53.3 |
+
+9/9 pass (Ternary's MTP companion is still being downloaded for a re-convert; the
+plain artifact is verified here). No regressions on sm_89 — every artifact starts,
+passes the probe, and decodes.
 
 ## Environment notes
 
