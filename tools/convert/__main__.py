@@ -33,8 +33,13 @@ def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
         # The ternary and GGUF block recipes read their block formats themselves, without gguf-py.
         if name in block_sources:
             return GGUFFile(path)
-        from .sources.gguf_source import GGUFSource
+        from .sources.gguf_source import GGUFSource, HFAliasSource
 
+        if name == "mtp":
+            from .sources.gguf_source import HFAliasSource, qwen35_mtp_name_map
+            name_map, transforms, composites = qwen35_mtp_name_map(64)
+            base_source = GGUFSource(path)
+            return HFAliasSource(base_source, name_map, transforms=transforms, composites=composites)
         return GGUFSource(path)
     return SafetensorsSource(path)
 
