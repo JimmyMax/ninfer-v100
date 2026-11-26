@@ -119,11 +119,11 @@ from the inkling2 branch, W4A4/swift with `--nvfp4-native`, Flash-Next with
 | W4A4 DFlash2 | Qwen W4A4 | MTP4 | Paris ✓ | 60.3 |
 | swift nvfp4 DFlash2 | Qwen NVFP4 | MTP4 | Paris ✓ | 63.3 |
 | Ternary-Bonsai (plain, no MTP in artifact) | Qwen PTQ | plain | Paris ✓ | 82.3 |
+| Ternary-Bonsai **+ MTP** (re-converted, 2026-11-26) | Qwen PTQ | MTP4 | Paris ✓ | **109.5** (24.1% accepted) |
 | Flash-Next IQ3_S | Flash-Next | MTP4 + host RAM | Paris ✓ | 53.3 |
 
-9/9 pass (Ternary's MTP companion is still being downloaded for a re-convert; the
-plain artifact is verified here). No regressions on sm_89 — every artifact starts,
-passes the probe, and decodes.
+10/10 pass. No regressions on sm_89 — every artifact starts, passes the probe, and
+decodes; the MTP companion lifts Ternary-Bonsai from 82.3 to 109.5 tok/s.
 
 ## Environment notes
 
