@@ -280,6 +280,14 @@ void gguf_vector_project(std::span<const GgufVectorProduct> products, std::int32
                          cudaStream_t stream) {
     std::vector<gguf::VectorJob> jobs;
     const Weight* group = nullptr;
+    // Builds with no sm_80+ tier (Volta/Turing) keep one launch per product: the shared-launch
+    // batching measures slower than back-to-back single launches on sm_70
+    // (docs/v100/regression-sweep-2026-11-25.md).
+#if defined(NINFER_TIER_AMPERE) || defined(NINFER_TIER_BLACKWELL)
+    constexpr std::size_t kMaxJobsHere = gguf::kMaxVectorJobs;
+#else
+    constexpr std::size_t kMaxJobsHere = 1;
+#endif
     const auto flush    = [&] {
         if (jobs.empty()) { return; }
         gguf::vector_products(gguf_type(group->qtype), row_bytes(*group), group->k, jobs, t, stream);
@@ -300,7 +308,7 @@ void gguf_vector_project(std::span<const GgufVectorProduct> products, std::int32
             (p.out.epilogue != gguf::Epilogue::Store ||
              jobs.back().out.epilogue != gguf::Epilogue::Store || group->qtype != w.qtype ||
              group->k != w.k || row_bytes(*group) != row_bytes(w) ||
-             jobs.size() == std::size_t(gguf::kMaxVectorJobs))) {
+             jobs.size() == kMaxJobsHere)) {
             flush();
         }
         group = &w;

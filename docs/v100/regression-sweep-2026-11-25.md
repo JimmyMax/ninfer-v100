@@ -60,3 +60,77 @@ No regression on V100.
 - Both production services (`ninfer-inkling2` on the V100, `ninfer-4080` + ComfyUI on the 4080S)
   were stopped for the sweep and restored afterwards; health checks pass.
 - Test binaries: `/tmp/ninfer-serve-70-NEW` (sm_70), `/tmp/ninfer-serve-89-{PRE,POST}` (sm_86;89).
+
+## V100 spec-mode regression: attribution and fix
+
+The full 96-point sweep (16 artifacts x V100/4080S x OLD/PRE/NEW x plain/spec) found a
+V100-only regression the 4-artifact sweep above had not covered: MTP/DSpark spec mode on
+sm_70 lost 15-20% versus the 1.7.2 release (Huihui Q4_K_M 67.6 -> 54.1, GSQ IQ3_S
+61.5 -> 52.2, Gemma4-31B 48.5 -> 40.7, Gemma4-26B 164.8 -> 148.6 tok/s), while plain
+decode (t=1) lost only 2-6% and the 4080S gained +8.5% on the same artifacts.
+
+### Attribution
+
+Built PRE = the fork base without the perf port (6734d5016, sm_70) and BISECT = PRE plus
+only the two gguf vector-product commits of the port (1494f934b shared launches,
+7e37de5b3 spread slices):
+
+| V100 case | OLD 1.7.2 | PRE (no port) | BISECT (PRE+2) | NEW (HEAD) |
+|---|---|---|---|---|
+| Gemma4-31B spec | 48.5 | 47.9 | 41.2 | 40.7 |
+| Gemma4-26B spec | 164.8 | 161.9 | 156.5 | 148.6 |
+| GSQ IQ3_S plain | 45.2 | 42.6 | 42.4 | 42.4 |
+
+- PRE matches OLD on the Gemma4 artifacts (the port's clean control).
+- Adding only the two vector commits reproduces most of the spec drop (Gemma4-31B:
+  47.9 -> 41.2 of the 47.9 -> 40.7; Gemma4-26B: 161.9 -> 156.5 of the 161.9 -> 148.6).
+  They are the cause of the port-induced spec regression.
+- The GSQ plain gap (45.2 -> 42.6) is already present in PRE: it is the wavecut base,
+  not the port (the two commits move it only 42.6 -> 42.4, within noise). Same class as
+  the ~-5% base gap on the 4080S noted above.
+- The two commits target sm_80+ (upstream measured 3090/4090/5090; the 4080S gains
+  +8.5%), so the fix gates their V100-hostile behavior to sm_80+ rather than reverting it.
+
+Separate finding: the wavecut base changed V100 t=1 numerics (greedy text drifts versus
+1.7.2; PRE and NEW produce identical text, both differing from OLD). That explains the
+acceptance-rate shifts in spec mode (e.g. Huihui 42.8% -> 34.8%) - the engines generate
+different content on the same prompt, not worse drafting. Present in PRE, not caused by
+the port. It also accounts for most of Huihui's spec gap: 67.6 -> 54.3 (-19.7%) matches
+the accept drop 42.8% -> 34.8% (-18.7%) to within the residual step-time difference.
+Huihui cannot be measured on PRE (the pre-port base cannot load its Q6_K dense
+projections), so its base-vs-port split rests on the accept arithmetic plus the
+Gemma4/GSQ controls.
+
+### Fix
+
+Compile-time gates restore the release's dense kernels on sm_70/sm_75 (the SIMT-only
+tiers) while sm_80+ keeps the ported kernels. Two earlier attempts gate-gated the
+whole spread form (`kSpreadForm` false below sm_80), which also swapped the MoE
+`moe_rows_kernel` (spread form) for `moe_kernel` (non-spread). Those binaries failed
+production startup (`gguf moe product launch: invalid resource handle` during CUDA-graph
+preparation); `NINFER_MOE_DBG` traced the failure to the first non-spread `moe_kernel`
+launch (chunk 4) - the spread `moe_rows_kernel` is capture-safe on V100 but the
+non-spread `moe_kernel` is not. The final gate therefore gates only the dense path and
+keeps the MoE spread form on every tier:
+
+- `ggml_bridge_vec.cuh`:
+  - `kVecSpread` (sm_80+ only) gates the spread tail in `vec_rows` (the dense product).
+  - the MoE `moe_rows1_kernel` (chunk 1) and `moe_rows_kernel` (chunks 2-8) stay on
+    every tier - both are capture-safe, the non-spread `moe_kernel` is not.
+  - `kSpreadForm` itself is arch-independent (format-level eligibility).
+- `gguf_linear.cpp`: `gguf_vector_project` flushes one product per launch in builds with
+  no sm_80+ tier (`NINFER_TIER_AMPERE`/`NINFER_TIER_BLACKWELL` undefined) - `vec_launch`
+  with count=1 takes the unchanged one-product kernel, i.e. the pre-port behavior.
+
+Verification (GATE = HEAD + the two gates, sm_70):
+
+| V100 case | NEW (HEAD) | GATE | verdict |
+|---|---|---|---|
+| Gemma4-31B spec | 40.7 | 47.8 | recovered to PRE (47.9) |
+| Gemma4-26B spec | 148.6 | 161.9 | recovered to PRE (161.9) |
+| GSQ IQ3_S plain | 42.4 | 42.4 | unchanged - its gap is the base's, not the port's |
+| Huihui Q4_K_M spec | 54.1 | 54.3 | unchanged - its gap is the accept-rate drift (base numerics) |
+| Inkling-2 Q4_K_XL spec (production) | 66.5 | 70.0 | improved +5% (accept 41.4% -> 47.1%) |
+
+All GATE runs pass the correctness probe (Paris). GATE text equals NEW's (the gated
+sm_70 path is the pre-port kernel, measured bit-identical to PRE/NEW).

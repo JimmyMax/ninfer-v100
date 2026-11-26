@@ -777,6 +777,20 @@ struct Decoder<GGML_TYPE_IQ1_M> {
 template <ggml_type type>
 inline constexpr bool kSpreadForm = type != GGML_TYPE_Q2_K && type != GGML_TYPE_IQ2_XS;
 
+// The spread pays on sm_80+ (upstream measured the 3090/4090/5090) but costs on the SIMT path:
+// with it, V100 decode measures -6% plain and -8..-15% at speculative-verify widths
+// (docs/v100/regression-sweep-2026-11-25.md). sm_75 shares the SIMT path.
+// Only the dense vec_rows is gated this way; the MoE spread form (moe_rows_kernel) must stay on
+// every tier because the non-spread moe_kernel fails V100's CUDA-graph capture
+// (docs/v100/regression-sweep-2026-11-25.md).
+template <ggml_type type>
+inline constexpr bool kVecSpread =
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    false;
+#else
+    kSpreadForm<type>;
+#endif
+
 // The rows of one product that block `block` of `blocks` takes: each warp kRows of them (one
 // fused pair) at a time. KS: the static K the slice loop unrolls over, or 0 for the runtime K.
 // Fused: the weight is one [gate; up] parent and each output row is silu(gate row) * up row.
@@ -848,7 +862,7 @@ __device__ __forceinline__ void vec_rows(const VecArgs& p, int block, int blocks
             static_assert(KS % 1024 == 0);
 #pragma unroll
             for (int it = 0; it < KS / 1024; ++it) { slice(it); }
-        } else if constexpr (kSpreadForm<type>) {
+        } else if constexpr (kVecSpread<type>) {
             const int full = slices / 32, rem = slices % 32, items = kRows * rem;
             for (int it = 0; it < full; ++it) { slice(it); }
             // At most two rounds: kRows * rem < 64.
@@ -1589,21 +1603,28 @@ __launch_bounds__(kVecWarps * 32) __global__ void moe_rows1_kernel(MoeVecArgs p)
 
 template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 void moe_launch_chunk(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
-    // Where K leaves a remainder of slices, moe_rows_kernel keeps every lane busy on it, T columns
-    // a pass: Inkling 2's DSpark decode with the same tokens went from 131.1 to 140.2 tok/s on an
-    // RTX 3090 and from 165.1 to 171.2 on an RTX 4090. One column a pass at chunks 2-8 measured
-    // 128.5 and 164.5.
+    // One column a pass: the release's decode form on every tier (moe_rows_kernel<1> ran 2.4%
+    // slower on a 3090). Where K leaves a remainder of slices it keeps every lane busy.
+    if constexpr (T == 1 && !Fused && kSpreadForm<type>) {
+        if ((args.k / 32) % 32 != 0) {
+            const int per_block = kVecWarps * kMoeRows;
+            const int groups    = (args.rows + per_block - 1) / per_block;
+            ninfer::pdl::launch_arch(dim3(groups, max_active, 1), kVecWarps * 32, 0, stream,
+                                     moe_rows1_kernel<type, Cooperative>, args);
+            check(cudaGetLastError(), "moe product launch");
+            return;
+        }
+    }
+    // T columns a pass at chunks 2-8: Inkling 2's DSpark decode with the same tokens went from
+    // 131.1 to 140.2 tok/s on an RTX 3090 and from 165.1 to 171.2 on an RTX 4090. One column a
+    // pass there measured 128.5 and 164.5. The spread form is capture-safe on V100 (the
+    // non-spread moe_kernel is not), so it stays on every tier (docs/v100/...).
     if constexpr (kSpreadForm<type>) {
         if ((args.k / 32) % 32 != 0) {
             const int per_block = kVecWarps * (Fused ? kMoeRows / 2 : kMoeRows);
             const int groups    = (args.rows + per_block - 1) / per_block;
-            if constexpr (T == 1 && !Fused) {
-                ninfer::pdl::launch_arch(dim3(groups, max_active, 1), kVecWarps * 32, 0, stream,
-                                         moe_rows1_kernel<type, Cooperative>, args);
-            } else {
-                ninfer::pdl::launch_arch(dim3(groups, max_active, 1), kVecWarps * 32, 0, stream,
-                                         moe_rows_kernel<type, T, Fused, Cooperative>, args);
-            }
+            ninfer::pdl::launch_arch(dim3(groups, max_active, 1), kVecWarps * 32, 0, stream,
+                                     moe_rows_kernel<type, T, Fused, Cooperative>, args);
             check(cudaGetLastError(), "moe product launch");
             return;
         }
