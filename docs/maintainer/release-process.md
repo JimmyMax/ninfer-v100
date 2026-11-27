@@ -9,7 +9,7 @@ additional, manual path that no release has used yet. This page is that path.
 ## The flow
 
 1. **Prepare.** Branch from `master`, set `VERSION` to the full tag (for example `0.13.0-rtx3090`),
-   write `RELEASE_NOTES_<X.Y.Z>.md` for it, and merge. The packagers derive everything
+   write `docs/release-notes/RELEASE_NOTES_<X.Y.Z>.md` for it, and merge. The packagers derive everything
    version-specific from `VERSION` and refuse to run without the matching release notes.
 2. **Build both platforms from the same commit.** The binaries do not embed `VERSION`, so they can
    be built before the release PR merges.
@@ -26,7 +26,7 @@ additional, manual path that no release has used yet. This page is that path.
 4. **Smoke-test on a real card** (below), not just the unit tests.
 5. **Publish.** Tag the merge commit (annotated), push the tag, then
    `gh release create vX.Y.Z-rtx3090 <zip> <tar.gz> <both SHA256SUMS files> -R JimmyMax/ninfer-v100
-   --notes-file RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
+   --notes-file docs/release-notes/RELEASE_NOTES_X.Y.Z.md --title "..." --latest`.
 
 ## Gotchas
 

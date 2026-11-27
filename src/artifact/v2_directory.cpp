@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-// 本仓库 V100 增量（docs/v100/v2-direct-read-2026-10-16.md）：v2 清单 → v3 目录。
+// 本仓库 V100 增量（docs/v100/experiments/v2-direct-read-2026-10-16.md）：v2 清单 → v3 目录。
 //
 // 这是 tools/upgrade_ninfer_v2_to_v3.py 中 make_directory 的逐条移植（那个工具是规格与等价性
 // oracle）。差别只有两点：这里只构造内存里的 JSON（权重字节原地保留，偏移不变），以及

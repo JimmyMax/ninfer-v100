@@ -10,7 +10,7 @@ The published image packages the sm_70 build. A local two-architecture image (sm
 Ada has no FP4 tensor cores, so the NVFP4 SIMT/GEMV kernels paid the `__nv_fp4x2_e2m1`
 intrinsic's 4–6-instruction ALU sequence for every 4-bit code. The decode is now a 16-entry
 `__shared__` LUT (bit-exact with the e2m1 spec) in all four NVFP4 decode kernels
-([`b1a1a1a`](../../commits/b1a1a1afa)). Swift1.5 27B NVFP4, RTX 4080 SUPER (sm_89),
+([`b1a1a1a`](../../../../commits/b1a1a1afa)). Swift1.5 27B NVFP4, RTX 4080 SUPER (sm_89),
 `--nvfp4-native`:
 
 | mode | 1.7.1 | 1.7.2 | change |
@@ -24,7 +24,7 @@ is no longer the limit. Quality is unchanged (bit-exact; perplexity identical).
 ## Ampere: load-time NVFP4 → row-split Q4 transcode, and `--nvfp4-native`
 
 Ampere-tier loads now transcode NVFP4 tensors to `Q4_G64_FP16` row-split at load time
-([`95e1f37`](../../commits/95e1f3773)), which suits mixed-format W4A4 artifacts
+([`95e1f37`](../../../../commits/95e1f3773)), which suits mixed-format W4A4 artifacts
 (+12.3% decode on the Coder390 W4A4). Pure-NVFP4 artifacts (Swift1.5) are faster **native**,
 so `--nvfp4-native` (CLI, serve, bench, perplexity) keeps the stored NVFP4 path — and with
 the LUT above, native is the right choice there (+119% over transcode). The flag is ignored
@@ -33,13 +33,13 @@ on Volta, which always runs its native QPN route.
 ## Flash-Next (V100): CPU experts skip the bus, and the n-gram table is safe
 
 - Hybrid execution: CPU threads now compute their expert share straight from the host copy
-  instead of staging it over PCIe first ([`ee2ef85`](../../commits/ee2ef8504)), with the
+  instead of staging it over PCIe first ([`ee2ef85`](../../../../commits/ee2ef8504)), with the
   expert-miss staging path attributed in the bench. Measured final configuration and lever
   space are in `docs/performance.md`.
 - The n-gram table no longer garbles output: untrained/uninitialised rows are zeroed and
-  non-finite rows rejected ([`0aa1761`](../../commits/0aa17618a)).
+  non-finite rows rejected ([`0aa1761`](../../../../commits/0aa17618a)).
 - Converter: the qwen4_exp GGUF recipe accepts ggml block-stored GDN controls and older MTP
-  block encodings ([`64f6c5c`](../../commits/64f6c5c7d), [`229fe30`](../../commits/229fe3037)).
+  block encodings ([`64f6c5c`](../../../../commits/64f6c5c7d), [`229fe30`](../../../../commits/229fe3037)).
 - 200,000-token context with `--kv-dtype rk4v4` without losing expert cache
   (+0.040% perplexity at that setting).
 - Optional ggml-cpu fast path for host experts (`20aa77a`), off by default.
@@ -47,9 +47,9 @@ on Volta, which always runs its native QPN route.
 ## Build and diagnostics
 
 - Multi-architecture builds link again, and Volta-only units compile for sm_70 alone
-  ([`5062dcc`](../../commits/5062dccef)) — a fat `70;89` build was broken before.
+  ([`5062dcc`](../../../../commits/5062dccef)) — a fat `70;89` build was broken before.
 - `NINFER_ROUND_TIMING=1` logs per-decode-round device/finish/commit wall time
-  ([`ab24fd1`](../../commits/ab24fd17f)); default off, zero overhead.
+  ([`ab24fd1`](../../../../commits/ab24fd17f)); default off, zero overhead.
 
 ## Documentation
 

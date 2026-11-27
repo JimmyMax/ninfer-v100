@@ -13,7 +13,7 @@ The Q6_K dense-prepack change in this release pulled the proposal head into the 
 device-layout list unconditionally. On NVFP4 artifacts the proposal head is Q4_G64, so it
 got panel-prepacked, the draft scores broke, MTP acceptance fell to ~0 (decode dropped to
 ~28 tok/s) and DFlash2 failed at startup. The layout pass now takes the proposal head only
-when it is actually Q6_K ([`0311d39`](../../commits/0311d39)).
+when it is actually Q6_K ([`0311d39`](../../../../commits/0311d39)).
 
 NVFP4 27B, V100, int8 KV, `--spec mtp --draft-tokens 3`: **65.5 tok/s** (44.2% acceptance)
 after the fix, vs ~28 tok/s before. `--full-draft-head` is no longer needed as a workaround.
@@ -24,7 +24,7 @@ Of a Q4_K_M 27B artifact's weights, Q6_K is ~26% and its vec kernel reads 210-by
 that are only 2-byte aligned, which caps the load width at 54–63% of the card's bandwidth.
 The projections (dense and MTP, ~4.35 GiB of a 16.95 GiB artifact) are now repacked at load
 time, device-side and in place, into a same-size dense 6-bit stream the vec kernel reads
-with 64-bit loads ([`bd052b2`](../../commits/bd052b2)). MoE experts keep the standard
+with 64-bit loads ([`bd052b2`](../../../../commits/bd052b2)). MoE experts keep the standard
 layout; the permute is a no-op for artifacts without Q6_K projections, so NVFP4 artifacts
 are unaffected. Artifacts whose recipes store a fused `[gate; up]` Q6_K parent (for example
 the IQ3_S 27B, whose MTP layer stores gate and up row-contiguously in one object) keep that
@@ -74,7 +74,7 @@ units (30–174× on the sm_89 ptxas pass, ~10 h total), so the image is built f
 single-arch trees and packaged with the dispatcher above. Runtime behavior is identical to
 a dual-arch build. The Volta kernel guards gained an explicit `__CUDA_ARCH__ == 700`
 clause so the tree also compiles cleanly as one unit for several architectures
-([`ec1d53a`](../../commits/ec1d53a)).
+([`ec1d53a`](../../../../commits/ec1d53a)).
 
 ## Upgrade
 

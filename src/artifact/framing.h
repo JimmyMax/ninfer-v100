@@ -19,7 +19,7 @@ inline constexpr std::array<std::byte, 8> kPartMagic = {
     std::byte{'R'}, std::byte{'T'}, std::byte{0},   std::byte{3},
 };
 inline constexpr std::size_t kHeaderBytes        = 32;
-// 本仓库 V100 增量（docs/v100/v2-direct-read-2026-10-16.md）：v2 头没有 UUID。
+// 本仓库 V100 增量（docs/v100/experiments/v2-direct-read-2026-10-16.md）：v2 头没有 UUID。
 inline constexpr std::size_t kV2HeaderBytes      = 16;
 inline constexpr std::uint64_t kPayloadAlignment = 4096;
 using ArtifactId                                 = std::array<std::byte, 16>;

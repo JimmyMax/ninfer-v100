@@ -7,7 +7,7 @@
 
 namespace ninfer::artifact {
 
-// 本仓库 V100 增量（docs/v100/v2-direct-read-2026-10-16.md）：v2 制品的直读。
+// 本仓库 V100 增量（docs/v100/experiments/v2-direct-read-2026-10-16.md）：v2 制品的直读。
 //
 // v2 与 v3 的差别只在**清单**：对象（名称、偏移、字节数、形状、格式、布局）与权重字节完全
 // 保留，升级只是补出 components/bindings/uses/files 并把词汇换成小写下划线。实测同一制品的

@@ -188,7 +188,7 @@ GGUF 路线能挂 2.7 倍的 int8 KV</b>,长上下文/高并发场景的实际�
 </table>
 <div class="note">vec 优化(T≥2 的 slice 循环只展开一次,修 Volta L1I 取指停顿)只动校验步(T=5):
 MTP +18.9%,纯解码(T=1)不受影响,接受率/输出逐字不变。详见
-<code>docs/v100/gguf-vec-optimization-2026-10-21.md</code>。</div>
+<code>docs/v100/experiments/gguf-vec-optimization-2026-10-21.md</code>。</div>
 
 <h2>7. 结论:两条线怎么选</h2>
 <ul>

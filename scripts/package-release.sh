@@ -6,7 +6,7 @@
 #
 # There is one packager, not one per release. Everything version-specific is derived from VERSION,
 # whose content is the full release tag (for example 0.10.0-rtx3090): the text before the first `-`
-# names RELEASE_NOTES_<version>.md and the checksum file, and the whole tag names the archive. To cut
+# names docs/release-notes/RELEASE_NOTES_<version>.md and the checksum file, and the whole tag names the archive. To cut
 # a release, bump VERSION and write its release notes; there is nothing here to copy and edit.
 set -euo pipefail
 
@@ -16,7 +16,7 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 release_tag="$(tr -d '[:space:]' < "$repo_root/VERSION")"
 [[ -n "$release_tag" ]] || { printf '%s is empty\n' "$repo_root/VERSION" >&2; exit 1; }
 release_version="${release_tag%%-*}"
-release_notes="RELEASE_NOTES_$release_version.md"
+release_notes="docs/release-notes/RELEASE_NOTES_$release_version.md"
 # Checked before anything is deleted or built into dist, so a forgotten release-notes file costs
 # nothing rather than a finished archive that has to be thrown away.
 [[ -f "$repo_root/$release_notes" ]] || {

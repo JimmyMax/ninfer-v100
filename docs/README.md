@@ -26,6 +26,7 @@ spelling and defaults.
 | [Configuration calculator](config-calculator.html) | which context, KV format and speculation fit an RTX 3090 with Qwen3.8-27B or Qwen3.6-35B-A3B, from measurements |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
 | [Release archives](release-archive-linux.md) ([Windows](release-archive-windows.md)) | the README that `scripts/package-release.sh` and `.ps1` put in a release archive |
+| [Release notes](release-notes/) | `RELEASE_NOTES_<version>.md`, the release body the tag and the packagers read |
 
 ## Model artifacts
 

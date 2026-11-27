@@ -1080,7 +1080,7 @@ __global__ void ffn_combine_kernel(FfnCombineArgs a) {
     if (a.next_q.qs != nullptr) { store_q8x4(a.next_q, a.hidden, blockIdx.x, i, nxt, i < q); }
 }
 
-// 本仓库 V100 增量（docs/v100/gemma4-wide-rows-2026-10-17.md）：hidden > 4096 的宽行内核。
+// 本仓库 V100 增量（docs/v100/experiments/gemma4-wide-rows-2026-10-16.md）：hidden > 4096 的宽行内核。
 //
 // 上面三个行内核每线程负责一个 float4，于是 hidden/4 不能超过一个 block 的 1024 线程：一行必须
 // 装进一个 block。Gemma 4 26B-A4B 的 hidden 是 2816（704 个 float4）没问题，但 dense 的 31B 是

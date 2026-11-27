@@ -71,7 +71,7 @@ __global__ void scale_gate_up_rows_kernel(__nv_bfloat16* __restrict__ data,
     data[i]            = __float2bfloat16(scaled);
 }
 
-// 本仓库 V100 增量（docs/v100/fp8-swiglu-wide-t-*.md）：宽 T 的 FP32 出口路线。上游的 A16 契约
+// 本仓库 V100 增量（docs/v100/experiments/fp8-swiglu-wide-t-*.md）：宽 T 的 FP32 出口路线。上游的 A16 契约
 // 要求 gate/up 在激活之前保持 FP32，而上面的 BF16 平面路线会先舍入一次；把 CUTLASS 的输出元素
 // 型别换成 float、行缩放在 FP32 里做、再把 SwiGLU 融进同一趟读出，就同时满足契约与宽 T 的速度。
 // 实测与 BF16 平面路线在噪声内（见上面 scale_gate_up_rows_kernel 的注释）。
@@ -260,7 +260,7 @@ std::size_t fp8_linear_swiglu_cutlass_f32_workspace_bytes(std::int32_t gate_up_r
     return layout.peak_bytes(1);
 }
 
-// 本仓库 V100 增量（docs/v100/fp8-swiglu-wide-t-*.md）：宽 T 的 FP8 SwiGLU。除最后一段外与上面
+// 本仓库 V100 增量（docs/v100/experiments/fp8-swiglu-wide-t-*.md）：宽 T 的 FP8 SwiGLU。除最后一段外与上面
 // 的 BF16 路线共用同一内核（反量化 FP8→FP16、bf16 激活→FP16、sm_70 mma），区别只在 CUTLASS 的
 // 输出平面是 FP32，行缩放在 FP32 里做，SwiGLU 直接读这个平面，整条路径上有且仅有一次舍入
 // （写回 BF16 的 out）——与上游 A16 阶梯“激活前保持 FP32”的契约一致。

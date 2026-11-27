@@ -42,7 +42,7 @@ debugging; add `--api-key sk-...` and send `-H 'Authorization: Bearer sk-...'` t
 
 The server speaks the OpenAI and Anthropic APIs on `:8000/v1` (`/v1/messages` accepts
 `"thinking": {"type": "disabled"}`). `GET /health` is 503 while loading, 200 when ready. Build with
-[`Dockerfile.1.7.2.local`](Dockerfile.1.7.2.local); the production compose files live in the Docker
+[`docker/local/Dockerfile.1.7.2.local`](docker/local/Dockerfile.1.7.2.local); the production compose files live in the Docker
 repo.
 
 ## Artifacts and formats

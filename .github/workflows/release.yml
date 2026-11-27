@@ -11,7 +11,7 @@
 # The image job is separate from the release job: if the registry refuses the push the tarballs still
 # publish, and re-running this workflow fills the image in.
 #
-# The release body is RELEASE_NOTES_<version>.md from the tagged commit, so the published text and
+# The release body is docs/release-notes/RELEASE_NOTES_<version>.md from the tagged commit, so the published text and
 # the notes in the tree cannot drift apart. GitHub-hosted runners have no GPU; the build is
 # compile-only and the smoke step tolerates binaries that insist on a GPU even for --help.
 name: release
@@ -46,7 +46,7 @@ jobs:
         id: meta
         run: |
           version="${{ inputs.version || github.ref_name }}"
-          notes="RELEASE_NOTES_${version#v}.md"
+          notes="docs/release-notes/RELEASE_NOTES_${version#v}.md"
           if [[ ! -f "$notes" ]]; then
             echo "::error::$notes is missing: write the release notes before tagging $version"
             exit 1
@@ -154,7 +154,7 @@ jobs:
           PKG="ninfer-v100-${V}-linux-x86_64-sm70"
           mkdir -p "dist/$PKG/bin"
           cp build/apps/ninfer build/apps/ninfer-serve build/apps/ninfer-perplexity "dist/$PKG/bin/"
-          cp README.md LICENSE "RELEASE_NOTES_${V#v}.md" "dist/$PKG/"
+          cp README.md LICENSE "docs/release-notes/RELEASE_NOTES_${V#v}.md" "dist/$PKG/"
           tar czf "dist/$PKG.tar.gz" -C dist "$PKG"
           rm -rf "dist/$PKG"
 

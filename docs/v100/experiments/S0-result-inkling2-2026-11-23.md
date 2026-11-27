@@ -39,7 +39,7 @@ phase timing：plain 15.5 ms/轮，draft 2.1 ms/轮，verify 19.5 ms/轮（4 tok
 ```
 docker exec -d ninfer-build-inkling2 bash -c \
   'cmake --build /build -j16 > /tmp/build.log 2>&1'
-docker build -f Dockerfile.1.8.0-inkling2.local -t ninfer:1.8.0-inkling2 .
+docker build -f docker/local/Dockerfile.1.8.0-inkling2.local -t ninfer:1.8.0-inkling2 .
 ```
 
 ## 生产 compose

@@ -58,7 +58,7 @@
 **结论**：上游 sm70 是"能跑"的兼容路径（Qwen 上比 fork 慢 4.3×），fork 是 V100 专精实现；
 Gemma 只有上游能跑。加速增量应当往上游线上做。
 
-详细环境与原始日志见 [`baseline-2026-10-12.md`](baseline-2026-10-12.md)。
+详细环境与原始日志见 [`baseline-2026-10-12.md`](experiments/baseline-2026-10-12.md)。
 
 ## 4. 分支与上游跟进策略
 
@@ -84,7 +84,7 @@ git merge --no-ff upstream/master                       # 2026-10-20 试合并�
   把合并冲突压到最小。
 * 每阶段的性能结论写回本目录，不改上游的 `docs/performance.md`。
 * 2026-10-20 的冲突清单与解决取舍见
-  [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md) §3–§4。
+  [v1.6-vs-v1.5-2026-10-20.md](experiments/v1.6-vs-v1.5-2026-10-20.md) §3–§4。
 
 ## 5. 路线图
 
@@ -93,16 +93,16 @@ git merge --no-ff upstream/master                       # 2026-10-20 试合并�
 ### S0 基座与工具链 ☑（2026-10-12）
 
 * [x] 建立 `gemma` 分支（基座 `iamwavecut/master`）+ 独立 git worktree
-* [x] V100 构建配方：`Dockerfile.sm70.local`（CUDA 12.8 + `-DCMAKE_CUDA_ARCHITECTURES=70`）
-* [x] 快速重打包配方：`Dockerfile.sm70-runtime.local`（复用 `ninfer:v100-stable` 运行时基底）
+* [x] V100 构建配方：`docker/local/Dockerfile.sm70.local`（CUDA 12.8 + `-DCMAKE_CUDA_ARCHITECTURES=70`）
+* [x] 快速重打包配方：`docker/local/Dockerfile.sm70-runtime.local`（复用 `ninfer:v100-stable` 运行时基底）
 * [x] 两线对照验收脚本：`bench/v100/compare_lines.py`
-* [x] 基线数据落档：`docs/v100/baseline-2026-10-12.md`
+* [x] 基线数据落档：`docs/v100/experiments/baseline-2026-10-12.md`
 * 验收：`ninfer:v100-gemma4` 镜像可从本仓库源码重建；`ninfer-serve --version` 正常；
   Gemma 4 在 V100 上加载并出词（见 §3）。
 
-### S0.5 用 Qwen 家族验证"正向搬运"可行 ☑（v2 已移植并通过 oracle；长上下文只 +3~6%，瓶颈不在注意力——见 [结果](S0.5-result-2026-10-13.md) 与 [oracle/长上下文](S0.5-oracle-and-longctx-2026-10-13.md)）
+### S0.5 用 Qwen 家族验证"正向搬运"可行 ☑（v2 已移植并通过 oracle；长上下文只 +3~6%，瓶颈不在注意力——见 [结果](experiments/S0.5-result-2026-10-13.md) 与 [oracle/长上下文](experiments/S0.5-oracle-and-longctx-2026-10-13.md)）
 
-> S0.5 的结论改写了后续优先级：Qwen 的 4.3× 差距经[定位测量](profiling-nvfp4-2026-10-13.md)
+> S0.5 的结论改写了后续优先级：Qwen 的 4.3× 差距经[定位测量](experiments/profiling-nvfp4-2026-10-13.md)
 > 精确落在 **NVFP4 投影路线**（同一形状：NVFP4 85 GB/s / DRAM 9.5%，而 fp8 622、q4 503、
 > q5 480、q8 601 GB/s）——不是注意力，也不是 fp8/q4/q5/q8；Gemma 4 的杠杆则在
 > **MoE 专家 + GGUF 投影**（S3/S4）。S2 的注意力工作降级为"顺带"，NVFP4 移植升为下一步的首要项。
@@ -120,7 +120,7 @@ git merge --no-ff upstream/master                       # 2026-10-20 试合并�
 
 ### S0.6 FP8 投影的 Volta QPN + 加载时 prepack ☑（2026-10-14）
 
-NVFP4 阶段（见 [profiling-nvfp4-2026-10-13.md](profiling-nvfp4-2026-10-13.md)）做完后，账本里剩下的最大
+NVFP4 阶段（见 [profiling-nvfp4-2026-10-13.md](experiments/profiling-nvfp4-2026-10-13.md)）做完后，账本里剩下的最大
 单项是 fp8（130 张量 / 9.76 GiB，含每层的注意力输入投影与输出投影）。把 fork 的 FP8 QPN + CUTLASS
 路径按"QPN 拥有全部宽度"的结构搬过来，并让权重在加载时就重排成 QPN8 的 fragment 序。
 
@@ -130,7 +130,7 @@ NVFP4 阶段（见 [profiling-nvfp4-2026-10-13.md](profiling-nvfp4-2026-10-13.md
 * [x] 加载时 prepack（`artifact/permute_fp8_qpn.cu`）+ 256 MiB 宽 T 上限
 * 验收：43/43 oracle 通过；端到端 42K prefill **407.8 → 951.2 tok/s**、TTFT **40.2 → 17.4 s**，
   decode 31.0 → 31.1（短）/ 32.9（42K）；42K 输出逐字相同。详见
-  [fp8-qpn-2026-10-14.md](fp8-qpn-2026-10-14.md)。
+  [fp8-qpn-2026-10-14.md](experiments/fp8-qpn-2026-10-14.md)。
 * 生产：`docker-compose.nvfp.yml` 已切到 `ninfer:v100-fp8`（制品同时从 v2 换成同目录的 v3 文件，
   上游代码只支持 v3 制式）。
 
@@ -145,7 +145,7 @@ NVFP4 阶段（见 [profiling-nvfp4-2026-10-13.md](profiling-nvfp4-2026-10-13.md
 * ☑ 真因已定位（S0.8）：**不在注意力**，是 FP8 GDN 输入投影（16384×5120）在 W=5/6 落到
   sm_70 上只有 10% 带宽的 `fp8_a16_ksplit_mma` → 48 层 × 0.89 ms = 42.8 ms/轮（占 77 ms 轮的 56%）
 * ☐ 下一步：t=1 还余 1.26×（需要新的 kernel 级归因，见 S0.8 的方法学）
-* 详见 [attention-2026-10-14.md](attention-2026-10-14.md)。
+* 详见 [attention-2026-10-14.md](experiments/attention-2026-10-14.md)。
 
 ### S0.8 nsys 归因 + FP8 GDN 投影 W=5/6 改走融合核 ☑（2026-10-14）
 
@@ -158,7 +158,7 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
 * 验收：oracle `ctest -R gdn_input` 12/12；短上下文固定 d=4 **28.5 → 44.1** tok/s（+55%）、
   `--adaptive-mtp` 40.9 → 44.4、27.2K 上下文 49.2 → 52.8；prefill 不变；宽度曲线变平
 * 生产：`ninfer:v100-fusedgdn`
-* 详见 [gdn-fused-5-6-2026-10-14.md](gdn-fused-5-6-2026-10-14.md)。
+* 详见 [gdn-fused-5-6-2026-10-14.md](experiments/gdn-fused-5-6-2026-10-14.md)。
 
 ### S0.9 与 master 的差距收敛：解码追平 + prefill 残差定位 ☑/◐（2026-10-15）
 
@@ -180,7 +180,7 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
   `--prefill-cublas`（+3%）、`--fast-prefill-kernel`（+2.5%）。已构建 `master` 分支参考二进制
   以便做 prefill 逐算子对账。
 * 生产：`ninfer:v100-deq`
-* 详见 [gap-closure-2026-10-15.md](gap-closure-2026-10-15.md)。
+* 详见 [gap-closure-2026-10-15.md](experiments/gap-closure-2026-10-15.md)。
 
 ### S0.10 prefill 残差归因到具体内核 + GDN 路由修复 ☑/◐（2026-10-15）
 
@@ -201,7 +201,7 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
       依赖在本线齐全（`CausalD256H24Kv4/16Kv2`、`PagedKVBatchLayerView`、`Int8Group64`、paged KV 地址
       helper；缺的只是 `round_up_keys` 之类小 helper）。
 * 生产：`ninfer:v100-gdnrec`
-* 详见 [gdn-recurrent-and-prefill-gap-2026-10-15.md](gdn-recurrent-and-prefill-gap-2026-10-15.md)。
+* 详见 [gdn-recurrent-and-prefill-gap-2026-10-15.md](experiments/gdn-recurrent-and-prefill-gap-2026-10-15.md)。
 
 ### S0.11 Volta flash-attention prefill 路线移植 ☑（2026-10-15）
 
@@ -218,7 +218,7 @@ kernel 级归因，把持已久的 t=5 异常钉死在单个算子上。
       bench 41.1 → **25.1 ms**；27K e2e TTFT 30.1 → **27.3 s**（上游参考 27.0 s）⇒ **prefill 追平上游**。
 * [x] 路线默认开启（int8/bf16），`NINFER_ATTN_VOLTA_FLASH[_INT8]=0` 可关。
 * 剩余：反量化 +0.49s（本线刻意选的精确解码，不动）；27K decode −7%（MTP 接受率差异，与 prefill 无关）。
-* 详见 [volta-flash-prefill-2026-10-15.md](volta-flash-prefill-2026-10-15.md)。
+* 详见 [volta-flash-prefill-2026-10-15.md](experiments/volta-flash-prefill-2026-10-15.md)。
 
 ### S0.12 解码投机配置：关掉 n-gram 混合草稿 ☑（2026-10-16）
 
@@ -294,7 +294,7 @@ CUTLASS 被打碎成 5.5 倍的碎 GEMM；注意力/GDN 两边完全一致。
 * **方案 B（保持位宽、只重排布局，QPN 思路）可行**：显存 +0.3–0.7 GiB，需为 IQ3_S/IQ4_XS/IQ3_XXS/Q4_K
   等 4–5 种布局写"一次干净反量化"内核（覆盖 71% 张量字节），预期可追平 nvfp4 制品（约 +10%）。
 * **方案 C（不改）建议**：生产用 nvfp4 制品；GSQ 作为长上下文选项（+150K 上下文 ≈ 那 7 GiB 权重之差）。
-* 详见 [gsq-iq3s-prepack-assessment-2026-10-16.md](gsq-iq3s-prepack-assessment-2026-10-16.md)。
+* 详见 [gsq-iq3s-prepack-assessment-2026-10-16.md](experiments/gsq-iq3s-prepack-assessment-2026-10-16.md)。
 
 ### S0.17 FP8 SwiGLU 宽 T：混合量化制品 prefill 慢 2× 的真因 ☑（2026-10-16）
 
@@ -315,7 +315,7 @@ nsys 逐内核对比后，55.05s vs 28.78s 的 GPU busy 差**只来自一个内�
 * **验收**：oracle 7/7 通过（含 A16 的 T=1…1024、非线性精度判据、单 T 容量精确性）；v2 制品
   **53.6s → 27.3s / 997.6 tok/s**（master 27.1s / 1.00k），decode 82.7、MTP 69.2%（master 75.7 /
   63.9%）；生产 SWIFT 与 GSQ 逐项不变（1.00k / 78.3、884.7 / 66.6）。
-* 详见 [fp8-swiglu-wide-t-2026-10-16.md](fp8-swiglu-wide-t-2026-10-16.md)。
+* 详见 [fp8-swiglu-wide-t-2026-10-16.md](experiments/fp8-swiglu-wide-t-2026-10-16.md)。
 
 ### S0.18 v2 制品直读（不再需要离线升级）☑（2026-10-16）
 
@@ -331,7 +331,7 @@ nsys 逐内核对比后，55.05s vs 28.78s 的 GPU busy 差**只来自一个内�
   中 `make_directory` 的逐条移植（那个工具即规格与等价性 oracle）；白名单与它相同（5 个官方
   v2 输入），名单之外仍旧报错并指向离线工具。
 * **纯加载期**：v3 的 `parse_directory`/binder/materializer/所有算子逐字未动，**不影响性能**。
-* 详见 [v2-direct-read-2026-10-16.md](v2-direct-read-2026-10-16.md)。
+* 详见 [v2-direct-read-2026-10-16.md](experiments/v2-direct-read-2026-10-16.md)。
 
 ### S0.19 制品家族：原生配方 vs GGUF 转制（性能差异的真正来源）☑ 只调查、不改代码（2026-10-16）
 
@@ -374,7 +374,7 @@ GGUF 转制制品）。
 * **验收**：新增 oracle `ninfer_gemma4_wide_rows_test`（2816 窄行 + 5376 宽行 vs FP64 ✓）；`ctest -R
   gemma4` **8/8** ✓；26B 在探针强制宽行下输出与窄行逐字一致 ✓；31B 端到端 **decode 29.3 tok/s
   （无 MTP）/ 41.8 tok/s（assistant，4 drafts，接受率 24.1%）** ✓，回答正确 ✓。
-* 详见 [gemma4-wide-rows-2026-10-16.md](gemma4-wide-rows-2026-10-16.md)。
+* 详见 [gemma4-wide-rows-2026-10-16.md](experiments/gemma4-wide-rows-2026-10-16.md)。
 
 ### S0.21 v1.5 → v1.6 差距的归因与收敛 ☑(2026-10-20)
 
@@ -391,7 +391,7 @@ sm_70 的 FP16 范围饱和(上游 `67778be`+`2d69547`)。
       `80e9ae4`(Q 块 1024)
 * [x] 终验:两个制品上 MTP decode 全深度领先(+2.4% ~ +11.1%),纯解码持平,prefill 27K 持平 /
       66K −1.0%(归属:精确 NVFP4 解码 645 ms + flash 每次调用 21.2 对 21.6 ms 但多 80 次)
-* 详见 [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md)。
+* 详见 [v1.6-vs-v1.5-2026-10-20.md](experiments/v1.6-vs-v1.5-2026-10-20.md)。
 
 ### S0.22 Flash-Next IQ3_S 的 V100 终态优化：PCIe 暂存是天花板 ☑（2026-10-31）
 
@@ -880,10 +880,10 @@ docker exec ninfer-sm70-build bash -c '
 ### 打包镜像
 
 ```bash
-docker build -f Dockerfile.sm70.local         -t ninfer:v100-gemma4 .        # 全量
+docker build -f docker/local/Dockerfile.sm70.local         -t ninfer:v100-gemma4 .        # 全量
 # 或复用已编好的二进制（秒级）：
 cp /mnt/data/ninfer-build-sm70/apps/ninfer-serve docker-runtime/
-docker build -f Dockerfile.sm70-runtime.local -t ninfer:v100-gemma4 docker-runtime/
+docker build -f docker/local/Dockerfile.sm70-runtime.local -t ninfer:v100-gemma4 docker-runtime/
 ```
 
 ### 内核开发的增量循环
@@ -893,7 +893,7 @@ docker build -f Dockerfile.sm70-runtime.local -t ninfer:v100-gemma4 docker-runti
 ```bash
 docker exec ninfer-sm70-build bash -c 'cd /build && ninja -j 16 ninfer-serve'
 cp /mnt/data/ninfer-build-sm70/apps/ninfer-serve docker-runtime/
-docker build -f Dockerfile.sm70-runtime.local -t ninfer:v100-gemma4 docker-runtime/
+docker build -f docker/local/Dockerfile.sm70-runtime.local -t ninfer:v100-gemma4 docker-runtime/
 ```
 
 只重编受影响的对象再链接（约 1–3 分钟），重打包 1 分钟内完成。

@@ -91,7 +91,7 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
                                            256);
             need = split_layout.peak_bytes(1);
         }
-        // 本仓库 V100 增量（docs/v100/fp8-swiglu-wide-t-*.md）：宽 T（t>=33）由 FP32 出口的
+        // 本仓库 V100 增量（docs/v100/experiments/fp8-swiglu-wide-t-*.md）：宽 T（t>=33）由 FP32 出口的
         // CUTLASS 拥有（原先交回上游的 small-t 阶梯，在 prefill 上是每 4 个 token 一块的 SIMT，
         // 实测占 FP8 混合制品近一半的 GPU 时间）。容量必须覆盖它；单个 T 的查询（min==max）
         // 要求与实际高水位精确相等，所以这里不能多算。

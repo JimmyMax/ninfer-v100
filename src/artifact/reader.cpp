@@ -51,7 +51,7 @@ struct Reader::Impl {
         auto file = std::make_unique<InputFile>(entry);
         std::array<std::byte, kHeaderBytes> header{};
         file->read_exact(0, header);
-        // 本仓库 V100 增量（docs/v100/v2-direct-read-2026-10-16.md）：v2 头的 JSON 长度在同一
+        // 本仓库 V100 增量（docs/v100/experiments/v2-direct-read-2026-10-16.md）：v2 头的 JSON 长度在同一
         // 位置，但头只有 16 字节、没有 UUID。清单在内存里归一化成 v3 形态后交给同一个
         // parse_directory，权重字节原地读取（实测同一制品的 1184 个张量偏移升级前后 1:1 相同）。
         const bool is_v2 =

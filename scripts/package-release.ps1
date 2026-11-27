@@ -5,7 +5,7 @@
 #
 # There is one packager, not one per release. Everything version-specific is derived from VERSION,
 # whose content is the full release tag (for example 0.10.0-rtx3090): the text before the first '-'
-# names RELEASE_NOTES_<version>.md and the checksum file, and the whole tag names the archive. To cut
+# names docs/release-notes/RELEASE_NOTES_<version>.md and the checksum file, and the whole tag names the archive. To cut
 # a release, bump VERSION and write its release notes; there is nothing here to copy and edit.
 $ErrorActionPreference = 'Stop'
 
@@ -16,7 +16,7 @@ if (-not (Test-Path -LiteralPath $VersionFile)) { throw "Missing $VersionFile" }
 $ReleaseTag = (Get-Content -LiteralPath $VersionFile -Raw).Trim()
 if (-not $ReleaseTag) { throw "$VersionFile is empty" }
 $ReleaseVersion = $ReleaseTag.Split('-')[0]
-$ReleaseNotes = "RELEASE_NOTES_$ReleaseVersion.md"
+$ReleaseNotes = "docs/release-notes/RELEASE_NOTES_$ReleaseVersion.md"
 # Checked before anything is deleted or built into dist, so a forgotten release-notes file costs
 # nothing rather than a finished archive that has to be thrown away.
 if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $ReleaseNotes))) {

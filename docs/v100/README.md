@@ -7,25 +7,25 @@
 | 文档 | 内容 |
 |---|---|
 | [PLAN.md](PLAN.md) | 路线图 S0–S5：目标、改动点、验收标准、工期、风险与回退 |
-| [baseline-2026-10-12.md](baseline-2026-10-12.md) | 第一条 V100-32GB 基线：Gemma 4 可用性与两线 A/B 数据 |
-| [S0.5-port-inventory.md](S0.5-port-inventory.md) | S0.5 的移植清单：来源提交、落点结构、分步计划与验收标准 |
-| [S0.5-result-2026-10-13.md](S0.5-result-2026-10-13.md) | S0.5 首次 A/B 结果：短上下文 +5.3%，验收标准需改为 oracle |
-| [S0.5-oracle-and-longctx-2026-10-13.md](S0.5-oracle-and-longctx-2026-10-13.md) | oracle 单测（v2 数值正确）+ 42K/152K 长上下文 A/B：只有 +3~6% |
-| [profiling-nvfp4-2026-10-13.md](profiling-nvfp4-2026-10-13.md) | **定位测量**：4.3× 差距精确落在 NVFP4 投影路线（85 GB/s / DRAM 9.5%，同形状 fp8/q4/q5/q8 已达 480–620 GB/s） |
-| [volta-flash-prefill-2026-10-15.md](volta-flash-prefill-2026-10-15.md) | Flash attention prefill 换核（vendored sm_70 mma）：41.1→25.1 ms，27K TTFT 30.1→27.2s |
-| [fp8-swiglu-wide-t-2026-10-16.md](fp8-swiglu-wide-t-2026-10-16.md) | 混合量化制品 prefill 慢 2× 的真因：FP8 SwiGLU 宽 T 落在 SIMT 阶梯；改走 FP32 出口的 CUTLASS |
-| [v2-direct-read-2026-10-16.md](v2-direct-read-2026-10-16.md) | v2 制品直读：清单在内存里归一化成 v3 形态，权重原地读 |
-| [v1.6-vs-v1.5-2026-10-20.md](v1.6-vs-v1.5-2026-10-20.md) | 外部报告的 1.5→1.6 接受率落差：度量口径、验证端 KV 切分、FP16 范围饱和三条原因与收敛计划 |
+| [baseline-2026-10-12.md](experiments/baseline-2026-10-12.md) | 第一条 V100-32GB 基线：Gemma 4 可用性与两线 A/B 数据 |
+| [S0.5-port-inventory.md](experiments/S0.5-port-inventory.md) | S0.5 的移植清单：来源提交、落点结构、分步计划与验收标准 |
+| [S0.5-result-2026-10-13.md](experiments/S0.5-result-2026-10-13.md) | S0.5 首次 A/B 结果：短上下文 +5.3%，验收标准需改为 oracle |
+| [S0.5-oracle-and-longctx-2026-10-13.md](experiments/S0.5-oracle-and-longctx-2026-10-13.md) | oracle 单测（v2 数值正确）+ 42K/152K 长上下文 A/B：只有 +3~6% |
+| [profiling-nvfp4-2026-10-13.md](experiments/profiling-nvfp4-2026-10-13.md) | **定位测量**：4.3× 差距精确落在 NVFP4 投影路线（85 GB/s / DRAM 9.5%，同形状 fp8/q4/q5/q8 已达 480–620 GB/s） |
+| [volta-flash-prefill-2026-10-15.md](experiments/volta-flash-prefill-2026-10-15.md) | Flash attention prefill 换核（vendored sm_70 mma）：41.1→25.1 ms，27K TTFT 30.1→27.2s |
+| [fp8-swiglu-wide-t-2026-10-16.md](experiments/fp8-swiglu-wide-t-2026-10-16.md) | 混合量化制品 prefill 慢 2× 的真因：FP8 SwiGLU 宽 T 落在 SIMT 阶梯；改走 FP32 出口的 CUTLASS |
+| [v2-direct-read-2026-10-16.md](experiments/v2-direct-read-2026-10-16.md) | v2 制品直读：清单在内存里归一化成 v3 形态，权重原地读 |
+| [v1.6-vs-v1.5-2026-10-20.md](experiments/v1.6-vs-v1.5-2026-10-20.md) | 外部报告的 1.5→1.6 接受率落差：度量口径、验证端 KV 切分、FP16 范围饱和三条原因与收敛计划 |
 | v1.6.2 发布说明（已移出仓库，保留在 v1.6.2 tag 与 GitHub Release 中） | 九次提交的实测矩阵、代价与已知缺口 |
 
-| [S0-result-inkling2-2026-11-23.md](S0-result-inkling2-2026-11-23.md) | **Inkling 2 Mini**（looped MoE）：sm70 桥接（NVFP4/MXFP4 MMQ/Vec kernel）、GGUF 格式白名单、DSpark 投机、vision；V100 上 ~70 tok/s decode / ~12.5K tok/s prefill / 600K ctx |
+| [S0-result-inkling2-2026-11-23.md](experiments/S0-result-inkling2-2026-11-23.md) | **Inkling 2 Mini**（looped MoE）：sm70 桥接（NVFP4/MXFP4 MMQ/Vec kernel）、GGUF 格式白名单、DSpark 投机、vision；V100 上 ~70 tok/s decode / ~12.5K tok/s prefill / 600K ctx |
 
 相关资产：
 
 | 路径 | 用途 |
 |---|---|
-| `Dockerfile.sm70.local` | CUDA 12.8 + `-DCMAKE_CUDA_ARCHITECTURES=70` 全量构建 |
-| `Dockerfile.sm70-runtime.local` | 复用已编好的 `ninfer-serve` 秒级重打包 |
+| `docker/local/Dockerfile.sm70.local` | CUDA 12.8 + `-DCMAKE_CUDA_ARCHITECTURES=70` 全量构建 |
+| `docker/local/Dockerfile.sm70-runtime.local` | 复用已编好的 `ninfer-serve` 秒级重打包 |
 | `bench/v100/compare_lines.py` | 两条实现的 A/B 对照（预热后连测，输出 markdown 表） |
 | `deploy/compose.gemma-v100.example.yml` | Gemma 线的 compose 示例（生产副本在 Docker 仓库里） |
 

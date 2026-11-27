@@ -65,7 +65,7 @@ constexpr int kFlashMaskRowPad = 8;
 // cap the sm_70 prompt fallback ran 14% slower than v1.5's uncapped flash at 166K (506.8 vs
 // 592.3). Measured on a V100-32GB with a 27B NVFP4 artifact, 2026-10-21; the sweep over caps
 // 32K..131K found no crossover below the cap (the prompt route is slower than this route at
-// every length it replaces). docs/v100/ab-v1.5-v1.6-decode-2026-10-21.html.
+// every length it replaces). docs/v100/experiments/ab-v1.5-v1.6-decode-2026-10-21.html.
 constexpr std::int32_t kFlashMaximumVisibleKeys = 200000;
 
 constexpr int round_up_keys(int n) { return ((n + kKeyPad - 1) / kKeyPad) * kKeyPad; }

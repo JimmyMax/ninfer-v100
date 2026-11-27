@@ -179,7 +179,7 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
 #if defined(NINFER_TIER_VOLTA)
     // 本仓库 V100 增量（docs/v100/PLAN.md）：NVFP4 的注意力输入在解码/校验宽度走 Volta QPN。
     // 必须排在下面的 sm70 宽路线之前，否则 14336x5120 会落到 SIMT 小 T 路线——实测纯解码
-    // 比 v1.5 慢 12%（docs/v100/v1.6-vs-v1.5-2026-10-20.md）。
+    // 比 v1.5 慢 12%（docs/v100/experiments/v1.6-vs-v1.5-2026-10-20.md）。
     {
         static const bool debug_qpn = std::getenv("NINFER_DEBUG_QPN") != nullptr;
         if (debug_qpn) {

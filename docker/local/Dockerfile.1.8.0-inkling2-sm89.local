@@ -1,0 +1,12 @@
+# Dockerfile.1.8.0-inkling2-sm89.local — 在 1.8.0-inkling2 基础上加入 inkling2 分支的 sm_89 构建
+#
+#   构建（sm_86;89）: 容器 ninfer-build-inkling2 里 make -j36，产物 /build89/apps/ninfer-serve
+#   docker build -f Dockerfile.1.8.0-inkling2-sm89.local -t ninfer:1.8.0-inkling2-sm89 .
+FROM ninfer:1.8.0-inkling2
+
+COPY docker-runtime/1.8.0-inkling2-sm89/ninfer-serve.sm89 /opt/ninfer/ninfer-serve.sm89
+RUN chmod +x /opt/ninfer/ninfer-serve.sm89
+
+WORKDIR /workspace
+EXPOSE 8000
+CMD ["ninfer-serve", "--help"]

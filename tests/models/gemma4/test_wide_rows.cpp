@@ -1,4 +1,4 @@
-// 本仓库 V100 增量（docs/v100/gemma4-wide-rows-2026-10-17.md）：Gemma 4 行内核的 FP64 oracle。
+// 本仓库 V100 增量（docs/v100/experiments/gemma4-wide-rows-2026-10-16.md）：Gemma 4 行内核的 FP64 oracle。
 //
 // 背景：rms_norm / attn_residual / ffn_combine 原先每线程负责一个 float4，因此 hidden/4 不能超过
 // 1024 线程（一行一个 block，hidden <= 4096）。dense 的 Gemma 4 31B hidden = 5376 装不下，于是

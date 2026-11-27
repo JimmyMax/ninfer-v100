@@ -6,7 +6,7 @@ under `scripts/`, and
 [docs/build-windows.md](https://github.com/JimmyMax/ninfer-v100/blob/main/docs/build-windows.md)
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
 
-Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` for what
+Check `VERSION` for the release this archive was cut from, and `docs/release-notes/RELEASE_NOTES_*.md` for what
 changed.
 
 ## Requirements
