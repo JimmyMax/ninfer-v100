@@ -72,7 +72,7 @@ Two families load, in place, with no offline conversion:
 | `Gemma4-31B-...-MTP-ninfer-v3.ninfer` | 18.7 | GGUF (dense) | 60 layers, hidden 5376, no experts |
 | `Gemma4-26B-A4B-...-MTP-ninfer-v3.ninfer` | 17.0 | GGUF Q4_0 | 128 experts, 8 routed per token |
 | `Ternary-Bonsai-2.5-27B-Uncensored-PTQ1_0.ninfer` | 6.9 | GGUF PTQ1_0 (ternary) | linear-attention (GDN) layers, no experts |
-| `Ternary-Bonsai-2.5-27B-Uncensored-PTQ1_0-mtp.ninfer` | 7.1 | PTQ1_0 + MTP (Q4_0) | the same base plus the official MTP head; 82.6 tok/s decode, MTP 4 drafts |
+| `Ternary-Bonsai-2.5-27B-Uncensored-PQ2_0-mtp.ninfer` | 7.1 | GGUF PQ2_0 (ternary) + MTP (Q4_0) | the official PQ2_0 base plus the official MTP head; 93.7 tok/s decode on V100 (MTP 2 drafts), 108.0 on the 4080S |
 | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-ninfer-v3.ninfer` | 54.0 | GGUF blocks, 3.5 bits | MoE, host/disk experts, n-gram table |
 | `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-ninfer-v3.ninfer` | 37.9 | GGUF blocks, 2.4 bits | MoE; reads the shared n-gram table |
 
@@ -104,13 +104,23 @@ plus the Volta gate), 8,192 context, int8 KV, one request per artifact —
 | Coder390 W4A4 DFlash2 | 65.0 | MTP |
 | swift NVFP4 DFlash2 | 67.1 | MTP |
 | Ternary-Bonsai PTQ1_0 | 69.8 | none |
-| Ternary-Bonsai PTQ1_0 + MTP | **82.6** | MTP 4 (29% accepted) |
+| Ternary-Bonsai PQ2_0 + MTP | **93.7** | MTP 2 (46.4% accepted) |
 | Flash-Next IQ3_S (host experts) | 33.6 | none |
 
 All nine artifacts start, probe and decode at or above their pre-merge rates. The sweep is the
 regression gate for this line — mandatory before any engine change is finalized, all artifact
 types, both cards (method and current numbers in
 [docs/v100/regression-sweep-2026-11-25.md](docs/v100/regression-sweep-2026-11-25.md)).
+
+2026-11-27: a V100 GGUF decode regression was found and fixed — the base had enabled the
+fully unrolled static-K vector kernel at T=1 for the 27B shapes, which 1.7.2 deliberately
+restricted to K=5376 (the unrolled bodies thrash the instruction cache when a token
+alternates 8-10 block types). `launch_k` now dispatches the runtime-K kernel at T=1 for
+builds without an Ampere/Blackwell tier: GSQ plain decode 42.5 -> 45.5 tok/s (release
+45.3), Huihui 39.7 -> 40.4 (release 40.5), NVFP4 artifacts bit-for-bit unchanged. The
+remaining spec-mode acceptance drift (GSQ dt2 59.0 vs 69.0, accepted 51.5% vs 57.0%) is
+the base's token-numerics drift, not this regression; it is recorded as a deferred known
+item in the sweep doc.
 
 ### 1.7.2 baseline (`ninfer_bench`)
 

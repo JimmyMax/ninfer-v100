@@ -1017,6 +1017,14 @@ void launch(const VecArgs& args, cudaStream_t stream) {
 
 template <ggml_type type, int T, bool Fused, bool Cooperative = false>
 void launch_k(const VecArgs& args, cudaStream_t stream) {
+#if !defined(NINFER_TIER_AMPERE) && !defined(NINFER_TIER_BLACKWELL)
+    // 本仓库 V100 增量（docs/v100/regression-sweep-2026-11-25.md）：T=1 回到运行时 K 内核。
+    // 1.7.2 只在 K=5376 上派发过展开的 T=1 形式——26B 的 K=2816/4096 形状实测回退；这里对
+    // 27B 链条（5120/6144/10240/17408）也实测回退：静态 K 的展开内核在单 product 基准里更
+    // 快，但模型每一 token 在 8-10 种块类型之间轮换，展开内核的指令体量让 L1 指令缓存反复
+    // 失效（无 Ampere/Blackwell 档的构建 = 纯 Volta/Turing 档），整模型慢 6%。
+    if constexpr (T == 1) { return launch<type, T, Fused, 0, Cooperative>(args, stream); }
+#endif
     if constexpr (kVecStaticK<type>) {
         switch (args.k) {
         case 5120: return launch<type, T, Fused, 5120, Cooperative>(args, stream);

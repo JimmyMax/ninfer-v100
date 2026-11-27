@@ -10,6 +10,8 @@
 
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/linear_swiglu.h"
 
 #include "core/device.h"
 #include "direct_bf16_weight.cuh"
@@ -139,6 +141,9 @@ struct Options {
     int repeat                = kDefaultRepeat;
     std::uint64_t flush_bytes = kDefaultFlushBytes;
     std::string csv_out;
+    // Epilogue variant: 0 Store (`linear`), 1 Accumulate (`linear_add`), 2 fused SwiGLU
+    // (`linear_swiglu`, the weight is a [gate; up] parent of 2 * n rows).
+    int epilogue = 0;
 };
 
 struct BenchPoint {
@@ -406,6 +411,8 @@ void usage(const char* argv0) {
                  "  --repeat N         Measured cold-cache samples per point (default %d).\n"
                  "  --flush-mib N      L2 eviction buffer size (default 256 MiB).\n"
                  "  --csv-out PATH     Write all ordinary measurement rows as CSV.\n"
+                 "  --epilogue V       store (default), accumulate (linear_add), or swiglu\n"
+                 "                     (linear_swiglu over a [gate; up] parent of 2*N rows).\n"
                  "  -h, --help         Show this text.\n",
                  argv0, argv0, argv0, kDefaultWarmup, kDefaultRepeat);
 }
@@ -463,6 +470,17 @@ Options parse_args(int argc, char** argv) {
                 checked_mul(parse_u64(next("flush-mib"), "flush-mib"), 1ULL << 20, "flush bytes");
         } else if (arg == "--csv-out") {
             opt.csv_out = next("csv output path");
+        } else if (arg == "--epilogue") {
+            const std::string_view value(next("epilogue"));
+            if (value == "store") {
+                opt.epilogue = 0;
+            } else if (value == "accumulate") {
+                opt.epilogue = 1;
+            } else if (value == "swiglu") {
+                opt.epilogue = 2;
+            } else {
+                throw std::invalid_argument("--epilogue must be store, accumulate or swiglu");
+            }
         } else if (arg == "--help" || arg == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -778,7 +796,8 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
     const std::uint64_t out_elements =
         checked_mul(static_cast<std::uint64_t>(group.n), max_t, "output allocation");
 
-    LinearBenchWeight weight = make_weight(group.qtype, group.n, group.k);
+    const std::int32_t weight_rows = opt.epilogue == 2 ? group.n * 2 : group.n;
+    LinearBenchWeight weight = make_weight(group.qtype, weight_rows, group.k);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
 #if defined(NINFER_TIER_VOLTA)
@@ -793,8 +812,15 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
 #else
     const bool staged = false;
 #endif
-    const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(
-        group.qtype, group.n, group.k, group.policy, min_t, max_t);
+    const std::size_t workspace_capacity =
+        opt.epilogue == 2
+            ? ops::linear_swiglu_workspace_capacity_bytes(group.qtype, weight_rows, group.k,
+                                                          group.policy, min_t, max_t)
+            : opt.epilogue == 1
+                ? ops::linear_add_workspace_capacity_bytes(group.qtype, group.n, group.k,
+                                                           group.policy, min_t, max_t)
+                : ops::linear_workspace_capacity_bytes(group.qtype, group.n, group.k, group.policy,
+                                                       min_t, max_t);
     DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
     fill_activation(x, x_elements, stream);
     CUDA_CHECK(cudaMemsetAsync(out.p, 0, out.bytes, stream));
@@ -820,7 +846,16 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
                 return;
             }
 #endif
-            ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream);
+            if (opt.epilogue == 2) {
+                ops::linear_swiglu(activation, weight.weight, output, group.policy, workspace,
+                                   launch_stream);
+            } else if (opt.epilogue == 1) {
+                ops::linear_add(activation, weight.weight, output, group.policy, workspace,
+                                launch_stream);
+            } else {
+                ops::linear(activation, weight.weight, output, group.policy, workspace,
+                            launch_stream);
+            }
         };
         bench::TimedGraph graph;
         if (opt.graph)
